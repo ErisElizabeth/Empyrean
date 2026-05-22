@@ -22,7 +22,7 @@ If those three things work, the project is in a sane state.
 
 ## Current Build
 
-Current build: `0.1.11-alpha`
+Current build: `0.1.21-alpha`
 
 The project currently has:
 
@@ -56,6 +56,8 @@ Use these when editing code:
 
 ```text
 main.js
+physics.js
+rig.js
 encounters.js
 styles.css
 index.html
@@ -123,4 +125,3 @@ Recommended flow:
 - DM tools
 
 Those are good ideas, just bigger than a quick solo edit.
-

@@ -6,7 +6,7 @@
 #
 # What it checks:
 #   1. JavaScript syntax for main.js.
-#   2. JavaScript syntax for encounters.js.
+#   2. JavaScript syntax for the helper modules main.js imports.
 #   3. PowerShell parse health for checkpoint.ps1.
 #   4. Important files exist.
 #
@@ -31,6 +31,11 @@ Write-Host ""
 $RequiredFiles = @(
   "index.html",
   "main.js",
+  "physics.js",
+  "rig.js",
+  "world.js",
+  "skin.js",
+  "combat_updated.js",
   "encounters.js",
   "styles.css",
   "README.md",
@@ -52,6 +57,11 @@ foreach ($File in $RequiredFiles) {
 Write-Host ""
 Write-Host "Checking JavaScript syntax..."
 node --check main.js
+node --check physics.js
+node --check rig.js
+node --check world.js
+node --check skin.js
+node --check combat_updated.js
 node --check encounters.js
 Write-Host "  OK JavaScript syntax"
 
@@ -73,8 +83,10 @@ Write-Host ""
 Write-Host "Checking common assets..."
 $AssetFiles = @(
   "assets/femaleMesh.glb",
+  "assets/enemy.glb",
   "assets/Jupiter.jpg",
   "assets/background.mp3",
+  "assets/battle.mp3",
   "assets/diffuse.jpg",
   "assets/normal.jpg",
   "assets/ao.jpg",

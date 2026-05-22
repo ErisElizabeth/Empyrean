@@ -1,9 +1,63 @@
-import * as THREE from "three";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+﻿import * as THREE from "three";
 import GUI from "lil-gui";
 import { ENCOUNTER_DEFINITIONS } from "./encounters.js";
+// Combat encounter prototype: wires /empyrean_dice (d20 roll) and the
+// /enemyAI tiered-decision idea into the existing /Empyrean world.
+import { initCombatEncounter, updateCombatEncounter } from "./combat_updated.js";
+import {
+  clamp01 as physicsClamp01,
+  cycle01 as physicsCycle01,
+  getJumpGravityValue,
+  getJumpLaunchVelocityValue,
+  getJumpPoseWeightValues,
+  getLegStrideValues as getPhysicsLegStrideValues,
+  getPelvisWalkValues as getPhysicsPelvisWalkValues,
+  smoothstep as physicsSmoothstep,
+  updateJumpState,
+} from "./physics.js";
+import {
+  DEFAULT_RIG_DIMENSIONS,
+  DEFAULT_RIG_HEIGHT,
+  RIG_DIMENSION_CONTROLS,
+  getRigStats,
+} from "./rig.js";
+import {
+  GUIDE_COLOR,
+  buildExplorationWorld,
+  buildGhostSpheres,
+  buildLighting,
+  createEncounterRuntime,
+  createWorldDebugView,
+  disposeObjectTree,
+  getEncounterCenter,
+  getEncounterRect,
+  isControlPositionValid,
+  makeLabelSprite,
+  moveRigWithCollision,
+  resolveRigRoomCollision,
+  tickEncounterSystem,
+  updateGhostSphereMotion,
+  worldCollision,
+} from "./world.js";
+import {
+  DEFAULT_IMPORTED_MESH_PATH,
+  applyImportedMeshPresentation,
+  clearImportedMesh,
+  disposeImportedPreview,
+  disposeImportedSkin,
+  getActiveMeshPath,
+  initSkin,
+  loadDefaultImportedMesh,
+  loadImportedMeshFromPath,
+  loadImportedMeshPreviewFromPath,
+  refreshImportedMeshReference,
+  rerigImportedMesh,
+  renderDefaultImportedMesh,
+  rigCurrentImportedMesh,
+  syncImportedSkinToPuppet,
+} from "./skin.js";
 
-const APP_VERSION = "0.1.12-alpha";
+const APP_VERSION = "0.1.21-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -29,40 +83,6 @@ const THREE_VERSION_PIN = "0.164.1";
     - Colors may be CSS hex strings like "#131862" or numeric hex like 0x131862.
 */
 const SOLO_TWEAKS = {
-  world: {
-    // roomSize controls width, depth, and height of each cube-like room.
-    roomSize: 24,
-
-    // wallThickness is thin because rooms are visual boundaries, not heavy
-    // architectural solids. Collision uses matching thin top-down rectangles.
-    wallThickness: 0.1,
-
-    // roomTransparency keeps the puppet visible through nearby room surfaces.
-    roomTransparency: 0.2,
-
-    // Door gaps. Increase doorWidth if the circular rig collider catches edges.
-    doorWidth: 4.4,
-    doorHeight: 5.1,
-
-    // The outside enclosure is a finite play box. To make a bigger yard, raise
-    // outsideSize and then spread tree positions farther out.
-    outsideSize: 96,
-    outsideCenterX: -12,
-    outsideCenterZ: -12,
-    outsideWallColor: "#131862",
-    outsideFloorColor: "#7BB369",
-  },
-
-  roomColors: {
-    // Distinct wall colors help you keep your bearings while testing movement.
-    north: 0x5d608c,
-    south: 0x131a13,
-    east: 0x1e856d,
-    west: 0x3e0b4d,
-    floor: 0xb89898,
-    ceiling: 0x591a1a,
-  },
-
   player: {
     // collisionMargin is extra padding around the visible collider circle.
     collisionMargin: 0.08,
@@ -88,32 +108,6 @@ const SOLO_TWEAKS = {
     // Wheel zoom has a slightly closer max than arrow-key zoom so trackpad
     // gestures stay easy to control while placing pivots.
     wheelMaxDistance: 18,
-  },
-
-  ghostSpheres: {
-    // Lower this first if the scene ever feels heavy on your machine.
-    count: 170,
-    color: "#7f827f",
-  },
-
-  worldDebug: {
-    /*
-      These colors only affect the visual debug overlay. They do not change the
-      real collision logic.
-    */
-    wallColor: "#ff5d73",
-    treeColor: "#ffd166",
-    boundsColor: "#78c7ff",
-    encounterColor: "#e0dcdc",
-
-    // Debug meshes hover a hair above the floor to avoid z-fighting with the
-    // floor material.
-    floorLift: 0.045,
-  },
-
-  trees: {
-    // This is the simple circular collision shell around each tree.
-    colliderRadius: 1.15,
   },
 
   jupiter: {
@@ -221,230 +215,12 @@ if (SOLO_TWEAKS.audio.autoplay) {
     circle sliding around on the floor.
 */
 
-// ---------------------------------------------------------------------------
-// WORLD SCALE AND ROOM CONSTANTS
-// ---------------------------------------------------------------------------
-// These values control the primitive geometry used to build the rooms and the
-// outside exploration enclosure. All dimensions are in Three.js scene units.
-const roomSize = SOLO_TWEAKS.world.roomSize;
-const wallThickness = SOLO_TWEAKS.world.wallThickness;
-const roomTransparency = SOLO_TWEAKS.world.roomTransparency;
-
-// A tiny padding added to the visible collider radius so the rig does not rub
-// directly on wall faces. If the avatar feels too far from obstacles, this is
-// one of the first values to inspect.
+// Extra padding around the visible collider so the rig does not rub wall faces.
 const rigCollisionMargin = SOLO_TWEAKS.player.collisionMargin;
-
-// Door geometry:
-// - doorWidth is the horizontal gap in a wall.
-// - doorHeight is how tall that passable gap is.
-// The visible top header of the door is drawn, but it does not block movement.
-const doorWidth = SOLO_TWEAKS.world.doorWidth;
-const doorHeight = SOLO_TWEAKS.world.doorHeight;
-
-// The outside enclosure is a large box around the rooms. It creates the feeling
-// of going "outside" without needing infinite terrain or streaming chunks yet.
-const outsideSize = SOLO_TWEAKS.world.outsideSize;
-const outsideCenter = new THREE.Vector3(
-  SOLO_TWEAKS.world.outsideCenterX,
-  0,
-  SOLO_TWEAKS.world.outsideCenterZ,
-);
-const outsideWallColor = SOLO_TWEAKS.world.outsideWallColor;
-const outsideFloorColor = SOLO_TWEAKS.world.outsideFloorColor;
-
-// Trees use circle colliders. The visual tree is a trunk plus cone leaves; this
-// radius is the simple collision shell around the whole tree.
-const treeColliderRadius = SOLO_TWEAKS.trees.colliderRadius;
-
-// ---------------------------------------------------------------------------
-// COLOR PALETTE
-// ---------------------------------------------------------------------------
-// Room colors are intentionally distinct so orientation is easy while testing.
-const wallNorthColor = SOLO_TWEAKS.roomColors.north;
-const wallSouthColor = SOLO_TWEAKS.roomColors.south;
-const wallEastColor = SOLO_TWEAKS.roomColors.east;
-const wallWestColor = SOLO_TWEAKS.roomColors.west;
-const floorColor = SOLO_TWEAKS.roomColors.floor;
-const ceilingColor = SOLO_TWEAKS.roomColors.ceiling;
-const GHOST_SPHERE_COLOR = SOLO_TWEAKS.ghostSpheres.color;
-
-// ---------------------------------------------------------------------------
-// TEXTURE LOADING HELPERS
-// ---------------------------------------------------------------------------
-// The room texture set is made of diffuse, normal, ambient occlusion, and
-// displacement maps. They are repeated across large surfaces so the rooms do
-// not look like flat color panels.
-const textureLoader = new THREE.TextureLoader();
-
-function loadRepeatedTexture(path, repeatX, repeatY, colorSpace = null) {
-  /*
-    Loads one texture file and configures it to tile.
-
-    Formula:
-      texture repeat = (repeatX, repeatY)
-
-    where:
-      repeatX = number of horizontal repeats across the geometry UVs
-      repeatY = number of vertical repeats across the geometry UVs
-
-    colorSpace is only set for color textures, such as diffuse/albedo maps.
-    Data textures like normal maps stay in their default linear space.
-  */
-  const texture = textureLoader.load(path);
-
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  texture.repeat.set(repeatX, repeatY);
-
-  if (colorSpace) {
-    texture.colorSpace = colorSpace;
-  }
-
-  return texture;
-}
-
-function loadRoomTextureSet(folder, repeatX = 4, repeatY = 4, options = {}) {
-  /*
-    Builds one complete MeshStandardMaterial for a room surface.
-
-    Inputs:
-      folder = folder that contains diffuse.jpg, normal.jpg, ao.jpg,
-               displacement.jpg
-      repeatX/repeatY = how often each texture tiles across the surface
-      options.color = optional tint multiplied over the diffuse texture
-      options.opacity = transparency for the final material
-      options.displacementScale = how strongly the displacement map pushes
-                                  vertices along their normals
-
-    Note:
-      Displacement only shows when the geometry has enough subdivisions. That is
-      why room surfaces use BoxGeometry segment counts like 32 or 24.
-  */
-  const diffuse = loadRepeatedTexture(
-    `${folder}/diffuse.jpg`,
-    repeatX,
-    repeatY,
-    THREE.SRGBColorSpace,
-  );
-  const normal = loadRepeatedTexture(`${folder}/normal.jpg`, repeatX, repeatY);
-  const ao = loadRepeatedTexture(`${folder}/ao.jpg`, repeatX, repeatY);
-  const displacement = loadRepeatedTexture(
-    `${folder}/displacement.jpg`,
-    repeatX,
-    repeatY,
-  );
-
-  return new THREE.MeshStandardMaterial({
-    color: options.color || 0xffffff,
-    map: diffuse,
-    normalMap: normal,
-    aoMap: ao,
-    displacementMap: displacement,
-    displacementScale: options.displacementScale ?? 0.018,
-    roughness: 0.86,
-    metalness: 0.02,
-    transparent: true,
-    opacity: options.opacity ?? roomTransparency,
-  });
-}
-
-function cloneRoomMaterial(baseMaterial, color) {
-  // Each wall gets a clone so changing one material's color/opacity never
-  // accidentally changes every wall that was sharing the same base material.
-  const material = baseMaterial.clone();
-  material.color = new THREE.Color(color);
-  return material;
-}
-
-function enableAmbientOcclusion(geometry) {
-  // Three.js reads aoMap from uv2. BoxGeometry only creates uv by default, so
-  // this copies the existing UV layout to uv2 and lets the baked AO texture work.
-  if (geometry.attributes.uv && !geometry.attributes.uv2) {
-    geometry.setAttribute(
-      "uv2",
-      new THREE.BufferAttribute(geometry.attributes.uv.array, 2),
-    );
-  }
-
-  return geometry;
-}
-
-const wallTextureMaterial = loadRoomTextureSet("assets", 4, 2, {
-  opacity: roomTransparency,
-});
-const floorTextureMaterial = loadRoomTextureSet("assets", 8, 8, {
-  opacity: roomTransparency,
-  displacementScale: 0.01,
-});
-const ceilingTextureMaterial = loadRoomTextureSet("assets", 4, 2, {
-  opacity: roomTransparency,
-  displacementScale: 0.012,
-});
-
-/*
-  Each colored room surface reuses the same texture files, then multiplies the
-  diffuse map by a surface color. This keeps the room readable as a tabletop
-  "space" while still letting the texture show through.
-*/
-const roomSurfaceMaterials = {
-  north: cloneRoomMaterial(wallTextureMaterial, wallNorthColor),
-  south: cloneRoomMaterial(wallTextureMaterial, wallSouthColor),
-  east: cloneRoomMaterial(wallTextureMaterial, wallEastColor),
-  west: cloneRoomMaterial(wallTextureMaterial, wallWestColor),
-  floor: cloneRoomMaterial(floorTextureMaterial, floorColor),
-  ceiling: cloneRoomMaterial(ceilingTextureMaterial, ceilingColor),
-};
-
-const outsideWallMaterial = new THREE.MeshStandardMaterial({
-  // Outside walls are deliberately translucent. They define the play boundary
-  // while still letting the green floor, trees, and ghost spheres remain visible.
-  color: outsideWallColor,
-  roughness: 0.95,
-  metalness: 0,
-  transparent: true,
-  opacity: 0.42,
-});
-const outsideFloorMaterial = new THREE.MeshStandardMaterial({
-  color: outsideFloorColor,
-  roughness: 0.9,
-  metalness: 0,
-});
-const ghostSphereMaterial = new THREE.MeshBasicMaterial({
-  // MeshBasicMaterial ignores lights. That is useful here because the ghost
-  // spheres should read like self-lit wire shapes no matter where the camera is.
-  color: GHOST_SPHERE_COLOR,
-  wireframe: true,
-  transparent: true,
-  opacity: 0.55,
-  depthWrite: false,
-  blending: THREE.AdditiveBlending,
-});
-const ghostGlowMaterial = new THREE.MeshBasicMaterial({
-  // The glow is just a second, larger sphere with additive blending and very
-  // low opacity. It is a cheap fake bloom that does not require post-processing.
-  color: GHOST_SPHERE_COLOR,
-  transparent: true,
-  opacity: 0.035,
-  depthWrite: false,
-  blending: THREE.AdditiveBlending,
-});
-const treeLeafMaterial = new THREE.MeshStandardMaterial({
-  color: "#457543",
-  roughness: 0.85,
-  metalness: 0,
-});
-const treeTrunkMaterial = new THREE.MeshStandardMaterial({
-  color: "#cc9029",
-  roughness: 0.82,
-  metalness: 0,
-});
 
 const sceneContainer = document.getElementById("scene-container");
 const STORAGE_KEY = "empyrean.puppetWorkshop.rigTuning.v1";
 const WALL_COLOR = "#131111";
-const GUIDE_COLOR = "#e0dcdc";
-const DEFAULT_IMPORTED_MESH_PATH = "assets/femaleMesh.glb";
 
 // Slider ranges. These are intentionally broad because the rig lab should be
 // able to accommodate strange proportions, not only "normal" humanoids.
@@ -452,46 +228,9 @@ const ROOT_ALIGNMENT_RANGE = { min: -6, max: 6, step: 0.005 };
 const JOINT_POINT_OFFSET_RANGE = { min: -4, max: 4, step: 0.005 };
 const BIND_ROTATION_RANGE = { min: -Math.PI, max: Math.PI, step: 0.005 };
 const AXIS_MARKER_SCALE_RANGE = { min: 0.03, max: 3, step: 0.01 };
-const gltfLoader = new GLTFLoader();
 
-const DEFAULT_RIG_HEIGHT = 4.46;
+const rigStats = getRigStats(DEFAULT_RIG_DIMENSIONS);
 
-/*
-  DEFAULT_RIG_DIMENSIONS
-
-  These values describe the initial bind pose. "Bind pose" means the neutral
-  reference pose used before animation.
-
-  Vertical joints are stored as absolute heights from the floor:
-    headY, neckY, chestY, torsoY, pelvisY
-
-  Limb lengths are stored as segment lengths:
-    upperArmLength, forearmLength, thighLength, shinLength
-
-  createSkeleton() converts the absolute heights into parent-relative joint
-  offsets. That is why, for example:
-
-    neck local Y = neckY - chestY
-
-  The neck joint is a child of the chest joint, so it only needs to know how far
-  it sits above its parent, not its final world height.
-*/
-const DEFAULT_RIG_DIMENSIONS = {
-  headY: DEFAULT_RIG_HEIGHT * 0.91,
-  neckY: DEFAULT_RIG_HEIGHT * 0.84,
-  chestY: DEFAULT_RIG_HEIGHT * 0.72,
-  torsoY: DEFAULT_RIG_HEIGHT * 0.6,
-  pelvisY: DEFAULT_RIG_HEIGHT * 0.5,
-
-  shoulderX: DEFAULT_RIG_HEIGHT * 0.19,
-  hipX: DEFAULT_RIG_HEIGHT * 0.09,
-
-  upperArmLength: DEFAULT_RIG_HEIGHT * 0.19,
-  forearmLength: DEFAULT_RIG_HEIGHT * 0.17,
-
-  thighLength: DEFAULT_RIG_HEIGHT * 0.245,
-  shinLength: DEFAULT_RIG_HEIGHT * 0.245,
-};
 const PRESETS = {
   /*
     Motion presets are groups of related animation tuning values. They do not
@@ -531,29 +270,6 @@ const PRESETS = {
     damping: 4.8,
   },
 };
-
-const RIG_DIMENSION_CONTROLS = [
-  /*
-    GUI rows for the "Rig Dimensions" folder.
-
-    Format:
-      [propertyName, min, max, step]
-
-    The min/max values are intentionally permissive so future imported meshes
-    with very long necks, odd limbs, or stylized bodies can still be matched.
-  */
-  ["headY", -1, 12, 0.01],
-  ["neckY", -1, 11, 0.01],
-  ["chestY", -1, 10, 0.01],
-  ["torsoY", -1, 9, 0.01],
-  ["pelvisY", -1, 8, 0.01],
-  ["shoulderX", 0, 4, 0.01],
-  ["hipX", 0, 3, 0.01],
-  ["upperArmLength", 0.02, 6, 0.01],
-  ["forearmLength", 0.02, 6, 0.01],
-  ["thighLength", 0.02, 6, 0.01],
-  ["shinLength", 0.02, 6, 0.01],
-];
 
 const JOINT_ORDER = [
   /*
@@ -641,6 +357,10 @@ const RIG_TUNING_KEYS = [
   "armTrailAmplitude",
   "damping",
   "walkAmplitude",
+  "walkHipSway",
+  "walkHipBob",
+  "walkHipTilt",
+  "walkHipTwist",
   "jumpHeight",
   "jumpDuration",
   "jumpGravityScale",
@@ -670,29 +390,10 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   160,
 );
-const worldCollision = {
-  /*
-    Collision is stored separately from visual meshes.
-
-    bounds:
-      The outside box that keeps the player inside the explorable area.
-
-    solidRects:
-      Axis-aligned wall rectangles in top-down X/Z space.
-
-    solidCircles:
-      Circular obstacles, currently used by low-poly trees.
-
-    This is intentionally simple. It is not a physics engine. It is a readable
-    collision map for avatar exploration and rig testing.
-  */
-  bounds: null,
-  solidRects: [],
-  solidCircles: [],
-};
 const explorationWorld = buildExplorationWorld();
 scene.add(explorationWorld.group);
-const ghostSpheres = buildGhostSpheres(SOLO_TWEAKS.ghostSpheres.count);
+const ghostSpheres = buildGhostSpheres();
+ghostSpheres.forEach((sphere) => scene.add(sphere.group));
 
 //-------------------------------------------------------------
 //-------------------------------------------------------------
@@ -728,555 +429,46 @@ jupiter.name = "sky-jupiter";
 scene.add(jupiter);
 jupiter.position.set(...SOLO_TWEAKS.jupiter.position);
 
+const rigHeightDisk = buildRigHeightDisk();
+scene.add(rigHeightDisk);
+
 // ======================================================
 // WORLD / ROOM / OUTSIDE HELPERS
 // ======================================================
 
-function buildExplorationWorld() {
+function buildRigHeightDisk() {
   /*
-    Creates the complete explorable space.
+    Creates a 5% opacity wireframe disk at the current program rig height.
 
-    Layout, viewed from above:
+    Purpose:
+      A visual "height gauge" for the default body proportions.
 
-      negative Z room
-            |
-      negative X room -- central room -- outside door to open enclosure
+    Current source:
+      rig.js exports DEFAULT_RIG_HEIGHT and getRigStats().
 
-    "Negative X" and "negative Z" mean their centers are shifted by -roomSize
-    along that axis from the central room.
+    Disk placement:
+      Y = DEFAULT_RIG_DIMENSIONS.headY
 
-    The returned object contains a single group, but the collision information
-    is registered into worldCollision as the pieces are created.
+    Geometry note:
+      CircleGeometry is born in the XY plane. Rotating it around X by PI / 2
+      lays it flat in the XZ plane, like a horizontal inspection gauge.
   */
-  const group = new THREE.Group();
-
-  group.name = "empyrean-three-room-exploration-world";
-
-  // The outside boundary is the master play area. Individual room walls and
-  // trees add obstacles inside this boundary.
-  worldCollision.bounds = {
-    centerX: outsideCenter.x,
-    centerZ: outsideCenter.z,
-    halfSize: outsideSize / 2,
-  };
-
-  group.add(createOutsideEnclosure());
-
-  [
-    /*
-      doors:
-        north/south/east/west true means that wall is split into:
-          - left/bottom side blocker
-          - right/top side blocker
-          - visual header above the doorway
-
-      Only the side pieces block movement. The header is visual only so the
-      floor-level circular collider can pass through.
-    */
-    {
-      name: "central-room",
-      center: new THREE.Vector3(0, roomSize / 2, 0),
-      doors: { north: true, south: true, west: true },
-    },
-    {
-      name: "negative-x-room",
-      center: new THREE.Vector3(-roomSize, roomSize / 2, 0),
-      doors: { east: true },
-    },
-    {
-      name: "negative-z-room",
-      center: new THREE.Vector3(0, roomSize / 2, -roomSize),
-      doors: { south: true },
-    },
-  ].forEach((roomConfig) => {
-    group.add(createRoom(roomConfig));
+  const geometry = new THREE.CircleGeometry(2.2, 64);
+  const material = new THREE.MeshBasicMaterial({
+    color: GUIDE_COLOR,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.05,
+    depthWrite: false,
+    side: THREE.DoubleSide,
   });
+  const disk = new THREE.Mesh(geometry, material);
 
-  buildLowPolyTrees(group);
-  return { group };
-}
-
-function createOutsideEnclosure() {
-  /*
-    Builds the large "outside" box around the rooms.
-
-    Visual pieces:
-      floor   = green box, very thin in Y
-      ceiling = blue/purple box, very thin in Y
-      walls   = four blue/purple boundary boxes
-
-    Collision pieces:
-      four solid rectangles in X/Z top-down space. The floor and ceiling do not
-      need collision because the avatar is not currently flying into them.
-  */
-  const group = new THREE.Group();
-  const half = outsideSize / 2;
-  const centerX = outsideCenter.x;
-  const centerZ = outsideCenter.z;
-  const wallHeight = roomSize;
-  const wallY = wallHeight / 2;
-  const floor = new THREE.Mesh(
-    new THREE.BoxGeometry(outsideSize, wallThickness, outsideSize),
-    outsideFloorMaterial,
-  );
-  const ceiling = new THREE.Mesh(
-    new THREE.BoxGeometry(outsideSize, wallThickness, outsideSize),
-    outsideWallMaterial.clone(),
-  );
-  const northWall = new THREE.Mesh(
-    new THREE.BoxGeometry(outsideSize, wallHeight, wallThickness),
-    outsideWallMaterial.clone(),
-  );
-  const southWall = new THREE.Mesh(
-    new THREE.BoxGeometry(outsideSize, wallHeight, wallThickness),
-    outsideWallMaterial.clone(),
-  );
-  const eastWall = new THREE.Mesh(
-    new THREE.BoxGeometry(wallThickness, wallHeight, outsideSize),
-    outsideWallMaterial.clone(),
-  );
-  const westWall = new THREE.Mesh(
-    new THREE.BoxGeometry(wallThickness, wallHeight, outsideSize),
-    outsideWallMaterial.clone(),
-  );
-
-  floor.name = "outside-green-floor";
-  ceiling.name = "outside-blue-ceiling";
-  floor.position.set(centerX, -wallThickness / 2, centerZ);
-  ceiling.position.set(centerX, wallHeight + wallThickness / 2, centerZ);
-  northWall.position.set(centerX, wallY, centerZ - half);
-  southWall.position.set(centerX, wallY, centerZ + half);
-  eastWall.position.set(centerX + half, wallY, centerZ);
-  westWall.position.set(centerX - half, wallY, centerZ);
-
-  [floor, ceiling, northWall, southWall, eastWall, westWall].forEach((part) => {
-    group.add(part);
-  });
-
-  addSolidRect(centerX, centerZ - half, outsideSize, wallThickness);
-  addSolidRect(centerX, centerZ + half, outsideSize, wallThickness);
-  addSolidRect(centerX + half, centerZ, wallThickness, outsideSize);
-  addSolidRect(centerX - half, centerZ, wallThickness, outsideSize);
-
-  return group;
-}
-
-function createRoom({ name, center, doors = {} }) {
-  /*
-    Creates one room at a world-space center point.
-
-    Important geometry detail:
-      The roomGroup is positioned at the room center. Floor, ceiling, and wall
-      meshes are placed relative to that group. Collision rectangles, however,
-      are stored in absolute world X/Z coordinates.
-
-    center.y is roomSize / 2, which makes the local floor sit at world Y = 0:
-      world floor Y = center.y + localFloorY
-                    = roomSize / 2 + (-roomSize / 2)
-                    = 0
-  */
-  const roomGroup = new THREE.Group();
-  const localFloorY = -roomSize / 2;
-  const floor = new THREE.Mesh(
-    enableAmbientOcclusion(
-      new THREE.BoxGeometry(roomSize, wallThickness, roomSize, 32, 1, 32),
-    ),
-    roomSurfaceMaterials.floor,
-  );
-  const ceiling = new THREE.Mesh(
-    enableAmbientOcclusion(
-      new THREE.BoxGeometry(roomSize, wallThickness, roomSize, 32, 1, 32),
-    ),
-    roomSurfaceMaterials.ceiling,
-  );
-
-  roomGroup.name = name;
-  roomGroup.position.copy(center);
-  floor.position.set(0, localFloorY, 0);
-  ceiling.position.set(0, roomSize / 2, 0);
-  roomGroup.add(floor, ceiling);
-
-  addRoomWall(roomGroup, center, "north", doors.north);
-  addRoomWall(roomGroup, center, "south", doors.south);
-  addRoomWall(roomGroup, center, "east", doors.east);
-  addRoomWall(roomGroup, center, "west", doors.west);
-
-  return roomGroup;
-}
-
-function addRoomWall(roomGroup, roomCenter, side, hasDoor = false) {
-  /*
-    Adds one wall to a room, optionally with a doorway.
-
-    No doorway:
-      one full wall segment, blocks movement.
-
-    With doorway:
-      left/right side wall segments block movement.
-      top header segment is visual only.
-
-    Door math:
-      sideLength = (roomSize - doorWidth) / 2
-
-    Example:
-      If roomSize is 24 and doorWidth is 4.4:
-        sideLength = (24 - 4.4) / 2 = 9.8
-
-      That leaves:
-        9.8 wall + 4.4 door gap + 9.8 wall = 24 total width
-  */
-  const material = roomSurfaceMaterials[side];
-  const sideLength = hasDoor ? (roomSize - doorWidth) / 2 : roomSize;
-  const sideOffset = hasDoor ? doorWidth / 2 + sideLength / 2 : 0;
-  const topHeight = roomSize - doorHeight;
-  const topY = -roomSize / 2 + doorHeight + topHeight / 2;
-
-  if (!hasDoor) {
-    addWallSegment(
-      roomGroup,
-      roomCenter,
-      side,
-      0,
-      0,
-      roomSize,
-      roomSize,
-      material,
-      true,
-    );
-    return;
-  }
-
-  addWallSegment(
-    roomGroup,
-    roomCenter,
-    side,
-    -sideOffset,
-    0,
-    sideLength,
-    roomSize,
-    material,
-    true,
-  );
-  addWallSegment(
-    roomGroup,
-    roomCenter,
-    side,
-    sideOffset,
-    0,
-    sideLength,
-    roomSize,
-    material,
-    true,
-  );
-  addWallSegment(
-    roomGroup,
-    roomCenter,
-    side,
-    0,
-    topY,
-    doorWidth,
-    topHeight,
-    material,
-    false,
-  );
-}
-
-function addWallSegment(
-  roomGroup,
-  roomCenter,
-  side,
-  alongOffset,
-  y,
-  alongLength,
-  height,
-  material,
-  blocksMovement,
-) {
-  /*
-    Draws one rectangular wall piece and optionally adds matching collision.
-
-    Parameters:
-      side          = north/south/east/west
-      alongOffset   = offset along the wall's long direction
-      y             = local Y center of the segment
-      alongLength   = wall width along the long direction
-      height        = wall height
-      blocksMovement = whether this piece becomes a solid X/Z rectangle
-
-    For north/south walls:
-      long direction is X, thickness is Z.
-
-    For east/west walls:
-      long direction is Z, thickness is X.
-  */
-  const isNorthSouth = side === "north" || side === "south";
-  const geometry = isNorthSouth
-    ? new THREE.BoxGeometry(alongLength, height, wallThickness, 24, 24, 1)
-    : new THREE.BoxGeometry(wallThickness, height, alongLength, 1, 24, 24);
-  const mesh = new THREE.Mesh(enableAmbientOcclusion(geometry), material);
-  const local = new THREE.Vector3();
-
-  if (side === "north") {
-    local.set(alongOffset, y, -roomSize / 2);
-  } else if (side === "south") {
-    local.set(alongOffset, y, roomSize / 2);
-  } else if (side === "east") {
-    local.set(roomSize / 2, y, alongOffset);
-  } else {
-    local.set(-roomSize / 2, y, alongOffset);
-  }
-
-  mesh.position.copy(local);
-  mesh.material.transparent = true;
-  mesh.material.opacity = roomTransparency;
-  roomGroup.add(mesh);
-
-  if (blocksMovement) {
-    // The mesh is local to the room group, so add roomCenter to get the matching
-    // world-space collision rectangle.
-    addSolidRect(
-      roomCenter.x + local.x,
-      roomCenter.z + local.z,
-      isNorthSouth ? alongLength : wallThickness,
-      isNorthSouth ? wallThickness : alongLength,
-    );
-  }
-}
-
-function addSolidRect(centerX, centerZ, width, depth) {
-  /*
-    Registers an axis-aligned rectangular obstacle in top-down space.
-
-    Stored form:
-      minX/maxX/minZ/maxZ
-
-    This is faster and easier to test than keeping width/depth and recomputing
-    the rectangle edges every frame.
-  */
-  worldCollision.solidRects.push({
-    minX: centerX - width / 2,
-    maxX: centerX + width / 2,
-    minZ: centerZ - depth / 2,
-    maxZ: centerZ + depth / 2,
-  });
-}
-
-function addSolidCircle(centerX, centerZ, radius) {
-  // Registers a circular obstacle in X/Z space. Trees use these because their
-  // footprint reads better as a circle than as a square.
-  worldCollision.solidCircles.push({ centerX, centerZ, radius });
-}
-
-function buildLowPolyTrees(parent) {
-  /*
-    Places primitive trees around the outside area.
-
-    Each tree is:
-      trunk  = CylinderGeometry, color #cc9029
-      leaves = ConeGeometry, color #457543
-
-    Each tree also gets a circular collider using treeColliderRadius.
-  */
-  const treePositions = [
-    [-42, 18],
-    [-34, 27],
-    [-22, 22],
-    [-8, 27],
-    [9, 22],
-    [24, 13],
-    [27, -7],
-    [20, -24],
-    [28, -38],
-    [8, -44],
-    [-12, -42],
-    [-33, -43],
-    [-48, -28],
-    [-45, -8],
-    [-51, 10],
-    [-31, 15],
-  ];
-
-  treePositions.forEach(([x, z], index) => {
-    const tree = createLowPolyTree(index);
-    tree.position.set(x, 0, z);
-    parent.add(tree);
-    addSolidCircle(x, z, treeColliderRadius);
-  });
-}
-
-function createLowPolyTree(index) {
-  /*
-    Builds one tree as a THREE.Group so the trunk and leaves travel together if
-    the tree is moved, cloned, or removed later.
-
-    The cone has only 7 radial segments on purpose: this keeps the low-poly
-    tabletop/game-piece look.
-  */
-  const group = new THREE.Group();
-  const trunk = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.22, 0.28, 1.35, 7),
-    treeTrunkMaterial,
-  );
-  const leaves = new THREE.Mesh(
-    new THREE.ConeGeometry(1.15, 3.2, 7),
-    treeLeafMaterial,
-  );
-
-  group.name = `low-poly-tree-${index + 1}`;
-  trunk.position.y = 0.675;
-  leaves.position.y = 2.45;
-  leaves.rotation.y = index * 0.37;
-  group.add(trunk, leaves);
-  return group;
-}
-
-function buildGhostSpheres(count) {
-  /*
-    Recycled from the avatar build: floating wireframe ghost spheres.
-
-    Each visible sphere is actually two meshes sharing one position:
-      1. a wireframe sphere
-      2. a larger, very transparent glow sphere
-
-    The function returns an array of motion records instead of only the meshes.
-    updateGhostSphereMotion() uses those records every frame.
-  */
-  const spheres = [];
-  const geometry = new THREE.SphereGeometry(1, 14, 10);
-
-  for (let index = 0; index < count; index += 1) {
-    const group = new THREE.Group();
-    const radius = 0.055 + Math.random() * 0.12;
-    const basePosition = makeGhostSpherePosition();
-    const wire = new THREE.Mesh(geometry, ghostSphereMaterial.clone());
-    const glow = new THREE.Mesh(geometry, ghostGlowMaterial.clone());
-
-    wire.scale.setScalar(radius);
-    wire.material.opacity = 0.34 + Math.random() * 0.28;
-    glow.scale.setScalar(radius * 2.15);
-    glow.material.opacity = 0.018 + Math.random() * 0.04;
-
-    group.position.copy(basePosition);
-    group.add(glow, wire);
-    scene.add(group);
-
-    spheres.push({
-      group,
-      basePosition,
-      // Maximum drift away from basePosition. The actual offset is multiplied
-      // by a sine wave in updateGhostSphereMotion().
-      drift: new THREE.Vector3(
-        (Math.random() - 0.5) * 0.7,
-        (Math.random() - 0.5) * 0.5,
-        (Math.random() - 0.5) * 0.7,
-      ),
-      // Each sphere gets a unique phase and speed so the movement does not look
-      // synchronized or mechanical.
-      phase: Math.random() * Math.PI * 2,
-      speed: 0.2 + Math.random() * 0.55,
-      spin: new THREE.Vector3(
-        Math.random() * 0.25,
-        Math.random() * 0.35,
-        Math.random() * 0.2,
-      ),
-    });
-  }
-
-  return spheres;
-}
-
-function makeGhostSpherePosition() {
-  /*
-    Picks a starting position that hugs either:
-      - the ceiling, or
-      - one of the four outside walls
-
-    face is a random selector:
-      < 0.48     ceiling
-      < 0.61     west wall
-      < 0.74     east wall
-      < 0.87     north wall
-      otherwise  south wall
-
-    The random ranges avoid the exact edges so spheres do not spawn halfway
-    outside the enclosure.
-  */
-  const half = outsideSize / 2;
-  const face = Math.random();
-  const minX = outsideCenter.x - half;
-  const maxX = outsideCenter.x + half;
-  const minZ = outsideCenter.z - half;
-  const maxZ = outsideCenter.z + half;
-
-  if (face < 0.48) {
-    return new THREE.Vector3(
-      THREE.MathUtils.randFloat(minX + 3, maxX - 3),
-      roomSize - THREE.MathUtils.randFloat(0.4, 2.5),
-      THREE.MathUtils.randFloat(minZ + 3, maxZ - 3),
-    );
-  }
-
-  if (face < 0.61) {
-    return new THREE.Vector3(
-      minX + THREE.MathUtils.randFloat(0.5, 1.8),
-      THREE.MathUtils.randFloat(4.5, roomSize - 1),
-      THREE.MathUtils.randFloat(minZ + 3, maxZ - 3),
-    );
-  }
-
-  if (face < 0.74) {
-    return new THREE.Vector3(
-      maxX - THREE.MathUtils.randFloat(0.5, 1.8),
-      THREE.MathUtils.randFloat(4.5, roomSize - 1),
-      THREE.MathUtils.randFloat(minZ + 3, maxZ - 3),
-    );
-  }
-
-  if (face < 0.87) {
-    return new THREE.Vector3(
-      THREE.MathUtils.randFloat(minX + 3, maxX - 3),
-      THREE.MathUtils.randFloat(4.5, roomSize - 1),
-      minZ + THREE.MathUtils.randFloat(0.5, 1.8),
-    );
-  }
-
-  return new THREE.Vector3(
-    THREE.MathUtils.randFloat(minX + 3, maxX - 3),
-    THREE.MathUtils.randFloat(4.5, roomSize - 1),
-    maxZ - THREE.MathUtils.randFloat(0.5, 1.8),
-  );
-}
-
-function updateGhostSphereMotion(elapsed) {
-  /*
-    Animates the ghost spheres.
-
-    Formula:
-      offset = sin(elapsed * speed + phase)
-      currentPosition = basePosition + drift * offset
-
-    where:
-      elapsed = seconds since page start
-      speed   = individual sphere speed multiplier
-      phase   = individual starting angle in radians
-      drift   = maximum movement vector from the base position
-
-    Result:
-      Each sphere eases back and forth around its own home point while spinning.
-  */
-  ghostSpheres.forEach((sphere) => {
-    const offset = Math.sin(elapsed * sphere.speed + sphere.phase);
-
-    sphere.group.position.set(
-      sphere.basePosition.x + sphere.drift.x * offset,
-      sphere.basePosition.y + sphere.drift.y * offset,
-      sphere.basePosition.z + sphere.drift.z * offset,
-    );
-
-    sphere.group.rotation.x += sphere.spin.x * 0.01;
-    sphere.group.rotation.y += sphere.spin.y * 0.01;
-    sphere.group.rotation.z += sphere.spin.z * 0.01;
-  });
+  disk.name = "default-rig-height-wire-disk";
+  disk.position.set(0, DEFAULT_RIG_DIMENSIONS.headY, 0);
+  disk.rotation.x = Math.PI / 2;
+  disk.renderOrder = 8;
+  return disk;
 }
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -1305,6 +497,17 @@ const state = {
   importedPreview: null,
   importedSkin: null,
   importedMeshStatus: "no mesh loaded",
+  /*
+    meshBlobUrl holds the object URL created when a user browses for a local
+    file using the "open fileâ€¦" button. It is separate from
+    rigTuning.importedMeshPath because:
+      - The blob URL is a session-only memory reference. It cannot be saved or
+        shared, and it must be revoked when a new file replaces it.
+      - importedMeshPath shows the human-readable filename or asset path.
+    getActiveMeshPath() combines both: blob URL takes priority, typed path is
+    the fallback, and DEFAULT_IMPORTED_MESH_PATH is the last resort.
+  */
+  meshBlobUrl: null,
   gui: null,
   guiControllers: [],
   guiFolders: {},
@@ -1382,9 +585,27 @@ const mouseJointEditor = {
     bounds, and encounter trigger zones.
 */
 state.encounterRuntime = createEncounterRuntime(ENCOUNTER_DEFINITIONS);
-state.worldDebugView = createWorldDebugView();
+state.worldDebugView = createWorldDebugView(
+  state.encounterRuntime,
+  rigTuning.colliderRadius + rigCollisionMargin,
+);
 scene.add(state.worldDebugView.group);
 applyWorldDebugVisibility();
+
+/*
+  COMBAT ENCOUNTER INIT
+    - Adds the 25% opacity trigger cylinder to the scene.
+    - Preloads battle.mp3 (kept silent until the player walks into the trigger).
+    - The enemy.glb itself is loaded lazily on first trigger fire so page load
+      stays fast for non-combat sessions.
+  All future combat updates happen via updateCombatEncounter() inside animate().
+*/
+initCombatEncounter({
+  scene,
+  controlState,
+  rigTuning,
+  backgroundAudio: myAudio,
+});
 
 function makeDefaultRigTuning() {
   /*
@@ -1431,6 +652,10 @@ function makeDefaultRigTuning() {
     armTrailAmplitude: PRESETS.calmAlien.armTrailAmplitude,
     damping: PRESETS.calmAlien.damping,
     walkAmplitude: 1,
+    walkHipSway: 0.075,
+    walkHipBob: 0.026,
+    walkHipTilt: 0.055,
+    walkHipTwist: 0.045,
     jumpHeight: 0.85,
     jumpDuration: 0.9,
     jumpGravityScale: 1,
@@ -1440,12 +665,12 @@ function makeDefaultRigTuning() {
     rootOffsetX: 0,
     rootOffsetY: 0,
     rootOffsetZ: 0,
-  labelScale: 1,
-  axisMarkerJoint: "head",
-  axisMarkerScale: 0.32,
-  mouseJointEditMode: false,
-  mouseJointEditJoint: "head",
-  jointPointOffsets: makeDefaultJointPointOffsets(),
+    labelScale: 1,
+    axisMarkerJoint: "head",
+    axisMarkerScale: 0.32,
+    mouseJointEditMode: false,
+    mouseJointEditJoint: "head",
+    jointPointOffsets: makeDefaultJointPointOffsets(),
     bindRotationOffsets: makeDefaultBindRotationOffsets(),
     ...DEFAULT_RIG_DIMENSIONS,
   };
@@ -1640,6 +865,7 @@ function loadRigTuningFromBrowser() {
   // Reloads saved tuning, rebuilds the skeleton from it, then redraws the GUI.
   assignRigTuningValues(loadSavedRigTuning(makeDefaultRigTuning()));
   state.walkPhase = 0;
+  state.walkArmSwing = { left: 0, right: 0 };
   rebuildSkeletonWorkshop();
   if (rigTuning.importedMeshPath) {
     loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
@@ -1675,51 +901,6 @@ function clearSavedRigTuning() {
   // Removes the localStorage copy. The live rig is not changed until reload/load.
   window.localStorage.removeItem(STORAGE_KEY);
   console.info("Cleared saved Empyrean tuning.");
-}
-
-function buildRoom() {
-  /*
-    Legacy single-room helper from an earlier stage.
-
-    It is left here as a reference, but the active world now comes from
-    buildExplorationWorld(). The call near the bottom of the file is commented
-    out on purpose.
-  */
-  const room = new THREE.Mesh(
-    new THREE.BoxGeometry(12, 5.2, 12),
-    new THREE.MeshBasicMaterial({
-      color: WALL_COLOR,
-      side: THREE.BackSide,
-    }),
-  );
-  room.position.y = 2.6;
-  scene.add(room);
-
-  const grid = new THREE.GridHelper(12, 24, "#172017", "#050505");
-  grid.material.transparent = true;
-  grid.material.opacity = 0.3;
-  grid.position.y = 0.003;
-  scene.add(grid);
-}
-
-function buildLighting() {
-  /*
-    Lighting stack:
-      HemisphereLight = soft ambient sky/ground fill
-      DirectionalLight = main readable key light
-      PointLight = small green character/world accent
-
-    MeshBasicMaterial objects, such as the ghost spheres, ignore these lights.
-  */
-  scene.add(new THREE.HemisphereLight("#91aa91", "#020202", 1.25));
-
-  const keyLight = new THREE.DirectionalLight("#dff5df", 2.15);
-  keyLight.position.set(-2.5, 5.5, 3.5);
-  scene.add(keyLight);
-
-  const pointLight = new THREE.PointLight("#639464", 1.45, 6.5);
-  pointLight.position.set(0, 2.5, 2.2);
-  scene.add(pointLight);
 }
 
 function buildSkeletonWorkshop() {
@@ -1799,15 +980,55 @@ function createJoint(name, position = [0, 0, 0]) {
 
     A joint is a THREE.Group, not a Mesh. It has no visible geometry by itself.
     Its job is to be a transform/pivot that can rotate, move, and carry child
-    joints along with it.
+    joints along with it automatically via Three.js's scene-graph parenting.
 
-    userData stores multiple versions of the rest pose:
-      baseBindLocalPosition     = original position from createSkeleton()
-      bindLocalPosition         = base position plus slider offsets
-      baseBindLocalQuaternion   = original neutral rotation
-      bindLocalQuaternion       = base rotation plus bind rotation sliders
-      bindLocalEuler            = Euler version of the bind rotation offset
-      bindLocalScale            = neutral scale
+    WHY THREE.Group, NOT THREE.Bone?
+      Three.js Bones are built for SkinnedMesh and come with extra constraints.
+      Using plain Groups here keeps the puppet joints simple and inspectable â€”
+      you can attach debug markers, labels, and bone lines to them without
+      fighting the bone system. The actual Three.js Bone objects used for mesh
+      skinning are created separately and just copy their transforms from these
+      puppet joints every frame.
+
+    THE PARENT-CHILD RELATIONSHIP IN THREE.JS:
+      When you call parent.add(child), the child's .position, .rotation, and
+      .scale are interpreted in the PARENT'S local space. If the parent moves
+      or rotates, the child moves and rotates with it automatically. This is
+      the scene graph. It is why:
+        - Rotating the chest carries the neck, head, and both arms.
+        - Moving the pelvis carries both legs.
+        - Moving the body joint carries everything.
+
+      You never need to manually update child positions when a parent moves â€”
+      Three.js handles that through the matrix hierarchy.
+
+    userData FIELDS (the rig's "ground truth" for every joint's rest pose):
+
+      baseBindLocalPosition:
+        The joint's ORIGINAL position from createSkeleton(). Never changes after
+        creation. This is the zero-reference for slider offsets.
+
+      bindLocalPosition:
+        base + offset. What the joint's position should be when at rest.
+        Updated by applyJointPointOffsets() whenever a slider or drag changes an
+        offset. resetSkeletonToBindPose() copies this back to joint.position.
+
+      baseBindLocalQuaternion:
+        The joint's ORIGINAL rotation from createSkeleton(). All joints start
+        at identity (no rotation), so this is typically (0,0,0,1).
+
+      bindLocalQuaternion:
+        base rotation multiplied by any bind-pose rotation offsets. Updated by
+        applyBindRotationOffsets(). Animation functions then add motion ON TOP of
+        this rotation, so the aligned rest pose is always the neutral reference.
+
+      bindLocalEuler:
+        The Euler-angle version of the bind rotation offset. Stored separately
+        because dampJointRotation() adds animation deltas in Euler space.
+
+      bindLocalScale:
+        Neutral scale (1,1,1). Kept in userData so resetSkeletonToBindPose()
+        can restore it without hard-coding the value.
   */
   const joint = new THREE.Group();
   joint.name = name;
@@ -1996,799 +1217,15 @@ function updateRigColliderVisual() {
     1,
     true,
   );
-  applyRoomCollision();
+  controlState.position.copy(
+    resolveRigRoomCollision(controlState.position, {
+      radius: rigTuning.colliderRadius + rigCollisionMargin,
+      rootOffsetX: rigTuning.rootOffsetX,
+      rootOffsetZ: rigTuning.rootOffsetZ,
+    }),
+  );
   rebuildWorldDebugView();
   applyVisibility();
-}
-
-function renderDefaultImportedMesh() {
-  /*
-    Step 1 of the render-adjust-rig workflow:
-      render the mesh as a static preview.
-
-    The preview is not skinned yet. This lets you move pivots and bind-pose
-    rotations while visually comparing the skeleton to the model.
-  */
-  rigTuning.importedMeshPath =
-    rigTuning.importedMeshPath || DEFAULT_IMPORTED_MESH_PATH;
-  loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
-  updateGuiDisplays();
-}
-
-function loadDefaultImportedMesh() {
-  /*
-    Convenience shortcut:
-      load the default mesh and rig it immediately.
-
-    Useful when the current pivot setup is already good enough and you do not
-    need the separate preview stage.
-  */
-  rigTuning.importedMeshPath =
-    rigTuning.importedMeshPath || DEFAULT_IMPORTED_MESH_PATH;
-  rigCurrentImportedMesh();
-  updateGuiDisplays();
-}
-
-function rerigImportedMesh() {
-  // Re-runs the current mesh through the generated skin-weight pipeline.
-  // Use after changing offsets, rotations, scale, or import orientation.
-  if (!state.importedSkin) {
-    return;
-  }
-
-  loadImportedMeshFromPath(rigTuning.importedMeshPath);
-}
-
-function rigCurrentImportedMesh() {
-  /*
-    Step 2 of the render-adjust-rig workflow:
-      if a preview GLTF is already loaded, reuse that exact loaded data and rig
-      it. Otherwise, load from rigTuning.importedMeshPath.
-
-    Reusing the preview avoids needing the user to type the path again.
-  */
-  if (state.importedPreview?.gltf) {
-    const path = state.importedPreview.path;
-
-    rigImportedMeshFromGltfClone(state.importedPreview.gltf, path);
-    state.importedMeshStatus = `rigged ${path}`;
-    console.info("Rigged rendered Empyrean mesh.", {
-      path,
-      meshes: state.importedSkin.meshes.length,
-      bindMode: "generated position weights",
-    });
-    return;
-  }
-
-  loadImportedMeshFromPath(rigTuning.importedMeshPath);
-}
-
-function refreshImportedMeshReference() {
-  /*
-    Called when import sliders change.
-
-    If the mesh is currently only a preview, refresh the preview.
-    If it is already rigged, refresh the rigged version.
-  */
-  if (state.importedPreview) {
-    loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
-    return;
-  }
-
-  if (state.importedSkin) {
-    loadImportedMeshFromPath(rigTuning.importedMeshPath);
-  }
-}
-
-function clearImportedMesh() {
-  // Removes both preview and rigged mesh from the scene. The skeleton remains.
-  disposeImportedPreview();
-  disposeImportedSkin();
-  state.importedMeshStatus = "mesh cleared";
-  console.info("Cleared imported Empyrean mesh.");
-}
-
-function disposeImportedPreview() {
-  // Safely removes the static imported preview and disposes its geometries,
-  // materials, and textures so repeated imports do not leak GPU memory.
-  if (!state.importedPreview?.group) {
-    state.importedPreview = null;
-    return;
-  }
-
-  state.importedPreview.group.parent?.remove(state.importedPreview.group);
-  disposeObjectTree(state.importedPreview.group);
-  state.importedPreview = null;
-}
-
-function disposeImportedSkin() {
-  // Safely removes the generated SkinnedMesh version of the import.
-  if (!state.importedSkin?.group) {
-    state.importedSkin = null;
-    return;
-  }
-
-  state.importedSkin.group.parent?.remove(state.importedSkin.group);
-  disposeObjectTree(state.importedSkin.group);
-  state.importedSkin = null;
-}
-
-function loadImportedMeshPreviewFromPath(path = DEFAULT_IMPORTED_MESH_PATH) {
-  /*
-    Asynchronously loads a GLB/GLTF and renders it as a static reference.
-
-    gltfLoader.load() callbacks:
-      success callback   = renderImportedMeshPreview()
-      progress callback  = undefined for now
-      error callback     = status + console error
-  */
-  if (!path) {
-    return;
-  }
-
-  state.importedMeshStatus = `rendering ${path}`;
-
-  gltfLoader.load(
-    path,
-    (gltf) => {
-      try {
-        renderImportedMeshPreview(gltf, path);
-        state.importedMeshStatus = `rendered ${path}`;
-        console.info("Rendered Empyrean mesh preview.", {
-          path,
-          meshes: state.importedPreview.meshes.length,
-          mode: "static reference mesh",
-        });
-      } catch (error) {
-        state.importedMeshStatus = "mesh render failed";
-        console.error("Could not render imported mesh preview.", error);
-      }
-    },
-    undefined,
-    (error) => {
-      state.importedMeshStatus = "mesh load failed";
-      console.error(
-        `Could not load imported mesh preview from ${path}.`,
-        error,
-      );
-    },
-  );
-}
-
-function renderImportedMeshPreview(gltf, path) {
-  // Clears any previous import, builds a static preview group, and attaches it
-  // to the skeleton root so root alignment controls affect both rig and mesh.
-  disposeImportedPreview();
-  disposeImportedSkin();
-
-  state.importedPreview = createPreviewMeshFromGltf(gltf, path);
-  state.skeleton.root.add(state.importedPreview.group);
-  applyImportedMeshPresentation();
-}
-
-function loadImportedMeshFromPath(path = DEFAULT_IMPORTED_MESH_PATH) {
-  /*
-    Loads a GLB/GLTF and immediately converts it into a generated SkinnedMesh.
-
-    This is the one-click path. The more careful workflow is:
-      1 render mesh
-      adjust pivots/sliders
-      2 rig rendered mesh
-  */
-  if (!path) {
-    return;
-  }
-
-  state.importedMeshStatus = `loading ${path}`;
-
-  gltfLoader.load(
-    path,
-    (gltf) => {
-      try {
-        rigImportedMeshFromGltfClone(gltf, path);
-        state.importedMeshStatus = `loaded ${path}`;
-        console.info("Imported and rigged Empyrean mesh.", {
-          path,
-          meshes: state.importedSkin.meshes.length,
-          bindMode: "generated position weights",
-        });
-      } catch (error) {
-        state.importedMeshStatus = "mesh rig failed";
-        console.error("Could not rig imported mesh.", error);
-      }
-    },
-    undefined,
-    (error) => {
-      state.importedMeshStatus = "mesh load failed";
-      console.error(`Could not load imported mesh from ${path}.`, error);
-    },
-  );
-}
-
-function rigImportedMeshFromGltfClone(gltf, path) {
-  /*
-    Converts loaded GLTF data into the rigged skin version.
-
-    The resulting state.importedSkin contains:
-      group          = root group added to the scene
-      meshes         = one or more THREE.SkinnedMesh objects
-      boneBindings   = maps from puppet joint names to generated bones
-      path           = source asset path
-  */
-  disposeImportedPreview();
-  disposeImportedSkin();
-
-  state.importedSkin = createRiggedSkinFromGltf(gltf, path);
-  state.skeleton.root.add(state.importedSkin.group);
-  syncImportedSkinToPuppet();
-  applyImportedMeshPresentation();
-}
-
-function createPreviewMeshFromGltf(gltf, path) {
-  /*
-    Creates a non-rigged preview mesh.
-
-    This uses the same geometry preparation as the rigged version, which means:
-      - import rotation sliders apply
-      - auto-fit scaling applies
-      - offset sliders apply
-
-    The only thing missing is skinIndex/skinWeight attributes and bones.
-  */
-  const sourceMeshes = collectImportableMeshes(gltf.scene);
-
-  if (!sourceMeshes.length) {
-    throw new Error("The GLB did not contain any Mesh objects.");
-  }
-
-  const preparedMeshes = prepareImportedGeometries(sourceMeshes);
-  const group = new THREE.Group();
-  const meshes = preparedMeshes.map((meshInfo) => {
-    const mesh = new THREE.Mesh(meshInfo.geometry, meshInfo.material);
-
-    mesh.name = `${meshInfo.name || "imported-mesh"}-preview`;
-    mesh.frustumCulled = false;
-    group.add(mesh);
-    return mesh;
-  });
-
-  group.name = "imported-static-avatar-preview";
-  group.userData.sourcePath = path;
-
-  return {
-    group,
-    gltf,
-    meshes,
-    path,
-  };
-}
-
-function createRiggedSkinFromGltf(gltf, path) {
-  /*
-    Converts imported mesh geometry into generated skin.
-
-    Process:
-      1. Collect all mesh objects from the GLTF scene.
-      2. Bake their world transforms into clone geometries.
-      3. Apply import rotation, centering, scale, and offset.
-      4. Read puppet bind positions.
-      5. Clone the puppet joint hierarchy as real THREE.Bone objects.
-      6. Generate skinIndex and skinWeight attributes per vertex.
-      7. Create THREE.SkinnedMesh and bind it to the generated skeleton.
-
-    Important:
-      The original puppet joints remain the animator-facing controls. The
-      generated bones are the mesh-facing deformation skeleton.
-  */
-  const sourceMeshes = collectImportableMeshes(gltf.scene);
-
-  if (!sourceMeshes.length) {
-    throw new Error("The GLB did not contain any Mesh objects.");
-  }
-
-  const preparedMeshes = prepareImportedGeometries(sourceMeshes);
-  const bindPositions = getBindPositionsByJointKey();
-  const skinMeshes = [];
-  const boneBindings = [];
-  const group = new THREE.Group();
-
-  group.name = "imported-rigged-avatar";
-  group.userData.sourcePath = path;
-
-  preparedMeshes.forEach((meshInfo) => {
-    const boneRig = createSkinBoneHierarchy();
-
-    addGeneratedSkinWeights(
-      meshInfo.geometry,
-      bindPositions,
-      boneRig.boneIndexByJointKey,
-    );
-
-    const skinnedMesh = new THREE.SkinnedMesh(
-      meshInfo.geometry,
-      meshInfo.material,
-    );
-    const skeleton = new THREE.Skeleton(boneRig.bones);
-
-    skinnedMesh.name = `${meshInfo.name || "imported-mesh"}-generated-skin`;
-    skinnedMesh.frustumCulled = false;
-    skinnedMesh.add(boneRig.rootBone);
-    skinnedMesh.bind(skeleton);
-
-    group.add(skinnedMesh);
-    skinMeshes.push(skinnedMesh);
-    boneBindings.push(boneRig.bonesByJointKey);
-  });
-
-  return {
-    group,
-    meshes: skinMeshes,
-    boneBindings,
-    path,
-  };
-}
-
-function collectImportableMeshes(root) {
-  /*
-    Finds every Mesh under the loaded GLTF scene.
-
-    GLB files can contain nested groups, transforms, and multiple mesh parts.
-    root.updateMatrixWorld(true) ensures each mesh has a correct world matrix
-    before prepareImportedGeometries() bakes those transforms into geometry.
-  */
-  const meshes = [];
-
-  root.updateMatrixWorld(true);
-  root.traverse((object) => {
-    if (object.isMesh && object.geometry) {
-      meshes.push(object);
-    }
-  });
-
-  return meshes;
-}
-
-function prepareImportedGeometries(sourceMeshes) {
-  /*
-    Prepares imported geometry for this workshop's coordinate space.
-
-    Formula summary:
-
-      local vertex
-        -> apply original mesh.matrixWorld
-        -> apply import rotation sliders
-        -> compute combined bounding box
-        -> translate so model is centered in X/Z and rests on Y = 0
-        -> scale to target height if auto-fit is enabled
-        -> apply user mesh offset sliders
-
-    Variables:
-      combinedBox = bounding box around every prepared mesh part
-      center      = geometric center of combinedBox
-      rawHeight   = combinedBox.max.y - combinedBox.min.y
-      targetHeight = skeleton height target from getImportedMeshTargetHeight()
-      autoFitScale = targetHeight / rawHeight when auto-fit is on, otherwise 1
-      finalScale   = autoFitScale * importedMeshScale slider
-
-    This is where future STL/GLB axis correction belongs. The import rotation
-    sliders already rotate around X/Y/Z before fitting.
-  */
-  const rotationMatrix = new THREE.Matrix4().makeRotationFromEuler(
-    new THREE.Euler(
-      rigTuning.importedMeshRotationX,
-      rigTuning.importedMeshRotationY,
-      rigTuning.importedMeshRotationZ,
-    ),
-  );
-  const prepared = sourceMeshes.map((mesh) => {
-    const geometry = mesh.geometry.clone();
-
-    geometry.applyMatrix4(mesh.matrixWorld);
-    geometry.applyMatrix4(rotationMatrix);
-    geometry.computeBoundingBox();
-
-    return {
-      name: mesh.name,
-      geometry,
-      material: cloneImportedMaterial(mesh.material),
-    };
-  });
-  const combinedBox = prepared.reduce((box, meshInfo) => {
-    box.union(meshInfo.geometry.boundingBox);
-    return box;
-  }, new THREE.Box3());
-  const center = combinedBox.getCenter(new THREE.Vector3());
-  const rawHeight = Math.max(0.001, combinedBox.max.y - combinedBox.min.y);
-  const targetHeight = getImportedMeshTargetHeight();
-  const autoFitScale = rigTuning.importedMeshAutoFit
-    ? targetHeight / rawHeight
-    : 1;
-  const finalScale = autoFitScale * rigTuning.importedMeshScale;
-  const offset = new THREE.Vector3(
-    rigTuning.importedMeshOffsetX,
-    rigTuning.importedMeshOffsetY,
-    rigTuning.importedMeshOffsetZ,
-  );
-
-  prepared.forEach((meshInfo) => {
-    /*
-      Translation math:
-
-        x' = x - center.x
-        y' = y - combinedBox.min.y
-        z' = z - center.z
-
-      That centers the model around the skeleton in X/Z and places the lowest
-      point at floor height before scaling/offsetting.
-    */
-    meshInfo.geometry.translate(-center.x, -combinedBox.min.y, -center.z);
-    meshInfo.geometry.scale(finalScale, finalScale, finalScale);
-    meshInfo.geometry.translate(offset.x, offset.y, offset.z);
-    meshInfo.geometry.computeBoundingBox();
-    meshInfo.geometry.computeBoundingSphere();
-  });
-
-  return prepared;
-}
-
-function cloneImportedMaterial(sourceMaterial) {
-  /*
-    Clones the imported material so workshop opacity/wireframe sliders do not
-    mutate the original GLTF material object.
-
-    If no material exists, a neutral gray MeshStandardMaterial is used.
-  */
-  const material = Array.isArray(sourceMaterial)
-    ? sourceMaterial.map((entry) => entry.clone())
-    : sourceMaterial?.clone?.() ||
-      new THREE.MeshStandardMaterial({ color: "#cfcfcf" });
-
-  getMaterialList(material).forEach((entry) => {
-    entry.side = THREE.DoubleSide;
-    entry.transparent = true;
-    entry.opacity = rigTuning.importedMeshOpacity;
-    entry.wireframe = rigTuning.importedMeshWireframe;
-    entry.needsUpdate = true;
-  });
-
-  return material;
-}
-
-function getMaterialList(material) {
-  // Imported meshes may have one material or an array of materials. This helper
-  // normalizes both shapes into an array so callers can loop safely.
-  return Array.isArray(material) ? material : [material];
-}
-
-function getImportedMeshTargetHeight() {
-  // headY is the top skeleton pivot, and the wire head extends slightly above it.
-  return Math.max(1, rigTuning.headY + 0.42);
-}
-
-function getBindPositionsByJointKey() {
-  /*
-    Computes bind-pose world positions for every puppet joint.
-
-    We do this manually instead of asking Three.js for current world positions
-    because animation may already be changing the live joints. Skin weights
-    should be based on the neutral bind pose, not the current animated pose.
-
-    Formula for each child:
-      worldPosition = parentWorldPosition +
-                      localBindPosition rotated by parentWorldQuaternion
-
-      worldQuaternion = parentWorldQuaternion * localBindQuaternion
-  */
-  const jointToKey = new Map(
-    Object.entries(state.skeleton.joints).map(([key, joint]) => [joint, key]),
-  );
-  const bindPositions = {};
-
-  function visit(joint, parentPosition, parentQuaternion) {
-    const key = jointToKey.get(joint);
-    const localPosition =
-      joint.userData.bindLocalPosition || joint.position || new THREE.Vector3();
-    const localQuaternion =
-      joint.userData.bindLocalQuaternion ||
-      joint.quaternion ||
-      new THREE.Quaternion();
-    const worldBindPosition = parentPosition
-      .clone()
-      .add(localPosition.clone().applyQuaternion(parentQuaternion));
-    const worldBindQuaternion = parentQuaternion
-      .clone()
-      .multiply(localQuaternion);
-
-    if (key) {
-      bindPositions[key] = worldBindPosition;
-    }
-
-    joint.children.forEach((child) => {
-      if (child.userData.isPuppetJoint) {
-        visit(child, worldBindPosition, worldBindQuaternion);
-      }
-    });
-  }
-
-  visit(
-    state.skeleton.joints.root,
-    new THREE.Vector3(),
-    new THREE.Quaternion(),
-  );
-  return bindPositions;
-}
-
-function createSkinBoneHierarchy() {
-  /*
-    Creates a real THREE.Bone hierarchy that mirrors the puppet joint hierarchy.
-
-    Why not use puppet joints as bones directly?
-      SkinnedMesh expects Bone objects arranged in a Skeleton. Keeping generated
-      bones separate lets the workshop controls stay as readable THREE.Group
-      pivots while the mesh deformation system gets what Three.js expects.
-
-    Returned maps:
-      bonesByJointKey      = joint name -> generated Bone object
-      boneIndexByJointKey  = joint name -> index used by skinIndex attribute
-  */
-  const jointToKey = new Map(
-    Object.entries(state.skeleton.joints).map(([key, joint]) => [joint, key]),
-  );
-  const bones = [];
-  const bonesByJointKey = {};
-  const boneIndexByJointKey = {};
-
-  function cloneJointAsBone(joint) {
-    const key = jointToKey.get(joint);
-    const bone = new THREE.Bone();
-
-    bone.name = `${key || joint.name}-generated-bone`;
-    bone.position.copy(joint.userData.bindLocalPosition || joint.position);
-    bone.quaternion.copy(
-      joint.userData.bindLocalQuaternion || joint.quaternion,
-    );
-    bone.scale.copy(joint.userData.bindLocalScale || joint.scale);
-
-    if (key) {
-      boneIndexByJointKey[key] = bones.length;
-      bonesByJointKey[key] = bone;
-    }
-
-    bones.push(bone);
-
-    joint.children.forEach((child) => {
-      if (child.userData.isPuppetJoint) {
-        bone.add(cloneJointAsBone(child));
-      }
-    });
-
-    return bone;
-  }
-
-  const rootBone = cloneJointAsBone(state.skeleton.joints.root);
-
-  return {
-    rootBone,
-    bones,
-    bonesByJointKey,
-    boneIndexByJointKey,
-  };
-}
-
-function addGeneratedSkinWeights(geometry, bindPositions, boneIndexByJointKey) {
-  /*
-    Adds skinIndex and skinWeight attributes to geometry.
-
-    For every vertex:
-      1. chooseSkinInfluences() decides up to four puppet joints that should
-         affect that vertex.
-      2. skinIndex stores the numeric bone indices.
-      3. skinWeight stores how strongly each bone affects the vertex.
-
-    Three.js expects four slots per vertex, so unused slots are filled with a
-    harmless fallback joint and zero weight.
-  */
-  const positionAttribute = geometry.attributes.position;
-  const skinIndices = [];
-  const skinWeights = [];
-  const vertex = new THREE.Vector3();
-
-  for (let index = 0; index < positionAttribute.count; index += 1) {
-    vertex.fromBufferAttribute(positionAttribute, index);
-
-    const influences = chooseSkinInfluences(vertex, bindPositions);
-
-    for (let slot = 0; slot < 4; slot += 1) {
-      const influence = influences[slot] || influences[influences.length - 1];
-
-      skinIndices.push(boneIndexByJointKey[influence.key] ?? 0);
-      skinWeights.push(influence.weight);
-    }
-  }
-
-  geometry.setAttribute(
-    "skinIndex",
-    new THREE.Uint16BufferAttribute(skinIndices, 4),
-  );
-  geometry.setAttribute(
-    "skinWeight",
-    new THREE.Float32BufferAttribute(skinWeights, 4),
-  );
-}
-
-function chooseSkinInfluences(vertex, bindPositions) {
-  /*
-    Chooses candidate joints for one vertex using rough anatomical regions.
-
-    This is intentionally approximate. It is a generated rigging pass, not a
-    hand-painted professional skin. The goal is to get useful deformation fast.
-
-    Decision tree:
-      - vertex at/above neck -> head and neck
-      - vertex outside torso at arm height -> shoulder/elbow/wrist/palm
-      - vertex below pelvis and away from center -> hip/knee/ankle/foot
-      - everything else -> pelvis/spine/chest/neck
-
-    The chosen candidate joints are then weighted by distance.
-  */
-  const pelvisY = bindPositions.pelvis.y;
-  const neckY = bindPositions.neck.y;
-  const shoulderY = Math.max(
-    bindPositions.leftShoulder.y,
-    bindPositions.rightShoulder.y,
-  );
-  const wristY = Math.min(
-    bindPositions.leftWrist.y,
-    bindPositions.rightWrist.y,
-  );
-  const shoulderX = Math.max(
-    Math.abs(bindPositions.leftShoulder.x),
-    Math.abs(bindPositions.rightShoulder.x),
-  );
-  const hipX = Math.max(
-    Math.abs(bindPositions.leftHip.x),
-    Math.abs(bindPositions.rightHip.x),
-  );
-  const sideName = vertex.x < 0 ? "left" : "right";
-  const absX = Math.abs(vertex.x);
-  const outsideTorso = absX > Math.max(hipX + 0.12, shoulderX * 0.58);
-  const inArmHeight = vertex.y > wristY - 0.3 && vertex.y < shoulderY + 0.5;
-  const inLegHeight = vertex.y <= pelvisY + 0.16;
-
-  if (vertex.y >= neckY) {
-    return weightedNearestJoints(vertex, ["head", "neck"], bindPositions);
-  }
-
-  if (outsideTorso && inArmHeight) {
-    return weightedNearestJoints(
-      vertex,
-      [
-        `${sideName}Shoulder`,
-        `${sideName}Elbow`,
-        `${sideName}Wrist`,
-        `${sideName}Palm`,
-      ],
-      bindPositions,
-    );
-  }
-
-  if (inLegHeight && absX > hipX * 0.35) {
-    return weightedNearestJoints(
-      vertex,
-      [
-        `${sideName}Hip`,
-        `${sideName}Knee`,
-        `${sideName}Ankle`,
-        `${sideName}Foot`,
-      ],
-      bindPositions,
-    );
-  }
-
-  return weightedNearestJoints(
-    vertex,
-    ["pelvis", "spineBase", "chest", "neck"],
-    bindPositions,
-  );
-}
-
-function weightedNearestJoints(vertex, jointKeys, bindPositions) {
-  /*
-    Calculates inverse-square distance weights.
-
-    Formula:
-      rawWeight = 1 / distance^2
-      normalizedWeight = rawWeight / sum(all rawWeights)
-
-    where:
-      distance = distance from the vertex to a candidate bind joint
-
-    Why inverse-square?
-      Nearby joints dominate strongly, but farther joints still contribute a
-      little. That creates smoother bends than simply picking one nearest joint.
-  */
-  const weighted = jointKeys
-    .filter((key) => bindPositions[key])
-    .map((key) => {
-      const distance = Math.max(0.0001, vertex.distanceTo(bindPositions[key]));
-      return {
-        key,
-        rawWeight: 1 / (distance * distance),
-      };
-    })
-    .sort((a, b) => b.rawWeight - a.rawWeight)
-    .slice(0, 4);
-  const total = weighted.reduce((sum, entry) => sum + entry.rawWeight, 0) || 1;
-  const normalized = weighted.map((entry) => ({
-    key: entry.key,
-    weight: entry.rawWeight / total,
-  }));
-
-  while (normalized.length < 4) {
-    normalized.push({ key: normalized[0]?.key || "body", weight: 0 });
-  }
-
-  return normalized;
-}
-
-function syncImportedSkinToPuppet() {
-  /*
-    Every animation frame, copies current puppet joint transforms onto generated
-    bones with matching joint keys.
-
-    Puppet joint:
-      human-readable control object, animated by this file
-
-    Generated bone:
-      deformation object used by THREE.SkinnedMesh
-
-    This bridge is what makes the imported mesh move with the workshop skeleton.
-  */
-  if (!state.importedSkin) {
-    return;
-  }
-
-  state.importedSkin.boneBindings.forEach((bonesByJointKey) => {
-    Object.entries(bonesByJointKey).forEach(([key, bone]) => {
-      const joint = state.skeleton.joints[key];
-
-      if (!joint || key === "root") {
-        bone.position.copy(
-          joint?.userData.bindLocalPosition || new THREE.Vector3(),
-        );
-        bone.quaternion.identity();
-        bone.scale.set(1, 1, 1);
-        return;
-      }
-
-      bone.position.copy(joint.position);
-      bone.quaternion.copy(joint.quaternion);
-      bone.scale.copy(joint.scale);
-    });
-  });
-}
-
-function applyImportedMeshPresentation() {
-  // Applies display-only mesh settings: visible, opacity, and wireframe.
-  // It works for both the static preview and the rigged skin.
-  const targets = [state.importedPreview, state.importedSkin].filter(Boolean);
-
-  if (!targets.length) {
-    return;
-  }
-
-  targets.forEach((target) => {
-    target.group.visible = rigTuning.importedMeshVisible;
-    target.meshes.forEach((mesh) => {
-      mesh.visible = rigTuning.importedMeshVisible;
-      getMaterialList(mesh.material).forEach((material) => {
-        material.transparent = true;
-        material.opacity = rigTuning.importedMeshOpacity;
-        material.wireframe = rigTuning.importedMeshWireframe;
-        material.needsUpdate = true;
-      });
-    });
-  });
 }
 
 function exportRigPackageToConsole() {
@@ -2865,8 +1302,8 @@ function makeJointMarker(joint, markerRadius, material) {
       is kept because it is useful for future debug-marker experiments.
   */
   if (joint.name === "head") {
-    const headRadius = markerRadius * 5.2;
-    const headLength = markerRadius * 7.5;
+    const headRadius = markerRadius * 3.2;
+    const headLength = markerRadius * 4.8;
 
     const marker = new THREE.Mesh(
       new THREE.CapsuleGeometry(headRadius, headLength, 12, 18),
@@ -3019,8 +1456,25 @@ function createDebugView(skeleton, options = {}) {
       });
     },
     refreshBones() {
-      // Called after joint point offsets move pivots. The line geometry stores
-      // child.position as a vertex, so it must be refreshed when pivots move.
+      /*
+        Re-syncs every visible debug bone line to the live child joint position.
+
+        Important detail:
+          The marker sphere is a child of the joint, so it follows automatically.
+          The bone guide line is different: it is a BufferGeometry attached to
+          the parent joint, and its second vertex stores a COPY of child.position.
+
+        Formula:
+          line vertex 0 = parent local origin = (0, 0, 0)
+          line vertex 1 = child local position = child.position
+
+        That means any system that changes joint.position after the line is
+        created must call refreshBones(). Pivot sliders call it immediately.
+        The live walk cycle must also call it every frame, because knee/ankle/
+        foot positions are animated for readability. Without this, the marker
+        moves correctly but the line endpoint appears to detach and dance near
+        the joint.
+      */
       boneLines.forEach(({ line, child }) => {
         const positionAttribute = line.geometry.attributes.position;
         positionAttribute.setXYZ(
@@ -3034,322 +1488,6 @@ function createDebugView(skeleton, options = {}) {
       });
     },
   };
-}
-
-function makeLabelSprite(text, options = {}) {
-  /*
-    Creates a 2D canvas label and turns it into a Three.js Sprite.
-
-    Sprites always face the camera, which makes joint names readable while
-    orbiting. The canvas is used as a texture.
-  */
-  const canvas = document.createElement("canvas");
-  canvas.width = 500;
-  canvas.height = 80;
-
-  const context = canvas.getContext("2d");
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  context.fillStyle = "rgba(0, 0, 0, 0.55)";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.strokeStyle = options.color || GUIDE_COLOR;
-  context.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
-  context.fillStyle = options.color || GUIDE_COLOR;
-  context.font = "70px monospace";
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.fillText(text, canvas.width / 2, canvas.height / 2);
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-
-  const sprite = new THREE.Sprite(
-    new THREE.SpriteMaterial({
-      map: texture,
-      transparent: true,
-      depthTest: false,
-    }),
-  );
-  sprite.scale.set(0.34 * options.scale, 0.085 * options.scale, 1);
-  return sprite;
-}
-
-function createWorldDebugView() {
-  /*
-    Builds the optional "collision vision" overlay.
-
-    This is the visual counterpart to worldCollision and encounters.js.
-
-    It shows:
-      - wall/outside solid rectangles
-      - tree circular colliders
-      - outside movement bounds
-      - encounter trigger zones
-      - optional encounter labels
-
-    Important:
-      These debug meshes do not participate in collision. They are only visual
-      markers that help you place world objects and triggers.
-  */
-  const group = new THREE.Group();
-  const wallColliders = [];
-  const treeColliders = [];
-  const outsideBounds = [];
-  const encounterZones = [];
-  const encounterLabels = [];
-  const encounterObjectsById = new Map();
-  const lift = SOLO_TWEAKS.worldDebug.floorLift;
-
-  group.name = "world-debug-overlay";
-  group.renderOrder = 50;
-
-  worldCollision.solidRects.forEach((rect, index) => {
-    const mesh = makeDebugRectMesh(
-      rect,
-      SOLO_TWEAKS.worldDebug.wallColor,
-      0.28,
-      lift,
-    );
-
-    mesh.name = `debug-wall-collider-${index + 1}`;
-    wallColliders.push(mesh);
-    group.add(mesh);
-  });
-
-  worldCollision.solidCircles.forEach((circle, index) => {
-    const mesh = makeDebugCircleMesh(
-      circle.centerX,
-      circle.centerZ,
-      circle.radius,
-      SOLO_TWEAKS.worldDebug.treeColor,
-      0.34,
-      lift + 0.012,
-    );
-
-    mesh.name = `debug-tree-collider-${index + 1}`;
-    treeColliders.push(mesh);
-    group.add(mesh);
-  });
-
-  makeDebugBoundsMeshes().forEach((mesh) => {
-    outsideBounds.push(mesh);
-    group.add(mesh);
-  });
-
-  state.encounterRuntime.definitions.forEach((encounter) => {
-    const zone = makeEncounterDebugMesh(encounter, lift + 0.024);
-
-    if (!zone) {
-      return;
-    }
-
-    zone.name = `debug-encounter-zone-${encounter.id}`;
-    zone.userData.baseOpacity = zone.material.opacity;
-    zone.userData.activeOpacity = Math.min(zone.material.opacity + 0.26, 0.72);
-    zone.userData.encounterId = encounter.id;
-    encounterZones.push(zone);
-    encounterObjectsById.set(encounter.id, zone);
-    group.add(zone);
-
-    const label = makeLabelSprite(encounter.label || encounter.id, {
-      color: encounter.debugColor || SOLO_TWEAKS.worldDebug.encounterColor,
-      scale: 0.72,
-    });
-    const center = getEncounterCenter(encounter);
-
-    label.name = `debug-encounter-label-${encounter.id}`;
-    label.position.set(center.x, 0.48, center.y);
-    label.renderOrder = 60;
-    encounterLabels.push(label);
-    group.add(label);
-  });
-
-  return {
-    group,
-    encounterObjectsById,
-    setVisible(options) {
-      /*
-        Master visibility is separate from category visibility.
-
-        Example:
-          showWorldDebug = false hides everything.
-          showWorldDebug = true and showTreeColliders = false shows the other
-          debug categories while keeping tree circles hidden.
-      */
-      group.visible = options.showWorldDebug;
-      wallColliders.forEach((object) => {
-        object.visible = options.showWallColliders;
-      });
-      treeColliders.forEach((object) => {
-        object.visible = options.showTreeColliders;
-      });
-      outsideBounds.forEach((object) => {
-        object.visible = options.showOutsideBounds;
-      });
-      encounterZones.forEach((object) => {
-        object.visible = options.showEncounterZones;
-      });
-      encounterLabels.forEach((object) => {
-        object.visible = options.showEncounterZones && options.showEncounterLabels;
-      });
-    },
-    syncEncounterActivity(activeIds) {
-      /*
-        Highlight active encounter zones.
-
-        This gives instant feedback when your avatar footprint is inside a
-        trigger, which is extremely useful while placing or resizing zones.
-      */
-      encounterObjectsById.forEach((object, id) => {
-        object.material.opacity = activeIds.has(id)
-          ? object.userData.activeOpacity
-          : object.userData.baseOpacity;
-        object.material.needsUpdate = true;
-      });
-    },
-  };
-}
-
-function makeDebugRectMesh(rect, color, opacity, y) {
-  /*
-    Creates one translucent top-down rectangle.
-
-    Input rect shape:
-      minX, maxX, minZ, maxZ
-
-    Derived values:
-      width  = maxX - minX
-      depth  = maxZ - minZ
-      center = average of min/max on each axis
-  */
-  const width = Math.max(0.001, rect.maxX - rect.minX);
-  const depth = Math.max(0.001, rect.maxZ - rect.minZ);
-  const centerX = (rect.minX + rect.maxX) / 2;
-  const centerZ = (rect.minZ + rect.maxZ) / 2;
-  const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(width, 0.035, depth),
-    new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity,
-      depthWrite: false,
-      depthTest: false,
-    }),
-  );
-
-  mesh.position.set(centerX, y, centerZ);
-  mesh.renderOrder = 50;
-  return mesh;
-}
-
-function makeDebugCircleMesh(centerX, centerZ, radius, color, opacity, y) {
-  /*
-    Creates one top-down circular debug marker.
-
-    CylinderGeometry is used because a very short cylinder already lies in the
-    right orientation for a floor footprint: circular in X/Z, thin in Y.
-  */
-  const mesh = new THREE.Mesh(
-    new THREE.CylinderGeometry(radius, radius, 0.04, 48, 1, true),
-    new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity,
-      wireframe: true,
-      depthWrite: false,
-      depthTest: false,
-    }),
-  );
-
-  mesh.position.set(centerX, y, centerZ);
-  mesh.renderOrder = 51;
-  return mesh;
-}
-
-function makeDebugBoundsMeshes() {
-  /*
-    Draws the outside movement boundary as four thin rectangles.
-
-    This is different from the outside wall colliders:
-      - wall colliders show the actual blocking wall rectangles
-      - bounds show the clamped legal area for the avatar footprint center
-  */
-  const radius = rigTuning.colliderRadius + rigCollisionMargin;
-  const bounds = getOutsideBounds(radius);
-  const thickness = 0.09;
-  const y = SOLO_TWEAKS.worldDebug.floorLift + 0.04;
-  const color = SOLO_TWEAKS.worldDebug.boundsColor;
-  const opacity = 0.42;
-
-  return [
-    makeDebugRectMesh(
-      {
-        minX: bounds.minX,
-        maxX: bounds.maxX,
-        minZ: bounds.minZ - thickness / 2,
-        maxZ: bounds.minZ + thickness / 2,
-      },
-      color,
-      opacity,
-      y,
-    ),
-    makeDebugRectMesh(
-      {
-        minX: bounds.minX,
-        maxX: bounds.maxX,
-        minZ: bounds.maxZ - thickness / 2,
-        maxZ: bounds.maxZ + thickness / 2,
-      },
-      color,
-      opacity,
-      y,
-    ),
-    makeDebugRectMesh(
-      {
-        minX: bounds.minX - thickness / 2,
-        maxX: bounds.minX + thickness / 2,
-        minZ: bounds.minZ,
-        maxZ: bounds.maxZ,
-      },
-      color,
-      opacity,
-      y,
-    ),
-    makeDebugRectMesh(
-      {
-        minX: bounds.maxX - thickness / 2,
-        maxX: bounds.maxX + thickness / 2,
-        minZ: bounds.minZ,
-        maxZ: bounds.maxZ,
-      },
-      color,
-      opacity,
-      y,
-    ),
-  ];
-}
-
-function makeEncounterDebugMesh(encounter, y) {
-  /*
-    Builds a visual marker for one trigger zone from encounters.js.
-
-    Supported shapes:
-      circle
-      rect
-  */
-  const color = encounter.debugColor || SOLO_TWEAKS.worldDebug.encounterColor;
-
-  if (encounter.shape?.type === "circle") {
-    const [x, z] = encounter.shape.center || [0, 0];
-    return makeDebugCircleMesh(x, z, encounter.shape.radius || 1, color, 0.22, y);
-  }
-
-  if (encounter.shape?.type === "rect") {
-    const rect = getEncounterRect(encounter);
-    return makeDebugRectMesh(rect, color, 0.18, y);
-  }
-
-  console.warn("Unknown encounter debug shape.", encounter);
-  return null;
 }
 
 function applyWorldDebugVisibility() {
@@ -3382,42 +1520,12 @@ function rebuildWorldDebugView() {
 
   state.worldDebugView.group.parent?.remove(state.worldDebugView.group);
   disposeObjectTree(state.worldDebugView.group);
-  state.worldDebugView = createWorldDebugView();
+  state.worldDebugView = createWorldDebugView(
+    state.encounterRuntime,
+    rigTuning.colliderRadius + rigCollisionMargin,
+  );
   scene.add(state.worldDebugView.group);
   applyWorldDebugVisibility();
-}
-
-function disposeObjectTree(root) {
-  /*
-    Disposes GPU resources under a scene object.
-
-    Removing an object from the scene is not enough. Geometry, textures, and
-    materials can remain allocated on the GPU. This helper walks the object tree
-    and disposes unique resources once.
-  */
-  const geometries = new Set();
-  const materials = new Set();
-
-  root.traverse((object) => {
-    if (object.geometry && !geometries.has(object.geometry)) {
-      geometries.add(object.geometry);
-      object.geometry.dispose();
-    }
-
-    const objectMaterials = Array.isArray(object.material)
-      ? object.material
-      : [object.material];
-
-    objectMaterials.forEach((material) => {
-      if (!material || materials.has(material)) {
-        return;
-      }
-
-      materials.add(material);
-      material.map?.dispose?.();
-      material.dispose();
-    });
-  });
 }
 
 function getJointPointOffset(jointName) {
@@ -3438,10 +1546,28 @@ function applyJointPointOffsets() {
 
     where:
       baseBindLocalPosition = original joint position from createSkeleton()
-      offset                = slider-controlled adjustment
+                              â€” never changes after creation
+      offset                = the value from the Joint Point Offset sliders
+                              (or from a mouse drag, which writes the same value)
 
-    The live joint.position is then reset to that bind position so the debug
-    rig immediately moves as sliders change.
+    After this function runs:
+      - bindLocalPosition is the "desired rest position" for the joint
+      - joint.position is set to that value immediately so the skeleton visually
+        updates as soon as a slider or drag changes an offset
+
+    WHY offset-from-base instead of storing an absolute position?
+      An absolute position would make export/import fragile â€” if the base
+      skeleton proportions change, a saved position that was once correct would
+      place the joint in the wrong spot. Storing the offset relative to the
+      base means:
+        - Zero offset = the original proportion from createSkeleton()
+        - Reset = just zero all offsets, nothing else needs to change
+        - Export = a small portable delta that survives proportion changes
+
+    NOTE: After this function changes joint.position, matrixWorld is NOT updated
+    automatically. If you need worldToLocal() or getWorldPosition() to reflect
+    these changes immediately (e.g., during a drag event), call:
+      state.skeleton.root.updateMatrixWorld(true)
   */
   JOINT_ORDER.forEach((jointName) => {
     const joint = state.skeleton?.joints[jointName];
@@ -3649,15 +1775,39 @@ function applyRigMeshStartPose() {
     return;
   }
 
-  console.info("Rig Mesh Mode: custom start pose is reserved for a future pass.");
+  console.info(
+    "Rig Mesh Mode: custom start pose is reserved for a future pass.",
+  );
 }
 
 function resetSkeletonToBindPose() {
   /*
     Resets every puppet joint to its current bind pose.
 
-    This does not erase slider offsets. It uses the adjusted bind values stored
-    in userData, so the tuned skeleton remains tuned.
+    "Bind pose" here means the stored rest values in userData:
+      bindLocalPosition   â€” base position + slider offsets
+      bindLocalQuaternion â€” base rotation + bind-pose rotation sliders
+      bindLocalScale      â€” always (1,1,1) unless deliberately changed
+
+    WHAT THIS DOES NOT DO:
+      It does NOT erase slider offsets or bind rotations. Those live in
+      rigTuning and userData. This function only copies the already-computed
+      bind values back into the live joint transform so the skeleton "stands
+      at rest."
+
+    WHEN IT IS CALLED:
+      - After applyJointPointOffsets() â€” so the new pivot positions take effect
+      - After applyBindRotationOffsets() â€” so the new rest pose takes effect
+      - In handleJointEditPointerMove â€” at the end of every drag step to
+        establish a clean base that the next animation frame can layer motion on
+
+    Animation functions (walk, idle, jump) then run AFTER this reset and add
+    their motion deltas on top of the bind pose. The reset ensures the previous
+    frame's animation does not accumulate into the next one.
+
+    NOTE: As with applyJointPointOffsets(), changing joint.position here does
+    NOT update matrixWorld. Call updateMatrixWorld(true) on the root if you
+    need world-space accuracy immediately after this call.
   */
   Object.values(state.skeleton.joints).forEach((joint) => {
     joint.position.copy(joint.userData.bindLocalPosition);
@@ -3668,135 +1818,332 @@ function resetSkeletonToBindPose() {
 
 function buildGui() {
   /*
-    Builds the lil-gui control panel.
+    GUI panel structure (top to bottom):
 
-    Control organization:
-      Debug Visibility     = show/hide lab helpers
-      Rig Dimensions       = base skeleton proportions
-      Workshop Alignment   = root offset, labels, axis marker
-      Joint Point Offsets  = XYZ pivot adjustment for every joint
-      Bind Pose Rotations  = rest-pose rotations for matching imported meshes
-      Mesh Import / Export = render/rig/clear imported mesh
-      Motion               = idle, walk, jump, collider controls
-      Bind Pose            = quick reset
-      Rig Save             = browser save/load/export
+      Mesh              â€” file browser, workflow steps, appearance, transform
+      Rig Dimensions    â€” body proportions (sliders)
+      Pivot Offsets     â€” per-joint XYZ position nudges
+      Bind Pose         â€” per-joint rest-pose rotations for mesh alignment
+      Motion            â€” idle, walk, jump, damping, presets
+      Skeleton Lab      â€” debug markers, labels, collider ring
+      Workshop          â€” root alignment, mouse point editing, axis marker
+      Save              â€” browser save/load and JSON export
+      World Debug       â€” collision and encounter zone overlays
+
+    All folders except Mesh start closed so the panel is not overwhelming on
+    first open. Click a folder header to expand it.
   */
   state.gui = new GUI({ title: "Empyrean Puppet Workshop" });
   state.guiFolders = {};
 
-  const visibilityFolder = state.gui.addFolder("Debug Visibility");
-  state.guiFolders.visibility = visibilityFolder;
-  addGuiController(visibilityFolder, rigTuning, "labEnabled")
-    .name("skeleton lab")
-    .onChange(applyVisibility);
-  addGuiController(visibilityFolder, rigTuning, "skeletonVisible")
-    .name("show pivots")
-    .onChange(applyVisibility);
-  addGuiController(visibilityFolder, rigTuning, "showJointLabels")
-    .name("joint labels")
-    .onChange(applyVisibility);
-  addGuiController(visibilityFolder, rigTuning, "showAxisMarker")
-    .name("axis marker")
-    .onChange(applyVisibility);
-  addGuiController(visibilityFolder, rigTuning, "showRigCollider")
-    .name("rig collider")
-    .onChange(applyVisibility);
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // MESH
+  // Everything you need to load, align, and rig a character mesh in one place.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const meshFolder = state.gui.addFolder("Mesh");
+  state.guiFolders.mesh = meshFolder;
 
-  const worldDebugFolder = state.gui.addFolder("World Debug");
-  state.guiFolders.worldDebug = worldDebugFolder;
   /*
-    World Debug is the "collision vision" panel.
+    FILE BROWSER BUTTON
+    Opens the operating system's native file picker filtered to .glb and .gltf.
+    Selecting a file:
+      1. Creates a temporary blob URL (session-only â€” not saved with the rig).
+      2. Stores the filename in the "path" field for reference.
+      3. Automatically loads a static preview so you can see the mesh right away.
 
-    It does not change gameplay. It only shows invisible helper shapes so you
-    can place rooms, trees, props, and encounter zones with confidence.
+    You can also type a relative path directly in the "path" field below
+    (e.g. assets/femaleMesh.glb) if the file is already in the project folder.
   */
-  addGuiController(worldDebugFolder, rigTuning, "showWorldDebug")
-    .name("world debug")
-    .onChange(applyWorldDebugVisibility);
-  addGuiController(worldDebugFolder, rigTuning, "showWallColliders")
-    .name("wall colliders")
-    .onChange(applyWorldDebugVisibility);
-  addGuiController(worldDebugFolder, rigTuning, "showTreeColliders")
-    .name("tree colliders")
-    .onChange(applyWorldDebugVisibility);
-  addGuiController(worldDebugFolder, rigTuning, "showOutsideBounds")
-    .name("outside bounds")
-    .onChange(applyWorldDebugVisibility);
-  addGuiController(worldDebugFolder, rigTuning, "showEncounterZones")
-    .name("encounter zones")
-    .onChange(applyWorldDebugVisibility);
-  addGuiController(worldDebugFolder, rigTuning, "showEncounterLabels")
-    .name("encounter labels")
-    .onChange(applyWorldDebugVisibility);
-  addGuiController(worldDebugFolder, rigTuning, "encounterSystemEnabled")
-    .name("encounters active")
-    .onChange(() => {
-      if (!rigTuning.encounterSystemEnabled) {
-        state.encounterRuntime?.activeIds.clear();
-        state.worldDebugView?.syncEncounterActivity?.(new Set());
-      }
-    });
-  worldDebugFolder.close();
+  meshFolder
+    .add(
+      {
+        openFile() {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.accept = ".glb,.gltf";
+          // Keep the element invisible but in the DOM long enough for the
+          // browser to recognise the user gesture and open the file picker.
+          input.style.cssText =
+            "position:fixed;opacity:0;pointer-events:none;width:0;height:0";
+          document.body.appendChild(input);
+          input.addEventListener("change", () => {
+            document.body.removeChild(input);
+            const file = input.files[0];
+            if (!file) return;
+            // Release the previous blob before creating a new one so the
+            // browser can free the previous file's memory.
+            if (state.meshBlobUrl) URL.revokeObjectURL(state.meshBlobUrl);
+            state.meshBlobUrl = URL.createObjectURL(file);
+            rigTuning.importedMeshPath = file.name;
+            updateGuiDisplays();
+            // Auto-preview on pick so you see the mesh immediately.
+            loadImportedMeshPreviewFromPath(state.meshBlobUrl);
+          });
+          input.click();
+        },
+      },
+      "openFile",
+    )
+    .name("open fileâ€¦");
 
-  const rigMeshModeFolder = state.gui.addFolder("Rig Mesh Mode");
-  state.guiFolders.rigMeshMode = rigMeshModeFolder;
   /*
-    Rig Mesh Mode is a guided "cockpit" for the mesh-binding workflow.
-
-    The older Mesh Import / Export and Bind Pose Rotations folders still exist,
-    but when rig mesh mode is active they are hidden so the GUI feels like it
-    has shifted into a focused workflow instead of becoming a longer checklist.
+    PATH FIELD â€” fallback for typing a relative path like "assets/femaleMesh.glb"
+    or for re-loading a path that was exported with the rig package.
+    When the file browser is used, this shows the chosen filename.
   */
-  addGuiController(rigMeshModeFolder, rigTuning, "rigMeshMode")
-    .name("rig mesh mode")
-    .onChange(applyRigMeshModeVisibility);
-  addGuiController(
-    rigMeshModeFolder,
-    rigTuning,
-    "rigMeshStartPose",
-    {
-      "keep current pose": "current",
-      "A pose": "aPose",
-      "T pose": "tPose",
-      "custom later": "custom",
-    },
-  ).name("start pose");
-  rigMeshModeFolder
-    .add({ applyStartPose: applyRigMeshStartPose }, "applyStartPose")
+  addGuiController(meshFolder, rigTuning, "importedMeshPath").name("path");
+
+  // â”€â”€ WORKFLOW â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  /*
+    Standard two-step workflow:
+      1 Â· preview  â€” loads the mesh as a static visual reference.
+                     Drag skeleton pivots to match it without skinning yet.
+      2 Â· rig      â€” generates skin weights from the current pivot positions
+                     and drives the mesh from the skeleton.
+
+    quick rig skips preview and rigs immediately. Useful when pivots are already
+    tuned and you just want to test the motion on the mesh.
+  */
+  addGuiController(meshFolder, rigTuning, "rigMeshStartPose", {
+    "keep current pose": "current",
+    "A pose": "aPose",
+    "T pose": "tPose",
+  }).name("start pose");
+  meshFolder
+    .add({ fn: applyRigMeshStartPose }, "fn")
     .name("apply start pose");
-  rigMeshModeFolder
-    .add({ render: renderDefaultImportedMesh }, "render")
-    .name("1 render mesh");
-  rigMeshModeFolder
-    .add({ rig: rigCurrentImportedMesh }, "rig")
-    .name("2 rig rendered mesh");
-  rigMeshModeFolder
-    .add({ quickRig: loadDefaultImportedMesh }, "quickRig")
-    .name("quick load and rig");
-  rigMeshModeFolder
-    .add({ rerig: rerigImportedMesh }, "rerig")
-    .name("rerig current");
-  rigMeshModeFolder
-    .add({ clear: clearImportedMesh }, "clear")
-    .name("clear mesh");
-  rigMeshModeFolder
-    .add({ exportPackage: exportRigPackageToConsole }, "exportPackage")
+  meshFolder.add({ fn: renderDefaultImportedMesh }, "fn").name("1  preview");
+  meshFolder.add({ fn: rigCurrentImportedMesh }, "fn").name("2  rig mesh");
+  meshFolder.add({ fn: loadDefaultImportedMesh }, "fn").name("quick rig");
+  meshFolder.add({ fn: rerigImportedMesh }, "fn").name("re-rig");
+  meshFolder.add({ fn: clearImportedMesh }, "fn").name("clear mesh");
+
+  // â”€â”€ APPEARANCE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Controls how the mesh looks while you are placing pivots.
+  const appearanceFolder = meshFolder.addFolder("Appearance");
+  addGuiController(appearanceFolder, rigTuning, "importedMeshVisible")
+    .name("visible")
+    .onChange(applyImportedMeshPresentation);
+  addGuiController(
+    appearanceFolder,
+    rigTuning,
+    "importedMeshOpacity",
+    0.05,
+    1,
+    0.01,
+  )
+    .name("opacity")
+    .onChange(applyImportedMeshPresentation);
+  addGuiController(appearanceFolder, rigTuning, "importedMeshWireframe")
+    .name("wireframe")
+    .onChange(applyImportedMeshPresentation);
+  appearanceFolder.close();
+
+  // â”€â”€ TRANSFORM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Fine-tune the mesh position, scale, and orientation relative to the skeleton.
+  const transformFolder = meshFolder.addFolder("Transform");
+  addGuiController(transformFolder, rigTuning, "importedMeshAutoFit")
+    .name("auto fit")
+    .onChange(refreshImportedMeshReference);
+  addGuiController(
+    transformFolder,
+    rigTuning,
+    "importedMeshScale",
+    0.05,
+    4,
+    0.01,
+  )
+    .name("scale")
+    .onFinishChange(refreshImportedMeshReference);
+  addGuiController(transformFolder, rigTuning, "importedMeshOffsetX", -4, 4, 0.01)
+    .name("offset X")
+    .onFinishChange(refreshImportedMeshReference);
+  addGuiController(transformFolder, rigTuning, "importedMeshOffsetY", -4, 4, 0.01)
+    .name("offset Y")
+    .onFinishChange(refreshImportedMeshReference);
+  addGuiController(transformFolder, rigTuning, "importedMeshOffsetZ", -4, 4, 0.01)
+    .name("offset Z")
+    .onFinishChange(refreshImportedMeshReference);
+  addGuiController(
+    transformFolder,
+    rigTuning,
+    "importedMeshRotationX",
+    -Math.PI,
+    Math.PI,
+    0.01,
+  )
+    .name("rot X")
+    .onFinishChange(refreshImportedMeshReference);
+  addGuiController(
+    transformFolder,
+    rigTuning,
+    "importedMeshRotationY",
+    -Math.PI,
+    Math.PI,
+    0.01,
+  )
+    .name("rot Y")
+    .onFinishChange(refreshImportedMeshReference);
+  addGuiController(
+    transformFolder,
+    rigTuning,
+    "importedMeshRotationZ",
+    -Math.PI,
+    Math.PI,
+    0.01,
+  )
+    .name("rot Z")
+    .onFinishChange(refreshImportedMeshReference);
+  transformFolder.close();
+
+  // â”€â”€ RIG PACKAGE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Export/import both rig tuning and mesh binding settings as a JSON bundle.
+  meshFolder
+    .add({ fn: exportRigPackageToConsole }, "fn")
     .name("export rig package");
-  rigMeshModeFolder
-    .add({ importPackage: importRigPackageFromPrompt }, "importPackage")
+  meshFolder
+    .add({ fn: importRigPackageFromPrompt }, "fn")
     .name("import rig package");
 
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // RIG DIMENSIONS
+  // Changes here rebuild the skeleton hierarchy from scratch. Drag slowly â€”
+  // each slider fires rebuildSkeletonWorkshop on release.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const dimensionFolder = state.gui.addFolder("Rig Dimensions");
   state.guiFolders.dimensions = dimensionFolder;
   RIG_DIMENSION_CONTROLS.forEach(([key, min, max, step]) => {
-    // Dimension changes alter parent-relative joint distances, so the hierarchy
-    // is rebuilt after the user finishes dragging each slider.
     addGuiController(dimensionFolder, rigTuning, key, min, max, step)
       .name(key)
       .onFinishChange(rebuildSkeletonWorkshop);
   });
+  dimensionFolder.close();
 
-  const alignmentFolder = state.gui.addFolder("Workshop Alignment");
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // PIVOT OFFSETS  +  BIND POSE
+  // buildJointPointControls and buildBindRotationControls each create their own
+  // top-level folder. The "reset bind pose" button lives in the Bind Pose folder
+  // instead of a separate one-button folder.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  state.guiFolders.jointPointControls = buildJointPointControls(state.gui);
+  state.guiFolders.bindRotationControls = buildBindRotationControls(state.gui);
+  state.guiFolders.bindRotationControls
+    .add({ fn: resetSkeletonToBindPose }, "fn")
+    .name("reset bind pose");
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // MOTION
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const motionFolder = state.gui.addFolder("Motion");
+  state.guiFolders.motion = motionFolder;
+  addGuiController(motionFolder, rigTuning, "presetName", Object.keys(PRESETS))
+    .name("preset")
+    .onChange(applyPreset);
+  addGuiController(motionFolder, rigTuning, "idleMotion")
+    .name("idle motion")
+    .onChange(resetSkeletonToBindPose);
+  addGuiController(motionFolder, rigTuning, "walkPreview")
+    .name("walk preview")
+    .onChange(() => {
+      state.walkPhase = 0;
+      resetSkeletonToBindPose();
+    });
+  addGuiController(motionFolder, rigTuning, "motionSpeed", 0.1, 2.2, 0.01).name(
+    "speed",
+  );
+  addGuiController(motionFolder, rigTuning, "breathingAmplitude", 0, 0.09, 0.001).name(
+    "breathing",
+  );
+  addGuiController(motionFolder, rigTuning, "headDriftAmplitude", 0, 0.28, 0.001).name(
+    "head drift",
+  );
+  addGuiController(motionFolder, rigTuning, "torsoSwayAmplitude", 0, 0.16, 0.001).name(
+    "torso sway",
+  );
+  addGuiController(motionFolder, rigTuning, "armTrailAmplitude", 0, 0.36, 0.001).name(
+    "arm trail",
+  );
+  addGuiController(motionFolder, rigTuning, "damping", 1.2, 10, 0.01).name("damping");
+  addGuiController(motionFolder, rigTuning, "walkAmplitude", 0, 1.4, 0.01).name(
+    "walk amplitude",
+  );
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "walkHipSway",
+    -0.18,
+    0.18,
+    0.001,
+  ).name("hip sway");
+  addGuiController(motionFolder, rigTuning, "walkHipBob", 0, 0.09, 0.001).name(
+    "hip bob",
+  );
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "walkHipTilt",
+    -0.16,
+    0.16,
+    0.001,
+  ).name("hip tilt");
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "walkHipTwist",
+    -0.16,
+    0.16,
+    0.001,
+  ).name("hip twist");
+  addGuiController(motionFolder, rigTuning, "jumpHeight", 0.05, 2.5, 0.01).name(
+    "jump height",
+  );
+  addGuiController(motionFolder, rigTuning, "jumpDuration", 0.28, 1.8, 0.01).name(
+    "jump duration",
+  );
+  addGuiController(motionFolder, rigTuning, "jumpGravityScale", 0.35, 2.4, 0.01).name(
+    "gravity feel",
+  );
+  addGuiController(motionFolder, rigTuning, "jumpCrouchDepth", 0, 0.45, 0.005).name(
+    "jump crouch",
+  );
+  addGuiController(motionFolder, rigTuning, "colliderRadius", 0.08, 1.4, 0.01)
+    .name("collider radius")
+    .onChange(updateRigColliderVisual);
+  motionFolder.add({ fn: startJump }, "fn").name("test jump");
+  addGuiController(motionFolder, rigTuning, "phaseOffset", -Math.PI, Math.PI, 0.01).name(
+    "phase offset",
+  );
+  motionFolder.close();
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // SKELETON LAB
+  // Toggle debug helpers: joint pivot spheres, bone lines, labels, collider ring.
+  // R key also toggles the lab. L key toggles joint labels.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const labFolder = state.gui.addFolder("Skeleton Lab");
+  state.guiFolders.visibility = labFolder;
+  addGuiController(labFolder, rigTuning, "labEnabled")
+    .name("lab on / off")
+    .onChange(applyVisibility);
+  addGuiController(labFolder, rigTuning, "skeletonVisible")
+    .name("show pivots")
+    .onChange(applyVisibility);
+  addGuiController(labFolder, rigTuning, "showJointLabels")
+    .name("joint labels")
+    .onChange(applyVisibility);
+  addGuiController(labFolder, rigTuning, "showAxisMarker")
+    .name("axis marker")
+    .onChange(applyVisibility);
+  addGuiController(labFolder, rigTuning, "showRigCollider")
+    .name("rig collider")
+    .onChange(applyVisibility);
+  labFolder.close();
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // WORKSHOP
+  // Root alignment offsets, mouse-drag joint editing, label and axis controls.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const alignmentFolder = state.gui.addFolder("Workshop");
   state.guiFolders.alignment = alignmentFolder;
   addGuiController(
     alignmentFolder,
@@ -3825,12 +2172,7 @@ function buildGui() {
   addGuiController(alignmentFolder, rigTuning, "labelScale", 0.35, 2.2, 0.01)
     .name("label scale")
     .onChange(applyVisibility);
-  addGuiController(
-    alignmentFolder,
-    rigTuning,
-    "axisMarkerJoint",
-    AXIS_MARKER_JOINTS,
-  )
+  addGuiController(alignmentFolder, rigTuning, "axisMarkerJoint", AXIS_MARKER_JOINTS)
     .name("axis joint")
     .onChange(updateAxisMarkerAttachment);
   addGuiController(
@@ -3848,219 +2190,58 @@ function buildGui() {
     .onChange(() => {
       selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
     });
-  addGuiController(
-    alignmentFolder,
-    rigTuning,
-    "mouseJointEditJoint",
-    MOUSE_EDIT_JOINTS,
-  )
+  addGuiController(alignmentFolder, rigTuning, "mouseJointEditJoint", MOUSE_EDIT_JOINTS)
     .name("selected point")
     .onChange(selectMouseJointEditJoint);
+  alignmentFolder.close();
 
-  state.guiFolders.jointPointControls = buildJointPointControls(state.gui);
-  state.guiFolders.bindRotationControls = buildBindRotationControls(state.gui);
-
-  const meshFolder = state.gui.addFolder("Mesh Import / Export");
-  state.guiFolders.meshImport = meshFolder;
-  /*
-    Mesh workflow:
-      1 render mesh        -> show static reference
-      tune pivots/rotations
-      2 rig rendered mesh  -> create generated SkinnedMesh
-
-    quick load and rig skips the preview step.
-  */
-  addGuiController(meshFolder, rigTuning, "importedMeshPath").name(
-    "asset path",
-  );
-  addGuiController(meshFolder, rigTuning, "importedMeshVisible")
-    .name("mesh visible")
-    .onChange(applyImportedMeshPresentation);
-  addGuiController(meshFolder, rigTuning, "importedMeshOpacity", 0.05, 1, 0.01)
-    .name("mesh opacity")
-    .onChange(applyImportedMeshPresentation);
-  addGuiController(meshFolder, rigTuning, "importedMeshWireframe")
-    .name("mesh wireframe")
-    .onChange(applyImportedMeshPresentation);
-  addGuiController(meshFolder, rigTuning, "importedMeshAutoFit")
-    .name("auto fit")
-    .onChange(refreshImportedMeshReference);
-  addGuiController(meshFolder, rigTuning, "importedMeshScale", 0.05, 4, 0.01)
-    .name("mesh scale")
-    .onFinishChange(refreshImportedMeshReference);
-  addGuiController(meshFolder, rigTuning, "importedMeshOffsetX", -4, 4, 0.01)
-    .name("mesh X")
-    .onFinishChange(refreshImportedMeshReference);
-  addGuiController(meshFolder, rigTuning, "importedMeshOffsetY", -4, 4, 0.01)
-    .name("mesh Y")
-    .onFinishChange(refreshImportedMeshReference);
-  addGuiController(meshFolder, rigTuning, "importedMeshOffsetZ", -4, 4, 0.01)
-    .name("mesh Z")
-    .onFinishChange(refreshImportedMeshReference);
-  addGuiController(
-    meshFolder,
-    rigTuning,
-    "importedMeshRotationX",
-    -Math.PI,
-    Math.PI,
-    0.01,
-  )
-    .name("rot X")
-    .onFinishChange(refreshImportedMeshReference);
-  addGuiController(
-    meshFolder,
-    rigTuning,
-    "importedMeshRotationY",
-    -Math.PI,
-    Math.PI,
-    0.01,
-  )
-    .name("rot Y")
-    .onFinishChange(refreshImportedMeshReference);
-  addGuiController(
-    meshFolder,
-    rigTuning,
-    "importedMeshRotationZ",
-    -Math.PI,
-    Math.PI,
-    0.01,
-  )
-    .name("rot Z")
-    .onFinishChange(refreshImportedMeshReference);
-  meshFolder
-    .add({ render: renderDefaultImportedMesh }, "render")
-    .name("1 render mesh");
-  meshFolder
-    .add({ rig: rigCurrentImportedMesh }, "rig")
-    .name("2 rig rendered mesh");
-  meshFolder
-    .add({ quickRig: loadDefaultImportedMesh }, "quickRig")
-    .name("quick load and rig");
-  meshFolder.add({ rerig: rerigImportedMesh }, "rerig").name("rerig current");
-  meshFolder.add({ clear: clearImportedMesh }, "clear").name("clear mesh");
-  meshFolder
-    .add({ exportPackage: exportRigPackageToConsole }, "exportPackage")
-    .name("export rig package");
-  meshFolder
-    .add({ importPackage: importRigPackageFromPrompt }, "importPackage")
-    .name("import rig package");
-
-  const motionFolder = state.gui.addFolder("Motion");
-  state.guiFolders.motion = motionFolder;
-  addGuiController(motionFolder, rigTuning, "presetName", Object.keys(PRESETS))
-    .name("preset")
-    .onChange(applyPreset);
-  addGuiController(motionFolder, rigTuning, "idleMotion")
-    .name("idle motion")
-    .onChange(resetSkeletonToBindPose);
-  addGuiController(motionFolder, rigTuning, "walkPreview")
-    .name("walk preview")
-    .onChange(() => {
-      state.walkPhase = 0;
-      resetSkeletonToBindPose();
-    });
-  addGuiController(motionFolder, rigTuning, "motionSpeed", 0.1, 2.2, 0.01).name(
-    "speed",
-  );
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "breathingAmplitude",
-    0,
-    0.09,
-    0.001,
-  ).name("breathing");
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "headDriftAmplitude",
-    0,
-    0.28,
-    0.001,
-  ).name("head drift");
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "torsoSwayAmplitude",
-    0,
-    0.16,
-    0.001,
-  ).name("torso sway");
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "armTrailAmplitude",
-    0,
-    0.36,
-    0.001,
-  ).name("arm trail");
-  addGuiController(motionFolder, rigTuning, "damping", 1.2, 10, 0.01).name(
-    "damping",
-  );
-  addGuiController(motionFolder, rigTuning, "walkAmplitude", 0, 1.4, 0.01).name(
-    "walk amplitude",
-  );
-  addGuiController(motionFolder, rigTuning, "jumpHeight", 0.05, 2.5, 0.01).name(
-    "jump height",
-  );
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "jumpDuration",
-    0.28,
-    1.8,
-    0.01,
-  ).name("jump duration");
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "jumpGravityScale",
-    0.35,
-    2.4,
-    0.01,
-  ).name("gravity feel");
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "jumpCrouchDepth",
-    0,
-    0.45,
-    0.005,
-  ).name("jump crouch");
-  addGuiController(motionFolder, rigTuning, "colliderRadius", 0.08, 1.4, 0.01)
-    .name("collider radius")
-    .onChange(updateRigColliderVisual);
-  motionFolder.add({ jump: startJump }, "jump").name("test jump");
-  addGuiController(
-    motionFolder,
-    rigTuning,
-    "phaseOffset",
-    -Math.PI,
-    Math.PI,
-    0.01,
-  ).name("phase offset");
-
-  const bindPoseFolder = state.gui.addFolder("Bind Pose");
-  state.guiFolders.bindPose = bindPoseFolder;
-  bindPoseFolder
-    .add({ reset: resetSkeletonToBindPose }, "reset")
-    .name("reset bind pose");
-
-  const saveFolder = state.gui.addFolder("Rig Save");
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // SAVE
+  // Browser save/load and JSON export. Tuning is auto-loaded on page refresh.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const saveFolder = state.gui.addFolder("Save");
   state.guiFolders.save = saveFolder;
-  saveFolder.add({ save: saveRigTuningToBrowser }, "save").name("save tuning");
-  saveFolder.add({ load: loadRigTuningFromBrowser }, "load").name("load saved");
-  saveFolder
-    .add({ resetDefaults: resetRigTuningToDefaults }, "resetDefaults")
-    .name("reset defaults");
-  saveFolder
-    .add({ exportJson: exportRigTuningToConsole }, "exportJson")
-    .name("copy/log JSON");
-  saveFolder
-    .add({ clearSaved: clearSavedRigTuning }, "clearSaved")
-    .name("clear saved");
+  saveFolder.add({ fn: saveRigTuningToBrowser }, "fn").name("save tuning");
+  saveFolder.add({ fn: loadRigTuningFromBrowser }, "fn").name("load saved");
+  saveFolder.add({ fn: resetRigTuningToDefaults }, "fn").name("reset defaults");
+  saveFolder.add({ fn: exportRigTuningToConsole }, "fn").name("copy / log JSON");
+  saveFolder.add({ fn: clearSavedRigTuning }, "fn").name("clear saved");
+  saveFolder.close();
 
-  applyRigMeshModeVisibility();
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // WORLD DEBUG
+  // Draws invisible collision shapes and encounter zones so you can see where
+  // things are without guessing. Does not affect gameplay or physics.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const worldDebugFolder = state.gui.addFolder("World Debug");
+  state.guiFolders.worldDebug = worldDebugFolder;
+  addGuiController(worldDebugFolder, rigTuning, "showWorldDebug")
+    .name("world debug")
+    .onChange(applyWorldDebugVisibility);
+  addGuiController(worldDebugFolder, rigTuning, "showWallColliders")
+    .name("wall colliders")
+    .onChange(applyWorldDebugVisibility);
+  addGuiController(worldDebugFolder, rigTuning, "showTreeColliders")
+    .name("tree colliders")
+    .onChange(applyWorldDebugVisibility);
+  addGuiController(worldDebugFolder, rigTuning, "showOutsideBounds")
+    .name("outside bounds")
+    .onChange(applyWorldDebugVisibility);
+  addGuiController(worldDebugFolder, rigTuning, "showEncounterZones")
+    .name("encounter zones")
+    .onChange(applyWorldDebugVisibility);
+  addGuiController(worldDebugFolder, rigTuning, "showEncounterLabels")
+    .name("encounter labels")
+    .onChange(applyWorldDebugVisibility);
+  addGuiController(worldDebugFolder, rigTuning, "encounterSystemEnabled")
+    .name("encounters active")
+    .onChange(() => {
+      if (!rigTuning.encounterSystemEnabled) {
+        state.encounterRuntime?.activeIds.clear();
+        state.worldDebugView?.syncEncounterActivity?.(new Set());
+      }
+    });
+  worldDebugFolder.close();
 }
 
 function buildJointPointControls(parentFolder) {
@@ -4319,11 +2500,25 @@ function animate(currentTime) {
   const elapsed = currentTime * 0.001;
 
   updateKeyboardMotion(delta, currentTime);
-  updateEncounterSystem();
+  if (rigTuning.encounterSystemEnabled && state.encounterRuntime) {
+    tickEncounterSystem(
+      state.encounterRuntime,
+      new THREE.Vector2(
+        controlState.position.x + rigTuning.rootOffsetX,
+        controlState.position.z + rigTuning.rootOffsetZ,
+      ),
+      state.worldDebugView,
+      { audio: myAudio, jupiter, defaultJupiterColor: SOLO_TWEAKS.jupiter.color },
+    );
+  }
+  // Combat encounter tick: state machine handles trigger/start/roll/contact/end.
+  // It is a no-op while phase === "idle" and nothing is in the trigger.
+  updateCombatEncounter(delta);
+
   updateJumpPhysics(delta);
   updateSkeleton(delta, elapsed, currentTime);
   syncImportedSkinToPuppet();
-  updateGhostSphereMotion(elapsed);
+  updateGhostSphereMotion(ghostSpheres, elapsed);
   updateCamera(delta);
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
@@ -4356,14 +2551,17 @@ function updateKeyboardMotion(delta, currentTime) {
     (keys.has("PageUp") ? 1 : 0) + (keys.has("PageDown") ? -1 : 0);
 
   controlState.yaw += turnInput * delta * 2.2;
-  controlState.cameraYaw += orbitInput * delta * SOLO_TWEAKS.camera.keyboardOrbitSpeed;
+  controlState.cameraYaw +=
+    orbitInput * delta * SOLO_TWEAKS.camera.keyboardOrbitSpeed;
   controlState.cameraDistance = THREE.MathUtils.clamp(
-    controlState.cameraDistance + zoomInput * delta * SOLO_TWEAKS.camera.keyboardZoomSpeed,
+    controlState.cameraDistance +
+      zoomInput * delta * SOLO_TWEAKS.camera.keyboardZoomSpeed,
     SOLO_TWEAKS.camera.minDistance,
     SOLO_TWEAKS.camera.maxDistance,
   );
   controlState.cameraHeight = THREE.MathUtils.clamp(
-    controlState.cameraHeight + heightInput * delta * SOLO_TWEAKS.camera.keyboardHeightSpeed,
+    controlState.cameraHeight +
+      heightInput * delta * SOLO_TWEAKS.camera.keyboardHeightSpeed,
     SOLO_TWEAKS.camera.minHeight,
     SOLO_TWEAKS.camera.maxHeight,
   );
@@ -4381,7 +2579,18 @@ function updateKeyboardMotion(delta, currentTime) {
       0,
       Math.cos(controlState.yaw),
     );
-    moveRigWithCollision(direction, moveInput * delta * SOLO_TWEAKS.player.moveSpeed);
+    controlState.position.copy(
+      moveRigWithCollision(
+        controlState.position,
+        direction,
+        moveInput * delta * SOLO_TWEAKS.player.moveSpeed,
+        {
+          radius: rigTuning.colliderRadius + rigCollisionMargin,
+          rootOffsetX: rigTuning.rootOffsetX,
+          rootOffsetZ: rigTuning.rootOffsetZ,
+        },
+      ),
+    );
     controlState.walkPhase += delta * SOLO_TWEAKS.player.walkPhaseSpeed;
   }
 
@@ -4423,7 +2632,6 @@ function updateSkeleton(delta, elapsed, currentTime) {
   if (rigTuning.walkPreview || controlState.isWalking) {
     updateWalkMotion(delta, elapsed, {
       phase: controlState.isWalking ? controlState.walkPhase : undefined,
-      blend: rigTuning.walkPreview ? 1 : 1,
     });
   } else {
     relaxLegs(delta);
@@ -4431,6 +2639,17 @@ function updateSkeleton(delta, elapsed, currentTime) {
 
   updateControlledArms(delta, currentTime);
   updateJumpPose(delta);
+
+  /*
+    The debug skeleton needs one final visual sync after all animation layers.
+
+    Joint markers are normal children of their joints, so Three.js moves them
+    automatically. Bone guide lines are custom BufferGeometry segments whose
+    end vertex stores a copied child.position. Since the walk cycle animates
+    knee/ankle/foot positions every frame, the copied vertex must be refreshed
+    here or the femur/shin/foot lines will visually detach from their markers.
+  */
+  state.debugView?.refreshBones?.();
 }
 
 function syncSkeletonRoot() {
@@ -4440,7 +2659,13 @@ function syncSkeletonRoot() {
     rootOffsetX/Y/Z are workshop alignment offsets. jump.offsetY is added on top
     of rootOffsetY so jumping does not permanently change the saved alignment.
   */
-  applyRoomCollision();
+  controlState.position.copy(
+    resolveRigRoomCollision(controlState.position, {
+      radius: rigTuning.colliderRadius + rigCollisionMargin,
+      rootOffsetX: rigTuning.rootOffsetX,
+      rootOffsetZ: rigTuning.rootOffsetZ,
+    }),
+  );
   state.skeleton.root.position.copy(controlState.position);
   state.skeleton.root.position.x += rigTuning.rootOffsetX;
   state.skeleton.root.position.y +=
@@ -4587,553 +2812,20 @@ function updateIdleMotion(delta, elapsed) {
   );
 }
 
-function cycle01(phase) {
-  // Converts a radian phase into a repeating 0..1 cycle.
-  // The double modulo pattern keeps negative phases positive.
-  return (((phase / (Math.PI * 2)) % 1) + 1) % 1;
-}
-
-function smoothstep(edge0, edge1, x) {
-  /*
-    Smooth interpolation curve from 0 to 1.
-
-    Formula:
-      t = clamp((x - edge0) / (edge1 - edge0), 0, 1)
-      result = t * t * (3 - 2 * t)
-
-    Unlike a straight linear ramp, smoothstep eases in and out.
-  */
-  const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0), 0, 1);
-  return t * t * (3 - 2 * t);
-}
-
-function clamp01(value) {
-  // Convenience wrapper for values that should stay between 0 and 1.
-  return THREE.MathUtils.clamp(value, 0, 1);
-}
-
-function resolveRigRoomCollision(position) {
-  /*
-    Converts a proposed control position into a legal control position.
-
-    Steps:
-      1. Convert control position to world footprint X/Z.
-      2. Resolve that footprint against bounds, walls, and tree circles.
-      3. Convert the corrected footprint back to control position.
-  */
-  const footprint = getWorldFootprint(position);
-  const resolvedFootprint = resolveFootprintAgainstWorld(footprint);
-
-  return getControlPositionFromFootprint(resolvedFootprint);
-}
-
-function applyRoomCollision() {
-  // Keeps the current control position legal even if a slider changes the root
-  // offset or collider radius while the avatar is near an obstacle.
-  controlState.position.copy(resolveRigRoomCollision(controlState.position));
-}
-
-function moveRigWithCollision(direction, distance) {
-  /*
-    Moves the rig with simple sliding collision.
-
-    First try:
-      full intended movement vector
-
-    If blocked:
-      try X movement alone, then Z movement alone
-
-    That creates a basic slide-along-wall behavior while remaining easy to
-    inspect and modify.
-  */
-  const nextPosition = controlState.position
-    .clone()
-    .addScaledVector(direction, distance);
-  const resolvedPosition = resolveRigRoomCollision(nextPosition);
-
-  if (isControlPositionValid(resolvedPosition)) {
-    controlState.position.copy(resolvedPosition);
-    return;
-  }
-
-  /*
-    If the direct diagonal move hits a wall or tree, try each axis separately.
-    This gives the rig a simple slide-along-walls feel without a physics engine.
-  */
-  const xOnly = resolveRigRoomCollision(
-    new THREE.Vector3(
-      nextPosition.x,
-      controlState.position.y,
-      controlState.position.z,
-    ),
-  );
-  const zOnly = resolveRigRoomCollision(
-    new THREE.Vector3(
-      controlState.position.x,
-      controlState.position.y,
-      nextPosition.z,
-    ),
-  );
-
-  if (isControlPositionValid(xOnly)) {
-    controlState.position.copy(xOnly);
-  }
-
-  if (isControlPositionValid(zOnly)) {
-    controlState.position.copy(zOnly);
-  }
-}
-
-function getWorldFootprint(controlPosition) {
-  /*
-    The collision circle lives at the visible skeleton root position, not just
-    the raw control position. Since rootOffsetX/Z can shift the skeleton inside
-    the workshop, collision has to include those offsets.
-  */
-  return new THREE.Vector2(
-    controlPosition.x + rigTuning.rootOffsetX,
-    controlPosition.z + rigTuning.rootOffsetZ,
-  );
-}
-
-function getControlPositionFromFootprint(footprint) {
-  // Inverse of getWorldFootprint(). Converts corrected world X/Z back into the
-  // stored control position.
-  return new THREE.Vector3(
-    footprint.x - rigTuning.rootOffsetX,
-    controlState.position.y,
-    footprint.y - rigTuning.rootOffsetZ,
-  );
-}
-
-function resolveFootprintAgainstWorld(footprint) {
-  /*
-    Pushes a 2D circular footprint out of all obstacles.
-
-    radius:
-      visible collider radius + small safety margin
-
-    Why three iterations?
-      Pushing out of one obstacle can push the circle into another nearby
-      obstacle. A few passes settle most simple cases without a physics engine.
-  */
-  const radius = rigTuning.colliderRadius + rigCollisionMargin;
-  const resolved = footprint.clone();
-  const bounds = getOutsideBounds(radius);
-
-  resolved.x = THREE.MathUtils.clamp(resolved.x, bounds.minX, bounds.maxX);
-  resolved.y = THREE.MathUtils.clamp(resolved.y, bounds.minZ, bounds.maxZ);
-
-  for (let iteration = 0; iteration < 3; iteration += 1) {
-    worldCollision.solidRects.forEach((rect) => {
-      pushFootprintOutOfRect(resolved, rect, radius);
-    });
-    worldCollision.solidCircles.forEach((circle) => {
-      pushFootprintOutOfCircle(resolved, circle, radius);
-    });
-
-    resolved.x = THREE.MathUtils.clamp(resolved.x, bounds.minX, bounds.maxX);
-    resolved.y = THREE.MathUtils.clamp(resolved.y, bounds.minZ, bounds.maxZ);
-  }
-
-  return resolved;
-}
-
-function getOutsideBounds(radius) {
-  /*
-    Returns the legal min/max X/Z values for the center of the player collider.
-
-    The radius is subtracted from the enclosure size so the edge of the circle,
-    not its center, stays inside the boundary.
-  */
-  const halfUsable = worldCollision.bounds.halfSize - wallThickness - radius;
-
-  return {
-    minX: worldCollision.bounds.centerX - halfUsable,
-    maxX: worldCollision.bounds.centerX + halfUsable,
-    minZ: worldCollision.bounds.centerZ - halfUsable,
-    maxZ: worldCollision.bounds.centerZ + halfUsable,
-  };
-}
-
-function pushFootprintOutOfRect(point, rect, radius) {
-  /*
-    Circle-vs-axis-aligned-rectangle resolver.
-
-    Instead of doing full circle/rectangle contact math, this expands the
-    rectangle by the circle radius and treats the circle center as a point.
-
-    If the point is inside the expanded rectangle, move it to the nearest edge.
-
-    This works well for thin walls and simple tabletop obstacles.
-  */
-  const expanded = {
-    minX: rect.minX - radius,
-    maxX: rect.maxX + radius,
-    minZ: rect.minZ - radius,
-    maxZ: rect.maxZ + radius,
-  };
-
-  if (
-    point.x < expanded.minX ||
-    point.x > expanded.maxX ||
-    point.y < expanded.minZ ||
-    point.y > expanded.maxZ
-  ) {
-    return;
-  }
-
-  const distances = [
-    {
-      axis: "x",
-      value: expanded.minX,
-      distance: Math.abs(point.x - expanded.minX),
-    },
-    {
-      axis: "x",
-      value: expanded.maxX,
-      distance: Math.abs(expanded.maxX - point.x),
-    },
-    {
-      axis: "z",
-      value: expanded.minZ,
-      distance: Math.abs(point.y - expanded.minZ),
-    },
-    {
-      axis: "z",
-      value: expanded.maxZ,
-      distance: Math.abs(expanded.maxZ - point.y),
-    },
-  ].sort((a, b) => a.distance - b.distance);
-  const nearest = distances[0];
-
-  if (nearest.axis === "x") {
-    point.x = nearest.value;
-  } else {
-    point.y = nearest.value;
-  }
-}
-
-function pushFootprintOutOfCircle(point, circle, radius) {
-  /*
-    Circle-vs-circle resolver for trees.
-
-    Variables:
-      dx, dz      = vector from obstacle center to player footprint
-      minDistance = obstacle radius + player radius
-      distance    = current center-to-center distance
-
-    If distance is too small, move the player footprint outward along the
-    center-to-center direction until the circles just touch.
-  */
-  const dx = point.x - circle.centerX;
-  const dz = point.y - circle.centerZ;
-  const minDistance = circle.radius + radius;
-  const distance = Math.hypot(dx, dz);
-
-  if (distance >= minDistance) {
-    return;
-  }
-
-  if (distance < 0.0001) {
-    point.x = circle.centerX + minDistance;
-    return;
-  }
-
-  point.x = circle.centerX + (dx / distance) * minDistance;
-  point.y = circle.centerZ + (dz / distance) * minDistance;
-}
-
-function isControlPositionValid(controlPosition) {
-  // Tests a proposed control position after converting it to world footprint.
-  const footprint = getWorldFootprint(controlPosition);
-  return isFootprintValid(footprint);
-}
-
-function isFootprintValid(footprint) {
-  // Boolean version of the collision check. Used by movement to decide whether
-  // a resolved step is acceptable.
-  const radius = rigTuning.colliderRadius + rigCollisionMargin;
-  const bounds = getOutsideBounds(radius);
-
-  if (
-    footprint.x < bounds.minX ||
-    footprint.x > bounds.maxX ||
-    footprint.y < bounds.minZ ||
-    footprint.y > bounds.maxZ
-  ) {
-    return false;
-  }
-
-  const intersectsRect = worldCollision.solidRects.some(
-    (rect) =>
-      footprint.x > rect.minX - radius &&
-      footprint.x < rect.maxX + radius &&
-      footprint.y > rect.minZ - radius &&
-      footprint.y < rect.maxZ + radius,
-  );
-
-  if (intersectsRect) {
-    return false;
-  }
-
-  return !worldCollision.solidCircles.some(
-    (circle) =>
-      Math.hypot(footprint.x - circle.centerX, footprint.y - circle.centerZ) <
-      circle.radius + radius,
-  );
-}
-
-function createEncounterRuntime(definitions) {
-  /*
-    Converts the raw encounter definitions from encounters.js into runtime state.
-
-    definitions:
-      The editable data list.
-
-    activeIds:
-      Set of encounter ids the avatar is currently inside.
-
-    Disabled encounters are kept out of the runtime list so they do not trigger
-    actions or draw debug zones.
-  */
-  return {
-    definitions: definitions.filter((encounter) => encounter.enabled !== false),
-    activeIds: new Set(),
-  };
-}
-
-function updateEncounterSystem() {
-  /*
-    Checks the avatar's footprint against every encounter trigger.
-
-    This runs once per animation frame. The logic only fires actions when the
-    inside/outside state changes:
-
-      outside -> inside = onEnter
-      inside -> outside = onExit
-
-    That keeps audio changes, console messages, and other one-shot actions from
-    repeating every frame.
-  */
-  if (!rigTuning.encounterSystemEnabled || !state.encounterRuntime) {
-    return;
-  }
-
-  const footprint = getWorldFootprint(controlState.position);
-
-  state.encounterRuntime.definitions.forEach((encounter) => {
-    const isInside = isFootprintInsideEncounter(footprint, encounter);
-    const wasInside = state.encounterRuntime.activeIds.has(encounter.id);
-
-    if (isInside && !wasInside) {
-      state.encounterRuntime.activeIds.add(encounter.id);
-      runEncounterActions(encounter.onEnter, encounter, "enter");
-    } else if (!isInside && wasInside) {
-      state.encounterRuntime.activeIds.delete(encounter.id);
-      runEncounterActions(encounter.onExit, encounter, "exit");
-    }
-  });
-
-  state.worldDebugView?.syncEncounterActivity?.(
-    state.encounterRuntime.activeIds,
-  );
-}
-
-function isFootprintInsideEncounter(footprint, encounter) {
-  /*
-    Tests the avatar footprint center against an encounter shape.
-
-    For now, the avatar collider radius is not added to encounter tests. This is
-    deliberate: encounter zones feel easier to place when they trigger from the
-    avatar center point. If you want edge-triggering later, add collider radius
-    to circle.radius or expand the rect here.
-  */
-  if (encounter.shape?.type === "circle") {
-    const [centerX, centerZ] = encounter.shape.center || [0, 0];
-    const radius = encounter.shape.radius || 1;
-    return Math.hypot(footprint.x - centerX, footprint.y - centerZ) <= radius;
-  }
-
-  if (encounter.shape?.type === "rect") {
-    const rect = getEncounterRect(encounter);
-    return (
-      footprint.x >= rect.minX &&
-      footprint.x <= rect.maxX &&
-      footprint.y >= rect.minZ &&
-      footprint.y <= rect.maxZ
-    );
-  }
-
-  return false;
-}
-
-function getEncounterRect(encounter) {
-  /*
-    Normalizes a rectangle encounter into min/max form.
-
-    Preferred editable form in encounters.js:
-      center: [x, z]
-      size: [width, depth]
-
-    Supported alternate form:
-      min: [minX, minZ]
-      max: [maxX, maxZ]
-  */
-  if (encounter.shape?.min && encounter.shape?.max) {
-    return {
-      minX: encounter.shape.min[0],
-      maxX: encounter.shape.max[0],
-      minZ: encounter.shape.min[1],
-      maxZ: encounter.shape.max[1],
-    };
-  }
-
-  const [centerX, centerZ] = encounter.shape?.center || [0, 0];
-  const [width, depth] = encounter.shape?.size || [1, 1];
-
-  return {
-    minX: centerX - width / 2,
-    maxX: centerX + width / 2,
-    minZ: centerZ - depth / 2,
-    maxZ: centerZ + depth / 2,
-  };
-}
-
-function getEncounterCenter(encounter) {
-  /*
-    Returns the center of an encounter in X/Z space as a THREE.Vector2.
-
-    Used for debug labels.
-  */
-  if (encounter.shape?.type === "circle") {
-    const [x, z] = encounter.shape.center || [0, 0];
-    return new THREE.Vector2(x, z);
-  }
-
-  const rect = getEncounterRect(encounter);
-  return new THREE.Vector2(
-    (rect.minX + rect.maxX) / 2,
-    (rect.minZ + rect.maxZ) / 2,
-  );
-}
-
-function runEncounterActions(actions = [], encounter, phase) {
-  /*
-    Runs each action listed in an encounter's onEnter or onExit array.
-
-    phase is currently "enter" or "exit". It is included in console output so
-    debugging messages tell you when the transition happened.
-  */
-  actions.forEach((action) => {
-    applyEncounterAction(action, encounter, phase);
-  });
-}
-
-function applyEncounterAction(action, encounter, phase) {
-  /*
-    Dispatch table for encounter actions.
-
-    To add a new action type later:
-      1. Add a new case here.
-      2. Document the action shape in encounters.js.
-      3. Add an example to WORLD_COOKBOOK.md.
-  */
-  switch (action.type) {
-    case "log":
-      console.info(`[encounter:${phase}] ${encounter.id}`, action.message || "");
-      break;
-    case "audio":
-      applyEncounterAudioAction(action);
-      break;
-    case "jupiterColor":
-      jupiter.material.color.set(action.color || SOLO_TWEAKS.jupiter.color);
-      break;
-    case "jupiterScale":
-      jupiter.scale.setScalar(Number.isFinite(action.scale) ? action.scale : 1);
-      break;
-    default:
-      console.warn("Unknown encounter action.", { encounter, action });
-      break;
-  }
-}
-
-function applyEncounterAudioAction(action) {
-  /*
-    Applies an audio action to the current background audio object.
-
-    Supported fields:
-      src          = optional new audio file path
-      volume       = 0..1
-      playbackRate = rate multiplier
-      loop         = true/false
-      play         = true to request playback
-      pause        = true to pause
-
-    This is intentionally simple right now. A future version can add timed fades
-    by storing a target volume and easing toward it in animate().
-  */
-  if (action.src && !myAudio.src.endsWith(action.src)) {
-    myAudio.pause();
-    myAudio.src = action.src;
-    myAudio.load();
-  }
-
-  if (Number.isFinite(action.volume)) {
-    myAudio.volume = THREE.MathUtils.clamp(action.volume, 0, 1);
-  }
-
-  if (Number.isFinite(action.playbackRate)) {
-    myAudio.playbackRate = THREE.MathUtils.clamp(action.playbackRate, 0.5, 4);
-  }
-
-  if (typeof action.loop === "boolean") {
-    myAudio.loop = action.loop;
-  }
-
-  if (action.pause) {
-    myAudio.pause();
-    return;
-  }
-
-  if (action.play) {
-    myAudio.play().catch((error) => {
-      console.info("Encounter audio is waiting for user interaction.", error);
-    });
-  }
-}
-
-function getJumpGravity() {
-  /*
-    For a symmetric hop:
-
-    gravity = (8 * height) / duration^2
-
-    where height is scene units and duration is seconds for the complete
-    up-and-down arc. jumpGravityScale intentionally bends that formula for
-    feel: > 1 snaps harder, < 1 floats longer.
-  */
-  const duration = Math.max(0.001, rigTuning.jumpDuration);
-  const baseGravity = (8 * rigTuning.jumpHeight) / (duration * duration);
-  return baseGravity * rigTuning.jumpGravityScale;
-}
-
-function getJumpLaunchVelocity() {
-  /*
-    launchVelocity = sqrt(2 * gravity * height)
-
-    With gravityScale = 1 this is equivalent to:
-    launchVelocity = (4 * height) / duration
-  */
-  return Math.sqrt(2 * getJumpGravity() * rigTuning.jumpHeight);
-}
-
 function startJump() {
   /*
     Begins a jump only if grounded.
 
+    This only kicks off the "crouch" phase. The actual transition from crouch
+    to air (and setting the launch velocity) is handled automatically by
+    updateJumpState() in physics.js once jump.elapsed >= jump.crouchDuration.
+
     The crouch phase gives the pose time to compress before physics launches
     the root upward. Without it, the jump starts too abruptly.
+
+    There used to be a separate launchJump() function here that manually set
+    phase = "air" and velocityY. It became dead code once updateJumpState()
+    took over the full state machine and was removed to reduce clutter.
   */
   const jump = controlState.jump;
 
@@ -5147,145 +2839,20 @@ function startJump() {
   jump.velocityY = 0;
 }
 
-function launchJump() {
-  // Switches from crouch to air and gives the root an upward velocity.
-  const jump = controlState.jump;
-
-  jump.phase = "air";
-  jump.elapsed = 0;
-  jump.velocityY = getJumpLaunchVelocity();
-}
-
 function updateJumpPhysics(delta) {
-  /*
-    Updates the jump state machine.
-
-    Air physics:
-      velocityY = velocityY - gravity * delta
-      offsetY   = offsetY + velocityY * delta
-
-    offsetY is applied in syncSkeletonRoot(), so jump physics stays separate
-    from the skeleton's saved root alignment.
-  */
-  const jump = controlState.jump;
-
-  if (jump.phase === "grounded") {
-    jump.offsetY = 0;
-    jump.velocityY = 0;
-    return;
-  }
-
-  jump.elapsed += delta;
-
-  if (jump.phase === "crouch") {
-    if (jump.elapsed >= jump.crouchDuration) {
-      launchJump();
-    }
-    return;
-  }
-
-  if (jump.phase === "air") {
-    jump.velocityY -= getJumpGravity() * delta;
-    jump.offsetY += jump.velocityY * delta;
-
-    if (jump.offsetY <= 0 && jump.velocityY < 0) {
-      jump.phase = "landing";
-      jump.elapsed = 0;
-      jump.offsetY = 0;
-      jump.velocityY = 0;
-    }
-    return;
-  }
-
-  if (jump.phase === "landing" && jump.elapsed >= jump.landingDuration) {
-    jump.phase = "grounded";
-    jump.elapsed = 0;
-  }
+  updateJumpState(controlState.jump, rigTuning, delta);
 }
 
 function getJumpPoseWeights() {
-  /*
-    Converts jump state into pose-blend weights.
-
-    Returned weights:
-      crouch  = compression before takeoff
-      air     = leg/arm pose while airborne
-      landing = compression after returning to floor
-
-    These are animation weights only. The vertical root motion comes from
-    updateJumpPhysics().
-  */
-  const jump = controlState.jump;
-
-  if (jump.phase === "crouch") {
-    return {
-      crouch: smoothstep(0, jump.crouchDuration, jump.elapsed),
-      air: 0,
-      landing: 0,
-    };
-  }
-
-  if (jump.phase === "air") {
-    return {
-      crouch: 0,
-      air: 1,
-      landing: 0,
-    };
-  }
-
-  if (jump.phase === "landing") {
-    return {
-      crouch: 0,
-      air: 0,
-      landing: 1 - smoothstep(0, jump.landingDuration, jump.elapsed),
-    };
-  }
-
-  return { crouch: 0, air: 0, landing: 0 };
+  return getJumpPoseWeightValues(controlState.jump);
 }
 
-function getStepPhase(phase) {
-  /*
-    Converts a walk phase into readable gait markers.
+function getLegStrideValues(phase) {
+  return getPhysicsLegStrideValues(phase);
+}
 
-    t is the normalized phase:
-      0.00 to 0.50 = stance/contact
-      0.50 to 1.00 = swing/recovery
-
-    lift:
-      sin(swingProgress * PI), so it rises from 0, peaks at 1, returns to 0
-
-    pushOff:
-      ramps up late in stance, like pushing from the toe
-
-    plant:
-      strong at the start of stance, then fades as the foot settles
-  */
-  const t = cycle01(phase);
-
-  // Rough gait phases:
-  // 0.00 - 0.50 = stance/contact
-  // 0.50 - 1.00 = swing/recovery
-  const isSwing = t >= 0.5;
-
-  const swingProgress = isSwing ? (t - 0.5) / 0.5 : 0;
-  const stanceProgress = !isSwing ? t / 0.5 : 0;
-
-  const lift = isSwing ? Math.sin(swingProgress * Math.PI) : 0;
-
-  const pushOff = !isSwing ? smoothstep(0.65, 1.0, stanceProgress) : 0;
-
-  const plant = !isSwing ? 1 - smoothstep(0.0, 0.2, stanceProgress) : 0;
-
-  return {
-    t,
-    isSwing,
-    swingProgress,
-    stanceProgress,
-    lift,
-    pushOff,
-    plant,
-  };
+function getPelvisWalkValues(phase, options) {
+  return getPhysicsPelvisWalkValues(phase, options);
 }
 
 function updateWalkMotion(delta, elapsed, options = {}) {
@@ -5311,44 +2878,62 @@ function updateWalkMotion(delta, elapsed, options = {}) {
   const amplitude = rigTuning.walkAmplitude * (options.blend ?? 1);
   const leftSwing = Math.sin(phase) * amplitude;
   const rightSwing = Math.sin(phase + Math.PI) * amplitude;
+  const pelvisWalk = getPelvisWalkValues(phase, {
+    amplitude,
+    swayAmount: rigTuning.walkHipSway,
+    bobAmount: rigTuning.walkHipBob,
+    tiltAmount: rigTuning.walkHipTilt,
+    twistAmount: rigTuning.walkHipTwist,
+  });
 
   /*
-    doubleStep runs twice per walk cycle. That is useful for body bob because
-    the body rises/falls with each footstep, not only once per full left+right
-    cycle.
+    pelvisWalk.bobY is built from abs(sin(phase * 2)), so it rises twice per
+    left+right cycle. That matches footfalls: left plant, right plant.
   */
-  const doubleStep = Math.sin(phase * 2);
-  const bodyBob = Math.abs(doubleStep) * 0.04 * amplitude;
-  const hipSway = doubleStep * 0.055 * amplitude;
-  const chestCounterSway = Math.sin(phase * 2 - 0.55) * 0.04 * amplitude;
-  const headStabilizer = Math.sin(phase * 2 - 1.1) * 0.025 * amplitude;
-  const leftStep = getStepPhase(phase);
-  const rightStep = getStepPhase(phase + Math.PI);
-
-  const leftSupport = leftStep.isSwing ? 0 : 1;
-  const rightSupport = rightStep.isSwing ? 0 : 1;
-
-  const supportBalance = rightSupport - leftSupport;
+  const bodyBob = pelvisWalk.bobY * 0.65;
+  const chestCounterSway =
+    -pelvisWalk.tiltZ * 0.62 + Math.sin(phase * 2 - 0.55) * 0.012 * amplitude;
+  const headStabilizer =
+    pelvisWalk.twistY * 0.45 + Math.sin(phase * 2 - 1.1) * 0.01 * amplitude;
   /*
-    supportBalance:
-      +1 when right foot supports
-      -1 when left foot supports
-       0 when both are equally treated
+    PELVIS CARRIER MOTION:
+      The hip sockets are children of the pelvis, so the clean way to make the
+      walk show weight transfer is to move/rotate the pelvis itself.
 
-    This shifts the pelvis over the supporting side and keeps the walk from
-    looking like the legs are moving under a locked torso.
+      getPelvisWalkValues() returns:
+        swayX  = side-to-side hip travel over the planted foot
+        bobY   = vertical rise once per footfall
+        tiltZ  = side lean around the forward axis
+        twistY = waist twist around the vertical axis
+
+      This is intentionally applied to joints.pelvis, not leftHip/rightHip.
+      Moving the individual hip sockets would tug the femur endpoints around
+      independently. Moving the pelvis carries both hip sockets together, which
+      is closer to a real body and keeps the joint hierarchy honest.
   */
-  const weightShift = supportBalance * 0.035 * amplitude;
   const headCounterY = -bodyBob * 0.35;
-  joints.body.position.y = joints.body.userData.bindLocalPosition.y + bodyBob;
+  dampJointPositionFromBind(
+    joints.body,
+    {
+      x: 0,
+      y: bodyBob,
+      z: 0,
+    },
+    delta,
+    rigTuning.damping * 0.95,
+  );
   dampJointRotation(
     joints.pelvis,
-    new THREE.Euler(0, hipSway * 0.35, -hipSway),
+    new THREE.Euler(0, pelvisWalk.twistY, pelvisWalk.tiltZ),
     delta,
   );
   dampJointRotation(
     joints.chest,
-    new THREE.Euler(0.02 * amplitude, -hipSway * 0.55, chestCounterSway),
+    new THREE.Euler(
+      0.02 * amplitude,
+      -pelvisWalk.twistY * 0.65,
+      chestCounterSway,
+    ),
     delta,
     rigTuning.damping * 0.9,
   );
@@ -5361,8 +2946,8 @@ function updateWalkMotion(delta, elapsed, options = {}) {
   dampJointPositionFromBind(
     joints.pelvis,
     {
-      x: weightShift,
-      y: 0,
+      x: pelvisWalk.swayX,
+      y: pelvisWalk.bobY,
       z: 0,
     },
     delta,
@@ -5372,54 +2957,99 @@ function updateWalkMotion(delta, elapsed, options = {}) {
   dampJointPositionFromBind(
     joints.head,
     {
-      x: -weightShift * 0.25,
+      x: -pelvisWalk.swayX * 0.25,
       y: headCounterY,
       z: 0,
     },
     delta,
     rigTuning.damping * 0.55,
   );
-  updateLegWalk("left", -1, leftSwing, phase, delta, amplitude);
-  updateLegWalk("right", 1, rightSwing, phase + Math.PI, delta, amplitude);
+  /*
+    ARM COUNTER-SWING:
+      In a natural bipedal walk, each arm swings in the OPPOSITE direction to
+      the leg on the same side. When the left leg steps forward, the left arm
+      swings backward (and vice versa). This prevents the walk from looking like
+      a march where both limbs on a side move together.
+
+      The swing direction is simply negated:
+        left arm target  = -leftSwing  (backward when left leg is forward)
+        right arm target = -rightSwing
+
+      The actual swing rotation is applied inside updateControlledArm() when the
+      arm is in the default "down" pose. We store it here so the arm controller
+      can read it without needing to know anything about the walk phase or
+      amplitude.
+
+      Amplitude is multiplied in here so the arm swing scales with walkAmplitude
+      the same way leg swing does. The 0.22 factor is about 65% of the leg swing
+      amplitude â€” arms swing somewhat less dramatically than legs in most gaits.
+  */
+  if (!state.walkArmSwing) {
+    state.walkArmSwing = { left: 0, right: 0 };
+  }
+
+  state.walkArmSwing.left = -leftSwing * 0.22 * amplitude;
+  state.walkArmSwing.right = -rightSwing * 0.22 * amplitude;
+
+  updateLegWalk("left", -1, phase, delta, amplitude);
+  updateLegWalk("right", 1, phase + Math.PI, delta, amplitude);
 }
 
-function updateLegWalk(sideName, side, swing, phase, delta, amplitude) {
+function updateLegWalk(sideName, side, phase, delta, amplitude) {
   /*
     Animates one leg.
 
     sideName = "left" or "right"
     side     = -1 for left, +1 for right
-    swing    = sine wave value for this leg
     phase    = phase offset for this leg
 
     This combines joint rotations with small joint-position offsets. The offsets
     are not physically perfect inverse kinematics, but they give readable foot
     lift, knee drift, toe push, and planted-foot behavior.
   */
-  const step = getStepPhase(phase);
+  const stride = getLegStrideValues(phase);
   const joints = state.skeleton.joints;
   const hip = joints[`${sideName}Hip`];
   const knee = joints[`${sideName}Knee`];
   const ankle = joints[`${sideName}Ankle`];
   const foot = joints[`${sideName}Foot`];
-  const kneeLift = step.lift;
-  const toePush = step.pushOff;
-  const footPlant = step.plant;
+  const kneeLift = stride.footLift;
+  const toePush = stride.pushOff;
+  const footPlant = stride.plant;
 
-  // Forward/back foot travel.
-  // Positive swing means leg forward/back depending on your current coordinate feel.
-  const footTravel = swing * 0.1 * amplitude;
+  /*
+    Forward/back foot travel.
 
-  // This makes the knee drift slightly outward during lift,
-  // which reads better than perfectly straight hinge motion.
-  const readableKneeBend = side * kneeLift * 0.075 + swing * 0.025;
-  const readableAnkleBend = -side * kneeLift * 0.052 - swing * 0.018;
+    The older pass used:
+      footTravel = sin(phase) * 0.1
+
+    That technically moved the leg, but the visible foot path felt boxed in:
+    the foot had only a tiny forward/back slot, and the lift happened inside
+    that slot. The new value comes from getLegStrideValues() in physics.js:
+
+      footTravel = normalizedFootZ * strideLength * amplitude
+
+    where:
+      normalizedFootZ = -0.5..0.5
+      strideLength    = 0.34 scene units
+      amplitude       = the GUI walk amplitude slider
+
+    This creates a clearer planted drift backward and a smoother lifted return
+    forward, while leaving the arm counter-swing math alone.
+  */
+  const strideSwing = stride.strideSwing;
+  const footTravel = stride.footZ * 0.34 * amplitude;
+
+  // This makes the knee drift slightly outward during lift, which reads better
+  // than perfectly straight hinge motion, especially on the wire skeleton.
+  const readableKneeBend = side * kneeLift * 0.09 + strideSwing * 0.018;
+  const readableAnkleBend = -side * kneeLift * 0.064 - strideSwing * 0.014;
   dampJointPositionFromBind(
     knee,
     {
       x: readableKneeBend,
-      y: kneeLift * 0.035,
-      z: footTravel * 0.75,
+      y: kneeLift * 0.075,
+      z: footTravel * 0.62,
     },
     delta,
   );
@@ -5428,7 +3058,7 @@ function updateLegWalk(sideName, side, swing, phase, delta, amplitude) {
     ankle,
     {
       x: readableAnkleBend,
-      y: kneeLift * 0.055 - footPlant * 0.01,
+      y: kneeLift * 0.11 - footPlant * 0.006,
       z: footTravel,
     },
     delta,
@@ -5438,8 +3068,8 @@ function updateLegWalk(sideName, side, swing, phase, delta, amplitude) {
     foot,
     {
       x: -readableAnkleBend * 0.5,
-      y: kneeLift * 0.025 + toePush * 0.015,
-      z: footTravel * 0.45 + toePush * 0.045,
+      y: kneeLift * 0.07 + toePush * 0.018 - footPlant * 0.004,
+      z: footTravel * 1.08 + toePush * 0.055,
     },
     delta,
   );
@@ -5447,7 +3077,7 @@ function updateLegWalk(sideName, side, swing, phase, delta, amplitude) {
   dampJointRotation(
     hip,
     new THREE.Euler(
-      swing * 0.34,
+      strideSwing * 0.32 * amplitude,
       side * 0.025 * amplitude,
       side * 0.06 * amplitude,
     ),
@@ -5457,9 +3087,9 @@ function updateLegWalk(sideName, side, swing, phase, delta, amplitude) {
   dampJointRotation(
     knee,
     new THREE.Euler(
-      0.06 + kneeLift * 0.38 + Math.max(0, -swing) * 0.12,
+      0.04 + kneeLift * 0.52 + Math.max(0, -strideSwing) * 0.08 * amplitude,
       0,
-      side * kneeLift * 0.06,
+      side * kneeLift * 0.07,
     ),
     delta,
   );
@@ -5467,7 +3097,7 @@ function updateLegWalk(sideName, side, swing, phase, delta, amplitude) {
   dampJointRotation(
     ankle,
     new THREE.Euler(
-      -swing * 0.12 + toePush * 0.24 - footPlant * 0.08,
+      -strideSwing * 0.1 * amplitude + toePush * 0.3 - footPlant * 0.06,
       side * 0.015 * amplitude,
       0,
     ),
@@ -5477,7 +3107,7 @@ function updateLegWalk(sideName, side, swing, phase, delta, amplitude) {
   dampJointRotation(
     foot,
     new THREE.Euler(
-      toePush * 0.28 - footPlant * 0.12,
+      toePush * 0.32 - footPlant * 0.09 - kneeLift * 0.02,
       0,
       -side * 0.025 * amplitude,
     ),
@@ -5490,8 +3120,44 @@ function relaxLegs(delta) {
     When not walking, smoothly returns all leg joints to bind pose.
 
     This prevents the last walk frame from freezing with one knee lifted.
+
+    We also clear walkArmSwing here so the arms ease back to idle trail
+    instead of holding the last walk swing value indefinitely after stopping.
+    The damp in updateControlledArm will smoothly interpolate from whatever
+    swing was last set toward the now-zero target over the next few frames.
   */
+  if (state.walkArmSwing) {
+    state.walkArmSwing.left = 0;
+    state.walkArmSwing.right = 0;
+  }
   const joints = state.skeleton.joints;
+
+  /*
+    The walk cycle moves the body carrier and pelvis carrier, not only the legs.
+    When walking stops, ease those local position offsets back to bind so the
+    rig does not freeze with one hip still shifted over a planted foot.
+
+    Rotations are left to idle motion when idle is enabled. The important thing
+    here is to clear the position offsets introduced by walk bob/sway.
+  */
+  dampJointPositionFromBind(
+    joints.body,
+    { x: 0, y: 0, z: 0 },
+    delta,
+    rigTuning.damping * 0.9,
+  );
+  dampJointPositionFromBind(
+    joints.pelvis,
+    { x: 0, y: 0, z: 0 },
+    delta,
+    rigTuning.damping * 0.82,
+  );
+  dampJointPositionFromBind(
+    joints.head,
+    { x: 0, y: 0, z: 0 },
+    delta,
+    rigTuning.damping * 0.62,
+  );
 
   ["left", "right"].forEach((sideName) => {
     ["Hip", "Knee", "Ankle", "Foot"].forEach((jointName) => {
@@ -5516,9 +3182,49 @@ function updateJumpPose(delta) {
   /*
     Adds jump pose on top of the root jump physics.
 
-    The root carries actual vertical movement. This function only adjusts the
-    skeleton shape: crouch compression, airborne leg tuck, floating arms, and
-    landing absorption.
+    THE SEPARATION BETWEEN ROOT AND POSE:
+      Two things happen during a jump:
+
+      1. ROOT MOVEMENT (in syncSkeletonRoot):
+           root.position.y += jump.offsetY
+         This lifts the entire skeleton â€” every joint â€” upward.
+         It is driven by real physics: launch velocity, gravity, arc.
+
+      2. POSE SHAPE (this function):
+         Body, legs, and arms change shape to look like a jump.
+         These are LOCAL position and rotation offsets within the skeleton.
+         They do not move the root â€” they deform the pose around it.
+
+    This function only handles the pose shape.
+
+    THE BUG THAT WAS HERE:
+      The original line was:
+        joints.body.position.y -= crouchDrop;
+
+      That uses -=, which SUBTRACTS from the current value every frame.
+      On the first frame of the crouch phase, crouchDrop might be 0.009.
+        body.y = 0 - 0.009 = -0.009
+      Next frame, crouchDrop is 0.018.
+        body.y = -0.009 - 0.018 = -0.027
+      ... and so on. Each frame adds MORE negative offset.
+
+      By the time the physics launched the root upward (adding jump.offsetY
+      to the world position), the body joint had accumulated such a large
+      downward offset in the root's local space that the two effects cancelled.
+      The root rose; the body stayed near the floor. The debug sphere for the
+      body-root joint appeared stuck at ground level.
+
+    THE FIX:
+      joints.body.position.y = joints.body.userData.bindLocalPosition.y - crouchDrop;
+
+      This is a SET, not an accumulation. Each frame it computes:
+        body.y = bind_y - current_crouchDrop
+      where bind_y = 0 (the body joint's neutral local position).
+
+      When crouchDrop is 0 (air phase), body.y = 0 = neutral. Root carries height.
+      When crouchDrop ramps up (crouch/landing), body.y becomes negative cleanly.
+      When the jump ends, crouchDrop reaches 0 and body.y returns to bind.
+      No accumulation. No drift. No fighting the root physics.
   */
   const weights = getJumpPoseWeights();
   const compression = weights.crouch + weights.landing;
@@ -5534,10 +3240,18 @@ function updateJumpPose(delta) {
   const armFloat = weights.air * 0.55 - weights.landing * 0.25;
 
   /*
-    Root Y carries the actual jump arc. This body offset is only the pose:
-    crouch before takeoff and absorb the landing after the root returns to floor.
+    Set body Y to bind position offset by the current crouchDrop.
+    During air phase, crouchDrop = 0, so body sits at its bind Y (neutral).
+    During crouch and landing, crouchDrop > 0, pressing body downward within
+    the root's local space to simulate compression.
+
+    WHY bindLocalPosition.y INSTEAD OF JUST 0:
+      If a slider or drag ever moves the body joint's pivot, bindLocalPosition.y
+      would hold that offset. Using it here means the jump pose respects any
+      customized body offset instead of hard-coding floor-level as the neutral.
   */
-  joints.body.position.y -= crouchDrop;
+  joints.body.position.y =
+    joints.body.userData.bindLocalPosition.y - crouchDrop;
 
   ["left", "right"].forEach((sideName, index) => {
     const side = index === 0 ? -1 : 1;
@@ -5595,7 +3309,7 @@ function updateControlledArm(sideName, side, pose, delta, currentTime) {
     Applies one controlled arm pose.
 
     Poses:
-      down = relaxed idle trail
+      down = relaxed idle trail  (default while standing or walking)
       half = both hands half high
       up   = selected arm high
       wave = temporary waving pose with wrist/palm oscillation
@@ -5603,6 +3317,20 @@ function updateControlledArm(sideName, side, pose, delta, currentTime) {
     side mirrors the pose across the body:
       left  side = -1
       right side = +1
+
+    ARM COUNTER-SWING DURING WALK:
+      When the puppet is walking, updateWalkMotion() stores the current arm
+      swing values in state.walkArmSwing.left and state.walkArmSwing.right.
+      In the "down" pose (hanging at rest), we blend that swing into the
+      shoulder's forward/back rotation (X axis). This gives a natural gait
+      where each arm swings opposite to the leg on the same side.
+
+      The swing only affects "down" pose â€” it would look wrong to counter-swing
+      while the arm is raised (up/half/wave) since those poses already dominate
+      the shoulder rotation with a deliberate override.
+
+      When not walking, walkArmSwing values are zero (updateWalkMotion is not
+      called), so the idle trail is unaffected.
   */
   const joints = state.skeleton.joints;
   const shoulder = joints[`${sideName}Shoulder`];
@@ -5614,7 +3342,26 @@ function updateControlledArm(sideName, side, pose, delta, currentTime) {
   const handFloat =
     Math.sin(time * 0.9 - 1.65) * rigTuning.armTrailAmplitude * 0.45;
   const wave = pose === "wave" ? Math.sin(time * 9) * 0.45 : 0;
-  let shoulderTarget = new THREE.Euler(trail * 0.12, 0, side * 0.16);
+
+  /*
+    Read the current walk arm swing for this side.
+    state.walkArmSwing is written each frame by updateWalkMotion() when
+    the walk preview or active movement is running. It is zero otherwise.
+  */
+  const walkSwing = state.walkArmSwing?.[sideName] ?? 0;
+
+  /*
+    Default "down" pose: arm hangs with a slow independent trail oscillation.
+    walkSwing is added to the shoulder X to create natural gait counter-swing.
+    The trail's X contribution (trail * 0.12) still blends in â€” during walking,
+    the trail amplitude is typically small so it only adds subtle variation on
+    top of the gait swing.
+  */
+  let shoulderTarget = new THREE.Euler(
+    trail * 0.12 + walkSwing,
+    0,
+    side * 0.16,
+  );
   let elbowTarget = new THREE.Euler(0.08, 0, side * 0.08);
   let wristTarget = new THREE.Euler(
     handFloat * 0.08,
@@ -5708,21 +3455,55 @@ function getScenePointer(event) {
 
   mouseJointEditor.pointer.x =
     ((event.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
-  mouseJointEditor.pointer.y =
-    -(((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1);
+  mouseJointEditor.pointer.y = -(
+    ((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 -
+    1
+  );
 
   return mouseJointEditor.pointer;
 }
 
 function handleJointEditPointerDown(event) {
   /*
-    Starts a joint-point drag if mouse point edit mode is enabled and the user
-    clicked a visible debug marker.
+    Starts a joint-point drag.
 
-    Drag plane:
-      A camera-facing plane through the selected joint. This makes the drag feel
-      like "move this point under my cursor" without needing a full transform
-      gizmo yet.
+    This function runs when the user presses the mouse button. Its job is to
+    record the "start state" that handleJointEditPointerMove will use as a
+    reference while the cursor moves.
+
+    THREE CONDITIONS must all be true before a drag can start:
+      1. mouseJointEditMode is on (the user toggled the mode in the GUI)
+      2. The skeleton lab is visible (joints must be rendered to be clickable)
+      3. There are selectable markers in the scene to hit-test against
+
+    HOW THE DRAG PLANE WORKS:
+      We do not use a full 3D transform gizmo (those are complex to implement and
+      read). Instead, we create a flat invisible plane that:
+        - faces the camera (its normal points toward the camera)
+        - passes through the clicked joint's world position
+
+      During pointermove, we shoot a ray from the camera through the cursor and
+      intersect it with this plane. That intersection point is the new "desired
+      world position" for the joint. Converting it to the parent's local space
+      gives us the offset to store.
+
+      The result feels like "sliding the joint along a wall facing you," which
+      is intuitive even without a full gizmo.
+
+    WHY WE CAPTURE THE POINTER:
+      setPointerCapture() tells the browser to keep sending pointer events to this
+      element even if the cursor leaves it. Without this, dragging fast outside
+      the canvas would silently end the drag mid-gesture.
+
+    REFERENCE POINTS RECORDED HERE:
+      dragStartWorld        = joint's world position at click time
+      dragStartLocal        = joint's bind-local position at click time (the slider values)
+      dragStartParentLocal  = the click point in the PARENT's local space
+                              (used in pointermove to calculate the delta correctly)
+
+    NOTE: worldToLocal() here uses the current matrixWorld, which is fresh because
+    the render loop just ran before the user clicked. See handleJointEditPointerMove
+    for the explanation of why later events need an explicit updateMatrixWorld().
   */
   if (
     !rigTuning.mouseJointEditMode ||
@@ -5735,6 +3516,11 @@ function handleJointEditPointerDown(event) {
 
   mouseJointEditor.raycaster.setFromCamera(getScenePointer(event), camera);
 
+  /*
+    Hit-test only the visible, editable joint markers. The `false` argument means
+    do not recurse into children â€” each marker is a flat mesh and we only want
+    the marker itself, not anything it might contain.
+  */
   const intersections = mouseJointEditor.raycaster.intersectObjects(
     state.debugView.selectableMarkers.filter(
       (marker) => marker.visible && marker.userData.isJointEditHandle,
@@ -5758,9 +3544,26 @@ function handleJointEditPointerDown(event) {
   sceneContainer.setPointerCapture?.(event.pointerId);
   selectMouseJointEditJoint(jointKey);
 
+  /*
+    Record the joint's world position at click time. This becomes the coplanar
+    point for the drag plane so the plane passes exactly through the joint.
+  */
   joint.getWorldPosition(mouseJointEditor.dragStartWorld);
+
+  /*
+    Record the joint's current bind-local position (base + offset). This is
+    the value we'll be adjusting during the drag.
+  */
   mouseJointEditor.dragStartLocal.copy(joint.userData.bindLocalPosition);
 
+  /*
+    Build the camera-facing drag plane.
+
+    getWorldDirection() returns a unit vector pointing OUT of the camera lens.
+    Setting that as the plane's normal makes the plane face the camera.
+    The coplanar point anchors the plane at the joint's world position so the
+    intersection point stays at the same depth as the joint.
+  */
   const cameraNormal = new THREE.Vector3();
   camera.getWorldDirection(cameraNormal).normalize();
   mouseJointEditor.dragPlane.setFromNormalAndCoplanarPoint(
@@ -5768,6 +3571,14 @@ function handleJointEditPointerDown(event) {
     mouseJointEditor.dragStartWorld,
   );
 
+  /*
+    Do an immediate first intersection to get the exact click point on the plane
+    (not the marker surface â€” the plane is coplanar with the joint, but the
+    marker is a sphere that protrudes from it, so they differ slightly).
+
+    Converting this to parent-local space gives dragStartParentLocal â€” the
+    reference origin for the delta calculation in pointermove.
+  */
   mouseJointEditor.raycaster.ray.intersectPlane(
     mouseJointEditor.dragPlane,
     mouseJointEditor.dragCurrentWorld,
@@ -5782,6 +3593,58 @@ function handleJointEditPointerDown(event) {
 }
 
 function handleJointEditPointerMove(event) {
+  /*
+    THE BUG THAT WAS HERE â€” and why it broke parent-child relationships:
+
+    Every joint in the skeleton is a THREE.Group. Three.js stores two separate
+    transforms on every object:
+
+      1. LOCAL matrix  â€” position/rotation/scale relative to the PARENT.
+                         Updated immediately whenever you set .position or .quaternion.
+
+      2. WORLD matrix  â€” the accumulated transform from the scene root all the way
+                         down to this object. This is what converts a local point
+                         into an actual position in 3D space.
+
+    IMPORTANT: Three.js does NOT update the world matrix automatically every time
+    you change a position. It only updates world matrices in two moments:
+      a) renderer.render() â€” the render loop calls scene.updateMatrixWorld() at
+                             the start of every frame.
+      b) An explicit call to object.updateMatrixWorld(true).
+
+    The drag handler calls these functions on every pointermove event:
+      applyJointPointOffsets()  â€” changes joint.position for ALL joints
+      resetSkeletonToBindPose() â€” also changes joint.position for ALL joints
+      syncSkeletonRoot()        â€” moves the root joint to the player position
+
+    After those calls, every joint's LOCAL transform is up to date.
+    But their WORLD matrices are now STALE â€” they still reflect positions from
+    before this event fired.
+
+    Then the handler calls:
+      joint.parent.worldToLocal(someWorldPoint)
+
+    worldToLocal() inverts joint.parent.matrixWorld to map a world-space point into
+    parent-local space. If matrixWorld is stale, this conversion is wrong â€” the
+    parent's actual current position in the world is not accounted for. This is
+    exactly what "parent-child relationships are not being followed" means: the
+    parent has moved, but worldToLocal() doesn't know that yet.
+
+    At normal speeds this is invisible because the render loop runs between events
+    and refreshes all matrices. But at high mouse speeds, multiple pointermove
+    events fire within the same animation frame â€” so the second event arrives before
+    renderer.render() has had a chance to update matrixWorld.
+
+    THE FIX:
+    After applying position changes, explicitly call:
+      state.skeleton.root.updateMatrixWorld(true)
+
+    The argument `true` means "update this node AND all its children." This
+    propagates fresh world matrices through the entire skeleton hierarchy so the
+    next worldToLocal() call gets accurate results regardless of how many events
+    have fired since the last render.
+  */
+
   if (!mouseJointEditor.dragging || !mouseJointEditor.selectedJointKey) {
     return;
   }
@@ -5795,6 +3658,14 @@ function handleJointEditPointerMove(event) {
   event.preventDefault();
   mouseJointEditor.raycaster.setFromCamera(getScenePointer(event), camera);
 
+  /*
+    Intersect the mouse ray with the camera-facing drag plane.
+
+    The drag plane was set up in handleJointEditPointerDown: it is a flat surface
+    facing the camera, passing through the joint's world position at click time.
+    Intersecting with it converts the current 2D mouse position into a 3D world
+    position on that plane.
+  */
   const hit = mouseJointEditor.raycaster.ray.intersectPlane(
     mouseJointEditor.dragPlane,
     mouseJointEditor.dragCurrentWorld,
@@ -5804,16 +3675,53 @@ function handleJointEditPointerMove(event) {
     return;
   }
 
+  /*
+    Convert the new world hit point to the PARENT joint's local space.
+
+    Why the parent's local space?
+      Joint positions are stored relative to their parent (that's how Three.js
+      scene graphs work). If we stored the joint's world position directly, moving
+      or rotating a parent would silently break every child's stored position.
+
+      By working in parent-local space, we store a position that is meaningful
+      relative to the parent joint regardless of where the parent is in the world.
+
+    WHY THIS CALL NEEDS A FRESH WORLD MATRIX:
+      joint.parent.worldToLocal() internally inverts joint.parent.matrixWorld.
+      If the skeleton's positions were just changed by applyJointPointOffsets() or
+      syncSkeletonRoot() earlier this same event, matrixWorld is out of date.
+      state.skeleton.root.updateMatrixWorld(true) at the end of this function
+      ensures the NEXT call here has a fresh matrix.
+  */
   joint.parent.worldToLocal(
     mouseJointEditor.dragCurrentParentLocal.copy(
       mouseJointEditor.dragCurrentWorld,
     ),
   );
 
+  /*
+    Calculate how far the cursor has moved from the drag start, in parent-local
+    space. Adding that delta to the original bind position gives the desired new
+    local position for this joint.
+
+    Working with the delta (current - start) rather than the raw current position
+    lets us anchor the drag to where the user clicked on the marker, not where the
+    marker's origin is. Without this, the joint would jump to the cursor on the
+    first move event.
+  */
   const localDelta = mouseJointEditor.dragCurrentParentLocal
     .clone()
     .sub(mouseJointEditor.dragStartParentLocal);
   const desiredLocal = mouseJointEditor.dragStartLocal.clone().add(localDelta);
+
+  /*
+    Offsets are stored relative to the BASE bind position, not absolute local
+    positions. This means:
+      offset = desiredLocal - baseBindLocalPosition
+
+    Keeping offsets separate from the base position makes it easy to reset to
+    defaults (zero the offset) or export/import rig tuning snapshots.
+  */
   const base = joint.userData.baseBindLocalPosition;
   const offset = getJointPointOffset(mouseJointEditor.selectedJointKey);
 
@@ -5836,6 +3744,27 @@ function handleJointEditPointerMove(event) {
   applyJointPointOffsets();
   resetSkeletonToBindPose();
   syncSkeletonRoot();
+
+  /*
+    THE FIX: refresh world matrices immediately after changing joint positions.
+
+    applyJointPointOffsets(), resetSkeletonToBindPose(), and syncSkeletonRoot()
+    have all just modified local transforms in the skeleton hierarchy. Those
+    changes update each joint's LOCAL matrix immediately, but THREE.js does not
+    cascade those changes into world matrices until renderer.render() runs.
+
+    If another pointermove event arrives before the next render (common at high
+    mouse speeds), joint.parent.worldToLocal() above will use the OLD matrixWorld
+    and calculate the wrong parent-local position â€” making the joint drift or jump
+    instead of tracking the cursor smoothly.
+
+    updateMatrixWorld(true) walks the entire tree starting from the skeleton root
+    and rebuilds every node's matrixWorld from its current local transform and
+    its parent's matrixWorld. After this call, worldToLocal() on any joint in this
+    skeleton will return correct results for the rest of this event cycle.
+  */
+  state.skeleton.root.updateMatrixWorld(true);
+
   syncImportedSkinToPuppet();
   updateGuiDisplays();
 }
@@ -5939,10 +3868,8 @@ console.info(
   "This is a development build. Expect bugs and incomplete features! Report issues on GitHub.",
 );
 
-// buildRoom() is the old single-room helper. The active world is now created
-// near the top of the file with buildExplorationWorld().
-//buildRoom();
-buildLighting();
+buildLighting(scene);
+initSkin({ state, rigTuning, updateGuiDisplays });
 buildSkeletonWorkshop();
 buildGui();
 resizeRendererToContainer();

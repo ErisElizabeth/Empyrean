@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\S. Jones\\\\Desktop\\\\Empyrean\" -Recurse -Force)",
+      "Bash(Select-Object FullName, Length)",
+      "Bash(Format-Table -AutoSize)",
+      "Bash(node --input-type=module)",
+      "Bash(node --check \"C:\\\\Users\\\\S. Jones\\\\Desktop\\\\Empyrean\\\\main.js\")",
+      "Bash(Get-Content \"C:\\\\Users\\\\S. Jones\\\\.claude\\\\projects\\\\C--Users-S--Jones-Desktop-Empyrean\\\\8dfd6a56-66bb-4f66-91c3-df9540af955b.jsonl\")",
+      "Bash(Select-Object -Last 200)",
+      "Bash(Out-String)",
+      "PowerShell($content = Get-Content \"C:\\\\Users\\\\S. Jones\\\\.claude\\\\projects\\\\C--Users-S--Jones-Desktop-Empyrean\\\\8dfd6a56-66bb-4f66-91c3-df9540af955b.jsonl\" -Raw; $content.Substring\\([Math]::Max\\(0, $content.Length - 8000\\)\\) | Out-String)",
+      "PowerShell(\\(Get-Content \"C:\\\\Users\\\\S. Jones\\\\Desktop\\\\Empyrean\\\\world.js\"\\).Count; \\(Get-Content \"C:\\\\Users\\\\S. Jones\\\\Desktop\\\\Empyrean\\\\skin.js\"\\).Count; \\(Get-Content \"C:\\\\Users\\\\S. Jones\\\\Desktop\\\\Empyrean\\\\main.js\"\\).Count)",
+      "PowerShell(node --check \"C:\\\\Users\\\\S. Jones\\\\Desktop\\\\Empyrean\\\\main.js\" 2>&1)"
+    ]
+  }
+}
