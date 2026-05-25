@@ -12,10 +12,14 @@
 
   It is intentionally self-contained.
 
-    - It exports two functions:  initCombatEncounter() and updateCombatEncounter().
-    - main.js only has to call init once and update each frame.
-    - All visuals (trigger cylinder, enemy mesh, d20, banner) are created here and
-      destroyed here so the rest of the project is not polluted.
+    - It exports initCombatEncounter() and updateCombatEncounter() for the frame
+      loop, plus setCombatDifficulty() and attemptCombatSwordHit() for the sword
+      combat controls in main.js.
+    - main.js calls init once, update each frame, and the sword-hit doorway only
+      when Enter starts a swing.
+    - All combat visuals (trigger cylinder, enemy mesh, health bar, d20, banner)
+      are created here and hidden/reset here so the rest of the project is not
+      polluted.
 
   ENCOUNTER FLOW (the state machine in this file)
   -----------------------------------------------
@@ -30,8 +34,19 @@
          |          printed (this is the /enemyAI evaluate-then-act idea reduced to
          |          a tiered lookup; we did not need a chess search for one die).
          v
-       active     <-- d20 is gone, enemy + hitbox visible, waiting for rig contact
-         |  rig footprint enters enemy hitbox
+       active     <-- d20 is gone, enemy + hitbox + health bar visible;
+         |          Enter calls attemptCombatSwordHit(), which checks range/arc
+         |          and subtracts HP on a successful sword hit
+         |
+         |  non-lethal hit
+         v
+       hiding     <-- enemy briefly disappears, relocates, then returns to active
+         ^
+         |  delay finishes
+         |
+       active
+         |
+         |  HP reaches zero on a successful hit
          v
        ending     <-- audio crossfade battle -> BG, enemy fades out (1 -> 0 opacity)
          |  audio + enemy at zero
@@ -82,7 +97,7 @@ const COMBAT_CONFIG = {
     modelPath: "assets/enemy.glb",
     // How far in front of the rig the enemy appears at encounter start.
     // We use the rig's facing direction so the enemy is always "in front".
-    spawnForwardDistance: 4.0,
+    spawnForwardDistance: 22.0,
     // Target Y position for the enemy's feet. Matches the floor at Y=0.
     groundY: 0,
     // Auto-fit target height in scene units. enemy.glb may be authored in an
@@ -131,6 +146,20 @@ const COMBAT_CONFIG = {
         contactScale: 1.12,
       },
     },
+  },
+
+  health: {
+    // Change this to "MEDIUM" or "HARD" when you want a tougher prototype.
+    difficulty: "EASY",
+    hitPointsByDifficulty: {
+      EASY: 3,
+      MEDIUM: 4,
+      HARD: 5,
+    },
+    barWidth: 1.15,
+    barHeight: 0.12,
+    yOffset: 2.02,
+    hideSeconds: 1.15,
   },
 
   // Audio crossfade durations in seconds.
@@ -189,6 +218,10 @@ const combat = {
   enemyGroup: null, // wraps the GLB so we can move + opacity-fade easily
   enemyHitbox: null,
   enemyAnchor: new THREE.Vector3(),
+  enemyHealthBar: null,
+  enemyHealthFill: null,
+  enemyHp: 0,
+  enemyMaxHp: 0,
   d20Group: null,
   d20Mesh: null,
   d20Label: null,
@@ -198,6 +231,10 @@ const combat = {
 
   // DOM banner (created lazily; reused).
   banner: null,
+
+  // TEMP / DEV: G53 rigging mode can suppress combat visuals while measuring.
+  riggingVisibilitySuppressed: false,
+  riggingVisibilitySnapshot: null,
 
   // State machine.
   phase: "idle", // see file header for the legal phases
@@ -262,6 +299,12 @@ export function initCombatEncounter(opts) {
   combat.enemyHitbox.visible = false;
   combat.enemyGroup.add(combat.enemyHitbox);
 
+  // Health bar is also a child of enemyGroup so it follows the GLB and hitbox
+  // during evasion. It is placed above the fitted target height.
+  combat.enemyHealthBar = buildEnemyHealthBar();
+  combat.enemyHealthBar.visible = false;
+  combat.enemyGroup.add(combat.enemyHealthBar);
+
   // Build the floating d20 mesh.  It is parented to its own group so we can move
   // and scale it without disturbing the icosahedron's own rotation.
   combat.d20Group = buildD20Group();
@@ -293,6 +336,17 @@ export function updateCombatEncounter(delta) {
   */
   if (!combat.scene) return; // init not called yet
 
+  if (combat.riggingVisibilitySuppressed) {
+    /*
+      G53 rigging mode is a precision setup mode. Combat trigger/hitbox visuals
+      can sit right in the measuring area, so main.js asks this module to hide
+      them temporarily. While suppressed, combat state is paused visually and
+      does not advance until rigging mode exits.
+    */
+    applyCombatRiggingVisibilitySuppression();
+    return;
+  }
+
   // Where is the rig's footprint right now in world coords?
   // We add rootOffsetX/Z because main.js does the same when running encounters —
   // staying consistent means the trigger fires in the same spot the rig draws.
@@ -314,10 +368,193 @@ export function updateCombatEncounter(delta) {
     case "active":
       tickActive(delta, rigX, rigZ);
       break;
+    case "hiding":
+      tickHiding(delta, rigX, rigZ);
+      break;
     case "ending":
       tickEnding(delta);
       break;
   }
+}
+
+export function setCombatRiggingVisibilitySuppressed(suppressed = false) {
+  /*
+    TEMP / DEV hook for G53 machine-home rigging mode.
+
+    combat_updated.js owns the combat trigger cylinder, enemy hitbox, health bar,
+    and d20. main.js should not reach into this module's private state directly.
+    This small public switch lets G53 mode hide those visuals while preserving
+    the same station boundary we use elsewhere.
+  */
+  if (!combat.scene) {
+    return;
+  }
+
+  if (suppressed) {
+    if (!combat.riggingVisibilitySuppressed) {
+      combat.riggingVisibilitySnapshot = {
+        triggerCylinder: combat.triggerCylinder?.visible ?? false,
+        enemyGroup: combat.enemyGroup?.visible ?? false,
+        enemyHitbox: combat.enemyHitbox?.visible ?? false,
+        enemyHealthBar: combat.enemyHealthBar?.visible ?? false,
+        d20Group: combat.d20Group?.visible ?? false,
+      };
+    }
+
+    combat.riggingVisibilitySuppressed = true;
+    applyCombatRiggingVisibilitySuppression();
+    return;
+  }
+
+  if (!combat.riggingVisibilitySuppressed) {
+    return;
+  }
+
+  const snapshot = combat.riggingVisibilitySnapshot;
+  combat.riggingVisibilitySuppressed = false;
+  combat.riggingVisibilitySnapshot = null;
+
+  if (!snapshot) {
+    return;
+  }
+
+  if (combat.triggerCylinder) {
+    combat.triggerCylinder.visible = snapshot.triggerCylinder;
+  }
+  if (combat.enemyGroup) {
+    combat.enemyGroup.visible = snapshot.enemyGroup;
+  }
+  if (combat.enemyHitbox) {
+    combat.enemyHitbox.visible = snapshot.enemyHitbox;
+  }
+  if (combat.enemyHealthBar) {
+    combat.enemyHealthBar.visible = snapshot.enemyHealthBar;
+  }
+  if (combat.d20Group) {
+    combat.d20Group.visible = snapshot.d20Group;
+  }
+}
+
+function applyCombatRiggingVisibilitySuppression() {
+  /*
+    Hides every combat visual that can interfere with pivot/attachment
+    measurement. Collision/gameplay data is not destroyed; the objects are just
+    visually hidden until setCombatRiggingVisibilitySuppressed(false).
+  */
+  if (combat.triggerCylinder) {
+    combat.triggerCylinder.visible = false;
+  }
+  if (combat.enemyGroup) {
+    combat.enemyGroup.visible = false;
+  }
+  if (combat.enemyHitbox) {
+    combat.enemyHitbox.visible = false;
+  }
+  if (combat.enemyHealthBar) {
+    combat.enemyHealthBar.visible = false;
+  }
+  if (combat.d20Group) {
+    combat.d20Group.visible = false;
+  }
+}
+
+export function setCombatDifficulty(difficulty = "EASY") {
+  /*
+    Public difficulty setter used by main.js / lil-gui.
+
+    Legal values:
+      EASY   = 3 hits
+      MEDIUM = 4 hits
+      HARD   = 5 hits
+
+    The values are stored in COMBAT_CONFIG.health.hitPointsByDifficulty so the
+    actual hit-point math has exactly one source of truth. If difficulty changes
+    during an active fight, the current HP is clamped into the new max instead
+    of being fully reset. Fresh encounters always start at full HP.
+  */
+  const normalized = String(difficulty).toUpperCase();
+  const nextMax = COMBAT_CONFIG.health.hitPointsByDifficulty[normalized];
+
+  if (!nextMax) {
+    console.warn("[combat] unknown difficulty", difficulty);
+    return COMBAT_CONFIG.health.difficulty;
+  }
+
+  COMBAT_CONFIG.health.difficulty = normalized;
+
+  if (combat.enemyMaxHp > 0) {
+    combat.enemyMaxHp = nextMax;
+    combat.enemyHp = THREE.MathUtils.clamp(combat.enemyHp, 0, nextMax);
+    updateHealthBar();
+  }
+
+  return COMBAT_CONFIG.health.difficulty;
+}
+
+export function attemptCombatSwordHit({
+  x = 0,
+  z = 0,
+  yaw = 0,
+  range = 1.45,
+  arcRadians = Math.PI * 0.72,
+} = {}) {
+  /*
+    Called by main.js when the player presses Enter during a sword swing.
+
+    This function is intentionally the only gameplay doorway between the rig
+    animation and the combat encounter:
+      - main.js owns the sword model and arm pose.
+      - combat_updated.js owns enemy state, hit points, hiding, and victory.
+
+    Hit test:
+      1. Encounter must be in active phase.
+      2. Enemy center must be inside sword range.
+      3. Enemy must be inside the player's forward attack arc.
+
+    Forward vector from yaw:
+      forward = (sin(yaw), cos(yaw))
+
+    Direction to enemy:
+      toEnemy = normalize(enemy - player)
+
+    Arc test:
+      dot(forward, toEnemy) >= cos(arcRadians / 2)
+  */
+  if (combat.phase !== "active") {
+    if (combat.phase === "hiding") {
+      showBanner("Find the enemy!", "#f7f0df");
+    }
+    return { hit: false, reason: combat.phase };
+  }
+
+  const dx = combat.enemyGroup.position.x - x;
+  const dz = combat.enemyGroup.position.z - z;
+  const distance = Math.hypot(dx, dz);
+
+  if (distance > range) {
+    showBanner("Out of range", "#f7f0df");
+    return { hit: false, reason: "range", distance };
+  }
+
+  const forwardX = Math.sin(yaw);
+  const forwardZ = Math.cos(yaw);
+  const invDistance = distance > 0.0001 ? 1 / distance : 1;
+  const toEnemyX = dx * invDistance;
+  const toEnemyZ = dz * invDistance;
+  const dot = forwardX * toEnemyX + forwardZ * toEnemyZ;
+  const requiredDot = Math.cos(arcRadians * 0.5);
+
+  if (dot < requiredDot) {
+    showBanner("Turn toward enemy", "#f7f0df");
+    return { hit: false, reason: "arc", dot };
+  }
+
+  applyEnemySwordHit();
+  return {
+    hit: true,
+    remainingHp: combat.enemyHp,
+    maxHp: combat.enemyMaxHp,
+  };
 }
 
 // ===============================================================
@@ -375,6 +612,7 @@ function enterPhase_starting(rigX, rigZ) {
     combat.controlState.yaw + Math.PI + COMBAT_CONFIG.enemy.modelYawOffset;
   combat.enemyAnchor.copy(combat.enemyGroup.position);
   combat.enemyHitbox.position.set(0, COMBAT_CONFIG.enemy.hitboxHeight / 2, 0);
+  resetEnemyHealth();
 
   // Ensure the GLB has been loaded.  loadEnemyGlbIfNeeded returns a promise but
   // we don't block the state machine on it — the wrapper exists either way and
@@ -386,6 +624,7 @@ function enterPhase_starting(rigX, rigZ) {
   setEnemyOpacity(0);
   combat.enemyGroup.visible = true;
   combat.enemyHitbox.visible = true;
+  combat.enemyHealthBar.visible = true;
 
   // 3) Start the battle audio.  Browsers may have blocked autoplay until the
   //    user pressed a key/clicked — but they just walked into the trigger using
@@ -554,13 +793,17 @@ function computeEvasionTier(rollValue) {
 // PHASE: active
 // ===============================================================
 /*
-  The dice are gone.  The enemy and its hitbox are visible.  We wait for the
-  rig to walk into the enemy hitbox.  When they collide, encounter ends.
+  The dice are gone. The enemy, its hitbox, and its health bar are visible.
+  The rig can chase the enemy, and pressing Enter during a sword swing asks
+  attemptCombatSwordHit() to check range/arc and subtract HP.
 */
 function enterPhase_active() {
   combat.phase = "active";
   combat.phaseElapsed = 0;
   combat.d20Group.visible = false;
+  combat.enemyGroup.visible = true;
+  combat.enemyHitbox.visible = true;
+  combat.enemyHealthBar.visible = true;
   // Don't auto-clear the banner — let it linger a moment so the player reads it.
   setTimeout(() => clearBanner(), 1500);
 }
@@ -575,11 +818,113 @@ function tickActive(delta, rigX, rigZ) {
   const dz = rigZ - ez;
   const distanceSquared = dx * dx + dz * dz;
   const profile = getEvasionProfile();
-  const contactRadius = COMBAT_CONFIG.enemy.contactRadius * profile.contactScale;
+  const contactRadius =
+    COMBAT_CONFIG.enemy.contactRadius * profile.contactScale;
 
   if (distanceSquared <= contactRadius * contactRadius) {
-    enterPhase_ending();
+    showBanner("Press Enter to strike", "#f7f0df");
   }
+}
+
+function resetEnemyHealth() {
+  /*
+    Sets hit points at encounter start.
+
+    Difficulty map:
+      EASY   = 3 hits
+      MEDIUM = 4 hits
+      HARD   = 5 hits
+
+    This is intentionally config-driven instead of hard-coded in the hit logic,
+    so a later GUI control only needs to edit COMBAT_CONFIG.health.difficulty.
+  */
+  combat.enemyMaxHp =
+    COMBAT_CONFIG.health.hitPointsByDifficulty[
+      COMBAT_CONFIG.health.difficulty
+    ] || COMBAT_CONFIG.health.hitPointsByDifficulty.EASY;
+  combat.enemyHp = combat.enemyMaxHp;
+  updateHealthBar();
+}
+
+function applyEnemySwordHit() {
+  combat.enemyHp = Math.max(0, combat.enemyHp - 1);
+  updateHealthBar();
+
+  if (combat.enemyHp <= 0) {
+    showBanner("Enemy defeated!", "#43d7c4");
+    enterPhase_ending();
+    return;
+  }
+
+  showBanner(`Hit! ${combat.enemyHp}/${combat.enemyMaxHp}`, "#43d7c4");
+  enterPhase_hiding();
+}
+
+function enterPhase_hiding() {
+  /*
+    After each successful non-lethal hit, the enemy breaks line of contact.
+
+    The prototype version "runs and hides" by:
+      1. hiding the enemy and hitbox
+      2. choosing a new point on its leash circle away from the player
+      3. reappearing after a short delay
+
+    That makes the player reacquire the target before the next hit. It is
+    intentionally simple and game-readable before we add pathfinding.
+  */
+  combat.phase = "hiding";
+  combat.phaseElapsed = 0;
+  combat.enemyGroup.visible = false;
+  combat.enemyHitbox.visible = false;
+  combat.enemyHealthBar.visible = false;
+}
+
+function tickHiding(delta, rigX, rigZ) {
+  if (combat.phaseElapsed < COMBAT_CONFIG.health.hideSeconds) {
+    return;
+  }
+
+  relocateEnemyForNextHit(rigX, rigZ);
+  combat.enemyGroup.visible = true;
+  combat.enemyHitbox.visible = true;
+  combat.enemyHealthBar.visible = true;
+  setEnemyOpacity(1);
+  combat.phase = "active";
+  combat.phaseElapsed = 0;
+  showBanner("Enemy reappeared!", "#f7f0df");
+}
+
+function relocateEnemyForNextHit(rigX, rigZ) {
+  /*
+    Picks a new hiding spot on the leash circle.
+
+    We bias the new point away from the player's current position:
+      awayFromPlayer = normalize(anchor - player)
+
+    Then we add a small alternating side component so repeated hits do not place
+    the enemy on the exact same point every time.
+  */
+  const anchor = combat.enemyAnchor;
+  const away = new THREE.Vector2(anchor.x - rigX, anchor.z - rigZ);
+
+  if (away.lengthSq() <= 0.0001) {
+    away.set(1, 0);
+  } else {
+    away.normalize();
+  }
+
+  const sideSign = combat.enemyHp % 2 === 0 ? 1 : -1;
+  const side = new THREE.Vector2(-away.y, away.x).multiplyScalar(
+    0.42 * sideSign,
+  );
+  const direction = away.add(side).normalize();
+  const radius = COMBAT_CONFIG.evasion.leashRadius * 0.82;
+
+  combat.enemyGroup.position.set(
+    anchor.x + direction.x * radius,
+    COMBAT_CONFIG.enemy.groundY,
+    anchor.z + direction.y * radius,
+  );
 }
 
 function getEvasionProfile() {
@@ -739,7 +1084,7 @@ function lerpAngle(current, target, t) {
 function enterPhase_ending() {
   combat.phase = "ending";
   combat.phaseElapsed = 0;
-  console.info("[combat] rig contacted enemy. ending encounter.");
+  console.info("[combat] ending encounter.");
 }
 
 function tickEnding(delta) {
@@ -764,6 +1109,7 @@ function tickEnding(delta) {
 
     combat.enemyGroup.visible = false;
     combat.enemyHitbox.visible = false;
+    combat.enemyHealthBar.visible = false;
     combat.d20Group.visible = false;
 
     // Restore trigger cylinder so the encounter can fire again (requirement #14).
@@ -837,6 +1183,87 @@ function buildEnemyHitbox() {
   cyl.position.set(0, COMBAT_CONFIG.enemy.hitboxHeight / 2, 0);
   cyl.renderOrder = 4;
   return cyl;
+}
+
+function buildEnemyHealthBar() {
+  /*
+    Creates a small in-world health bar above the enemy.
+
+    Parent:
+      combat.enemyGroup
+
+    Local placement:
+      y = targetHeight + yOffset adjustment
+
+    The bar uses two planes:
+      - background: fixed black translucent backing
+      - fill: green/yellow/red rectangle scaled on X by health percentage
+
+    Scaling note:
+      PlaneGeometry scales from its center, so updateHealthBar() also shifts the
+      fill's X position left as it shrinks. That makes the left edge stay fixed,
+      which is how most game health bars read.
+  */
+  const group = new THREE.Group();
+  group.name = "combat-enemy-healthbar";
+  group.position.set(0, COMBAT_CONFIG.health.yOffset, 0.08);
+
+  const background = new THREE.Mesh(
+    new THREE.PlaneGeometry(
+      COMBAT_CONFIG.health.barWidth,
+      COMBAT_CONFIG.health.barHeight,
+    ),
+    new THREE.MeshBasicMaterial({
+      color: 0x050505,
+      transparent: true,
+      opacity: 0.72,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    }),
+  );
+  background.name = "combat-enemy-healthbar-background";
+
+  const fill = new THREE.Mesh(
+    new THREE.PlaneGeometry(
+      COMBAT_CONFIG.health.barWidth,
+      COMBAT_CONFIG.health.barHeight * 0.62,
+    ),
+    new THREE.MeshBasicMaterial({
+      color: 0x43d7c4,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    }),
+  );
+  fill.name = "combat-enemy-healthbar-fill";
+  fill.position.z = 0.01;
+
+  group.add(background);
+  group.add(fill);
+  combat.enemyHealthFill = fill;
+  updateHealthBar();
+  return group;
+}
+
+function updateHealthBar() {
+  if (!combat.enemyHealthFill || !combat.enemyMaxHp) {
+    return;
+  }
+
+  const percent = THREE.MathUtils.clamp(combat.enemyHp / combat.enemyMaxHp, 0, 1);
+  const fullWidth = COMBAT_CONFIG.health.barWidth;
+
+  combat.enemyHealthFill.scale.x = Math.max(percent, 0.001);
+  combat.enemyHealthFill.position.x = -fullWidth * 0.5 * (1 - percent);
+
+  if (percent > 0.55) {
+    combat.enemyHealthFill.material.color.set("#43d7c4");
+  } else if (percent > 0.25) {
+    combat.enemyHealthFill.material.color.set("#f7f0df");
+  } else {
+    combat.enemyHealthFill.material.color.set("#ff6b6b");
+  }
 }
 
 function buildD20Group() {

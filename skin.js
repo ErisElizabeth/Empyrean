@@ -23,7 +23,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { disposeObjectTree } from "./world.js";
 
-export const DEFAULT_IMPORTED_MESH_PATH = "assets/femaleMesh.glb";
+export const DEFAULT_IMPORTED_MESH_PATH = "assets/Sigewynn.glb";
 
 const gltfLoader = new GLTFLoader();
 
@@ -696,7 +696,6 @@ function chooseSkinInfluences(vertex, bindPositions) {
     Math.abs(bindPositions.rightHip.x),
   );
 
-  const sideName     = vertex.x < 0 ? "left" : "right";
   const absX         = Math.abs(vertex.x);
   const outsideTorso = absX > Math.max(hipX + 0.12, shoulderX * 0.58);
   const inArmHeight  = vertex.y > wristY - 0.3 && vertex.y < shoulderY + 0.5;
@@ -707,6 +706,8 @@ function chooseSkinInfluences(vertex, bindPositions) {
   }
 
   if (outsideTorso && inArmHeight) {
+    const sideName = chooseNearestBindSide(vertex, bindPositions, "Shoulder");
+
     return weightedNearestJoints(
       vertex,
       [`${sideName}Shoulder`, `${sideName}Elbow`, `${sideName}Wrist`, `${sideName}Palm`],
@@ -715,6 +716,8 @@ function chooseSkinInfluences(vertex, bindPositions) {
   }
 
   if (inLegHeight && absX > hipX * 0.35) {
+    const sideName = chooseNearestBindSide(vertex, bindPositions, "Hip");
+
     return weightedNearestJoints(
       vertex,
       [`${sideName}Hip`, `${sideName}Knee`, `${sideName}Ankle`, `${sideName}Foot`],
@@ -727,6 +730,50 @@ function chooseSkinInfluences(vertex, bindPositions) {
     ["pelvis", "spineBase", "chest", "neck"],
     bindPositions,
   );
+}
+
+function chooseNearestBindSide(vertex, bindPositions, referenceJointSuffix) {
+  /*
+    Chooses "left" or "right" from the CURRENT bind-pose joint locations.
+
+    OLD ASSUMPTION:
+      sideName = vertex.x < 0 ? "left" : "right"
+
+    That was simple, but it assumed the left-named skeleton joints were always
+    on negative X and the right-named skeleton joints were always on positive X.
+    A whole-body 180 degree Y bind rotation breaks that assumption:
+
+      rotateY(PI) turns X into -X
+
+    so the left shoulder can physically land on the positive-X side of the
+    model while still being named "leftShoulder".
+
+    NEW FORMULA:
+      leftDistance  = abs(vertex.x - leftReference.x)
+      rightDistance = abs(vertex.x - rightReference.x)
+      sideName      = leftDistance <= rightDistance ? "left" : "right"
+
+    where:
+      vertex.x         = the prepared mesh vertex's X coordinate
+      leftReference.x  = the bind-pose X coordinate of leftShoulder/leftHip
+      rightReference.x = the bind-pose X coordinate of rightShoulder/rightHip
+
+    Result:
+      Skin weights follow the visible bind-pose skeleton side, even if the user
+      rotates the body 180 degrees while aligning a backwards-facing GLB.
+  */
+  const leftReference = bindPositions[`left${referenceJointSuffix}`];
+  const rightReference = bindPositions[`right${referenceJointSuffix}`];
+
+  if (!leftReference || !rightReference) {
+    // Defensive fallback for incomplete experimental rigs.
+    return vertex.x < 0 ? "left" : "right";
+  }
+
+  const leftDistance = Math.abs(vertex.x - leftReference.x);
+  const rightDistance = Math.abs(vertex.x - rightReference.x);
+
+  return leftDistance <= rightDistance ? "left" : "right";
 }
 
 function weightedNearestJoints(vertex, jointKeys, bindPositions) {

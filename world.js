@@ -289,6 +289,15 @@ function createOutsideEnclosure() {
 
   floor.name   = "outside-green-floor";
   ceiling.name = "outside-blue-ceiling";
+  northWall.name = "outside-north-wall";
+  southWall.name = "outside-south-wall";
+  eastWall.name  = "outside-east-wall";
+  westWall.name  = "outside-west-wall";
+  floor.userData.g53VisibilityRole = "floor";
+  ceiling.userData.g53VisibilityRole = "ceiling";
+  [northWall, southWall, eastWall, westWall].forEach((wall) => {
+    wall.userData.g53VisibilityRole = "wall";
+  });
   floor.position.set(centerX, -wallThickness / 2, centerZ);
   ceiling.position.set(centerX, wallHeight + wallThickness / 2, centerZ);
   northWall.position.set(centerX, wallY, centerZ - half);
@@ -324,6 +333,10 @@ function createRoom({ name, center, doors = {} }) {
 
   roomGroup.name = name;
   roomGroup.position.copy(center);
+  floor.name = `${name}-floor`;
+  ceiling.name = `${name}-ceiling`;
+  floor.userData.g53VisibilityRole = "floor";
+  ceiling.userData.g53VisibilityRole = "ceiling";
   floor.position.set(0, localFloorY, 0);
   ceiling.position.set(0, roomSize / 2, 0);
   roomGroup.add(floor, ceiling);
@@ -386,6 +399,8 @@ function addWallSegment(
   }
 
   mesh.position.copy(local);
+  mesh.name = `${roomGroup.name}-${side}-wall-segment`;
+  mesh.userData.g53VisibilityRole = "wall";
   mesh.material.transparent = true;
   mesh.material.opacity = roomTransparency;
   roomGroup.add(mesh);
@@ -436,6 +451,11 @@ function createLowPolyTree(index) {
   const leaves = new THREE.Mesh(new THREE.ConeGeometry(1.15, 3.2, 7),            treeLeafMaterial);
 
   group.name = `low-poly-tree-${index + 1}`;
+  group.userData.g53VisibilityRole = "tree";
+  trunk.name = `${group.name}-trunk`;
+  leaves.name = `${group.name}-leaves`;
+  trunk.userData.g53VisibilityRole = "tree";
+  leaves.userData.g53VisibilityRole = "tree";
   trunk.position.y  = 0.675;
   leaves.position.y = 2.45;
   leaves.rotation.y = index * 0.37;

@@ -1,9 +1,16 @@
 ﻿import * as THREE from "three";
 import GUI from "lil-gui";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { ENCOUNTER_DEFINITIONS } from "./encounters.js";
 // Combat encounter prototype: wires /empyrean_dice (d20 roll) and the
 // /enemyAI tiered-decision idea into the existing /Empyrean world.
-import { initCombatEncounter, updateCombatEncounter } from "./combat_updated.js";
+import {
+  attemptCombatSwordHit,
+  initCombatEncounter,
+  setCombatDifficulty,
+  setCombatRiggingVisibilitySuppressed,
+  updateCombatEncounter,
+} from "./combat_updated.js";
 import {
   clamp01 as physicsClamp01,
   cycle01 as physicsCycle01,
@@ -57,7 +64,7 @@ import {
   syncImportedSkinToPuppet,
 } from "./skin.js";
 
-const APP_VERSION = "0.1.21-alpha";
+const APP_VERSION = "0.1.36-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -126,6 +133,116 @@ const SOLO_TWEAKS = {
     backgroundPath: "assets/background.mp3",
     loop: true,
     autoplay: true,
+  },
+};
+
+const SWORD_TWEAKS = {
+  /*
+    Right-hand sword prototype.
+
+    The sword is a GLB authored outside this project, so its source units and
+    axis orientation may not match Empyrean. The loader below measures the
+    imported model's bounding box, scales its longest side to targetLength, and
+    then attaches it to the rightPalm joint.
+
+    Tuning workflow:
+      1. Adjust targetLength if the sword feels too large/small.
+      2. Adjust localPosition to move the handle relative to the palm.
+      3. Adjust localRotation if the blade points the wrong way.
+
+    localRotation values are radians:
+      Math.PI * 0.5 = 90 degrees
+      Math.PI       = 180 degrees
+  */
+  assetPath: "assets/plainSword.glb",
+  targetLength: 1.02,
+  /*
+    gripFromLowerEnd is used by normalizeSwordModel().
+
+    Formula:
+      gripCoordinate = box.min[longAxis] + box.size[longAxis] * gripFromLowerEnd
+
+    where:
+      box.min[longAxis]       = low end of the sword along its longest axis
+      box.size[longAxis]      = full length of the sword along that axis
+      gripFromLowerEnd = 0.14 = put the hand origin 14% up from that low end
+
+    Why:
+      A sword held from its geometric center looks floaty. A sword held near the
+      hilt behaves more like a real prop. If a future sword imports upside down,
+      this one number is the first place to tune before changing arm animation.
+  */
+  gripFromLowerEnd: 0.14,
+  localPosition: [0.025, -0.015, 0.025],
+  localRotation: [-Math.PI * 0.5, 0, Math.PI * 0.04],
+  swingDurationMs: 520,
+  hitRange: 1.55,
+  hitArcRadians: Math.PI * 0.78,
+};
+
+const DEV_PROBE_TWEAKS = {
+  /*
+    TEMP / DEV MODE coordinate probe.
+
+    Purpose:
+      Put one small movable marker near the rig, then read/copy exact numbers
+      for attachment offsets, sword grips, hit arcs, and animation poses.
+
+    Parenting choice:
+      The probe is parented to state.skeleton.root. That means:
+
+        devProbe.position = rig-local / player-relative coordinates
+
+      It still has a world position, but the local numbers are the useful
+      "attach this object relative to the player" measurements.
+
+    Axis reminder:
+      X = left/right
+      Y = height
+      Z = forward/back in the rig's local space
+  */
+  color: "#ffec99",
+  radius: 0.055,
+  min: -6,
+  max: 6,
+  step: 0.005,
+  keyboardStep: 0.025,
+};
+
+const G53_RIGGING_HOME = {
+  /*
+    TEMP / DEV PRECISION RIGGING MODE home point.
+
+    "G53-style" here borrows the machining idea of a known machine coordinate
+    home. When the mode is active, the rig is put at a predictable position and
+    yaw so pivot edits can be made without idle/walk motion drifting the target.
+
+    Pass 1 scope:
+      - enter/exit with F2
+      - save/restore gameplay state
+      - home the rig/player
+      - freeze idle/walk drift
+      - turn on mouse joint editing
+
+    Later passes can add wall fading, strict axis locks, and richer tool UI.
+  */
+  position: new THREE.Vector3(0, 0, 0),
+  yaw: 0,
+  visibility: {
+    /*
+      Phase 2 visibility fixture.
+
+      Walls/ceilings become invisible enough that the mesh and pivots are easy
+      to inspect. Floors stay barely visible as a reference plane. Trees, ghost
+      spheres, and Jupiter are hidden because they are useful for gameplay mood
+      but not for precision rig setup.
+    */
+    floorOpacity: 0.06,
+    wallOpacity: 0,
+    ceilingOpacity: 0,
+    treeOpacity: 0,
+    hideGhostSpheres: true,
+    hideJupiter: true,
   },
 };
 
@@ -219,6 +336,16 @@ if (SOLO_TWEAKS.audio.autoplay) {
 const rigCollisionMargin = SOLO_TWEAKS.player.collisionMargin;
 
 const sceneContainer = document.getElementById("scene-container");
+/*
+  Make the scene container programmatically focusable.
+
+  A local mesh import opens the browser's native file picker through a temporary
+  <input type="file">. After that picker closes, browser focus can remain in UI
+  plumbing instead of returning neatly to the 3D scene. A tabindex of -1 keeps
+  the scene out of normal tab order, but lets code call sceneContainer.focus()
+  after file selection so keyboard shortcuts are routed back to the workshop.
+*/
+sceneContainer.tabIndex = -1;
 const STORAGE_KEY = "empyrean.puppetWorkshop.rigTuning.v1";
 const WALL_COLOR = "#131111";
 
@@ -314,6 +441,28 @@ const JOINT_ORDER = [
 
 const AXIS_MARKER_JOINTS = ["root", ...JOINT_ORDER];
 const BIND_ROTATION_JOINTS = [...JOINT_ORDER];
+const ARM_RUNTIME_BIND_ROTATION_JOINTS = [
+  /*
+    Mesh rigging sometimes needs a modeling pose, such as a T-pose, so the
+    generated skin weights line up with the imported GLB. Gameplay needs a
+    different neutral pose: arms relaxed at the sides so "down", walk swing,
+    combat guard, and sword swing all start from a useful baseline.
+
+    These are the bind-rotation sliders we are allowed to zero after the skin
+    has been bound. The generated SkinnedMesh keeps the T-pose bind matrices it
+    was created with, while the live puppet can return to gameplay arms.
+  */
+  "leftClavicle",
+  "leftShoulder",
+  "leftElbow",
+  "leftWrist",
+  "leftPalm",
+  "rightClavicle",
+  "rightShoulder",
+  "rightElbow",
+  "rightWrist",
+  "rightPalm",
+];
 const MOUSE_EDIT_JOINTS = [...JOINT_ORDER];
 const RIG_TUNING_KEYS = [
   /*
@@ -323,6 +472,7 @@ const RIG_TUNING_KEYS = [
   */
   "labEnabled",
   "skeletonVisible",
+  "skeletonOpacity",
   "showJointLabels",
   "showAxisMarker",
   "showRigCollider",
@@ -333,6 +483,21 @@ const RIG_TUNING_KEYS = [
   "showEncounterZones",
   "showEncounterLabels",
   "encounterSystemEnabled",
+  "combatDifficulty",
+  "swordAssetPath",
+  "swordTargetLength",
+  "swordGripFromLowerEnd",
+  "swordOffsetX",
+  "swordOffsetY",
+  "swordOffsetZ",
+  "swordPitch",
+  "swordYaw",
+  "swordRoll",
+  "devProbeVisible",
+  "devProbeX",
+  "devProbeY",
+  "devProbeZ",
+  "devProbeStep",
   "rigMeshMode",
   "rigMeshStartPose",
   "importedMeshPath",
@@ -375,6 +540,10 @@ const RIG_TUNING_KEYS = [
   "axisMarkerScale",
   "mouseJointEditMode",
   "mouseJointEditJoint",
+  "g53AllowX",
+  "g53AllowY",
+  "g53AllowZ",
+  "g53PreserveChildPoints",
   "jointPointOffsets",
   "bindRotationOffsets",
   ...Object.keys(DEFAULT_RIG_DIMENSIONS),
@@ -494,6 +663,53 @@ const state = {
   encounterRuntime: null,
   axisHelper: null,
   rigCollider: null,
+  g53RiggingMode: {
+    /*
+      TEMP / DEV PRECISION RIGGING MODE runtime state.
+
+      This is intentionally NOT part of rigTuning/localStorage. The mode is a
+      temporary workholding fixture: enter it, do precise edits, then leave it.
+      The pivot edits themselves still save through the existing rigTuning
+      system; only the temporary "machine state" lives here.
+    */
+    active: false,
+    status: "OFF",
+    saved: null,
+    visibilityFixture: [],
+    readoutControllers: [],
+  },
+  devProbe: {
+    /*
+      TEMP / DEV MODE marker state.
+
+      group:
+        A tiny sphere named devProbe. It is parented to the skeleton root so its
+        local position is automatically rig-relative.
+
+      readout:
+        Plain strings shown in the GUI. The numbers are refreshed by
+        updateDevProbeReadout().
+
+      drag fields:
+        Mouse dragging uses the same camera-facing plane idea as joint editing,
+        but writes to devProbeX/Y/Z instead of changing skeleton pivots.
+    */
+    group: null,
+    mesh: null,
+    raycaster: new THREE.Raycaster(),
+    dragPlane: new THREE.Plane(),
+    dragStartWorld: new THREE.Vector3(),
+    dragCurrentWorld: new THREE.Vector3(),
+    dragStartLocal: new THREE.Vector3(),
+    dragStartRootLocal: new THREE.Vector3(),
+    dragCurrentRootLocal: new THREE.Vector3(),
+    dragging: false,
+    readout: {
+      world: "{ x: 0, y: 0, z: 0 }",
+      rigLocal: "{ x: 0, y: 0, z: 0 }",
+    },
+    readoutControllers: [],
+  },
   importedPreview: null,
   importedSkin: null,
   importedMeshStatus: "no mesh loaded",
@@ -512,7 +728,50 @@ const state = {
   guiControllers: [],
   guiFolders: {},
   walkPhase: 0,
+  /*
+    Walk arm counter-swing is runtime animation bookkeeping, not saved tuning.
+
+    BUG HISTORY:
+      This used to be created lazily only after walking or loading saved tuning.
+      Pressing F2 before any movement entered G53 mode, then freezeG53RiggingPose()
+      tried to write state.walkArmSwing.left/right and crashed the animation loop.
+      Initializing it here makes the cold-start path valid.
+  */
+  walkArmSwing: { left: 0, right: 0 },
   lastVisibilityKey: "",
+  sword: {
+    /*
+      Runtime sword object.
+
+      group:
+        The normalized GLB wrapper that eventually becomes a child of
+        rightPalm. It is kept out of the disposable skeleton tree when the rig
+        rebuilds, so slider changes do not accidentally destroy the loaded GLB.
+
+      loading:
+        Prevents repeated GLTFLoader requests if the user taps 1 several times
+        while the sword asset is still coming in.
+
+      loaded:
+        Tells the equip flow whether it can attach immediately or needs to wait
+        for the loader callback.
+    */
+    group: null,
+    model: null,
+    loading: false,
+    loaded: false,
+    loadedAssetPath: "",
+  },
+  /*
+    Temporary arm-rest snapshot for rigging start poses.
+
+    When a T/A-pose is applied for mesh fitting, the arm bind-rotation sliders
+    are changed so the skeleton matches the model's authored pose. Gameplay
+    still needs the pre-rig relaxed arm rest afterward. This snapshot stores
+    that relaxed arm rest until the mesh is bound and the puppet can return to
+    it.
+  */
+  runtimeArmBindRotationBackup: null,
 };
 
 const controlState = {
@@ -535,6 +794,11 @@ const controlState = {
   waveUntil: 0,
   leftArm: "down",
   rightArm: "down",
+  // Sword state is input/animation state only. The GLB object itself lives in
+  // state.sword because it is a runtime asset, not a saved rig dimension.
+  weaponEquipped: false,
+  swordSwingStart: 0,
+  swordSwingUntil: 0,
   jump: {
     /*
       Jump is modeled as a tiny state machine:
@@ -569,6 +833,7 @@ const mouseJointEditor = {
   dragStartLocal: new THREE.Vector3(),
   dragStartParentLocal: new THREE.Vector3(),
   dragCurrentParentLocal: new THREE.Vector3(),
+  preservedDescendantRootLocals: [],
   selectedJointKey: null,
   dragging: false,
 };
@@ -606,6 +871,7 @@ initCombatEncounter({
   rigTuning,
   backgroundAudio: myAudio,
 });
+setCombatDifficulty(rigTuning.combatDifficulty);
 
 function makeDefaultRigTuning() {
   /*
@@ -618,6 +884,7 @@ function makeDefaultRigTuning() {
   return {
     labEnabled: true,
     skeletonVisible: true,
+    skeletonOpacity: 0.7,
     showJointLabels: true,
     showAxisMarker: true,
     showRigCollider: true,
@@ -628,6 +895,21 @@ function makeDefaultRigTuning() {
     showEncounterZones: true,
     showEncounterLabels: true,
     encounterSystemEnabled: true,
+    combatDifficulty: "EASY",
+    swordAssetPath: SWORD_TWEAKS.assetPath,
+    swordTargetLength: SWORD_TWEAKS.targetLength,
+    swordGripFromLowerEnd: SWORD_TWEAKS.gripFromLowerEnd,
+    swordOffsetX: SWORD_TWEAKS.localPosition[0],
+    swordOffsetY: SWORD_TWEAKS.localPosition[1],
+    swordOffsetZ: SWORD_TWEAKS.localPosition[2],
+    swordPitch: SWORD_TWEAKS.localRotation[0],
+    swordYaw: SWORD_TWEAKS.localRotation[1],
+    swordRoll: SWORD_TWEAKS.localRotation[2],
+    devProbeVisible: false,
+    devProbeX: 0.25,
+    devProbeY: 1.1,
+    devProbeZ: -0.4,
+    devProbeStep: DEV_PROBE_TWEAKS.keyboardStep,
     rigMeshMode: false,
     rigMeshStartPose: "current",
     importedMeshPath: DEFAULT_IMPORTED_MESH_PATH,
@@ -670,6 +952,10 @@ function makeDefaultRigTuning() {
     axisMarkerScale: 0.32,
     mouseJointEditMode: false,
     mouseJointEditJoint: "head",
+    g53AllowX: true,
+    g53AllowY: true,
+    g53AllowZ: true,
+    g53PreserveChildPoints: true,
     jointPointOffsets: makeDefaultJointPointOffsets(),
     bindRotationOffsets: makeDefaultBindRotationOffsets(),
     ...DEFAULT_RIG_DIMENSIONS,
@@ -743,6 +1029,57 @@ function sanitizeRigTuning(candidate) {
   )
     ? clean.rigMeshStartPose
     : defaults.rigMeshStartPose;
+  if (clean.importedMeshPath === "Sigewynn.glb") {
+    /*
+      The local file picker stores only the chosen filename while the page is
+      live because the actual file data is held in state.meshBlobUrl. After a
+      refresh that blob is gone. Since Sigewynn.glb now lives in /assets, a bare
+      saved filename can be safely upgraded to the reusable project path.
+    */
+    clean.importedMeshPath = DEFAULT_IMPORTED_MESH_PATH;
+  }
+  clean.combatDifficulty = ["EASY", "MEDIUM", "HARD"].includes(
+    clean.combatDifficulty,
+  )
+    ? clean.combatDifficulty
+    : defaults.combatDifficulty;
+  clean.swordAssetPath =
+    typeof clean.swordAssetPath === "string" && clean.swordAssetPath.trim()
+      ? clean.swordAssetPath.trim()
+      : defaults.swordAssetPath;
+  clean.swordTargetLength = Number.isFinite(clean.swordTargetLength)
+    ? THREE.MathUtils.clamp(clean.swordTargetLength, 0.05, 4)
+    : defaults.swordTargetLength;
+  clean.swordGripFromLowerEnd = Number.isFinite(clean.swordGripFromLowerEnd)
+    ? THREE.MathUtils.clamp(clean.swordGripFromLowerEnd, 0, 1)
+    : defaults.swordGripFromLowerEnd;
+  [
+    "swordOffsetX",
+    "swordOffsetY",
+    "swordOffsetZ",
+    "swordPitch",
+    "swordYaw",
+    "swordRoll",
+  ].forEach((key) => {
+    clean[key] = Number.isFinite(clean[key]) ? clean[key] : defaults[key];
+  });
+
+  if (
+    Math.abs(clean.swordPitch - Math.PI * 0.5) < 0.000001 &&
+    Math.abs(clean.swordYaw) < 0.000001 &&
+    Math.abs(clean.swordRoll - Math.PI * 0.04) < 0.000001
+  ) {
+    /*
+      0.1.35's first Sword Offsets defaults aimed plainSword.glb sideways into
+      the right edge of the screen. If an older save contains exactly that
+      default rotation, migrate it to the corrected default so the sword is
+      visible immediately after refresh. Hand-tuned non-default rotations are
+      left alone.
+    */
+    clean.swordPitch = defaults.swordPitch;
+    clean.swordYaw = defaults.swordYaw;
+    clean.swordRoll = defaults.swordRoll;
+  }
   clean.mouseJointEditJoint = MOUSE_EDIT_JOINTS.includes(
     clean.mouseJointEditJoint,
   )
@@ -864,6 +1201,7 @@ function saveRigTuningToBrowser() {
 function loadRigTuningFromBrowser() {
   // Reloads saved tuning, rebuilds the skeleton from it, then redraws the GUI.
   assignRigTuningValues(loadSavedRigTuning(makeDefaultRigTuning()));
+  state.runtimeArmBindRotationBackup = null;
   state.walkPhase = 0;
   state.walkArmSwing = { left: 0, right: 0 };
   rebuildSkeletonWorkshop();
@@ -879,6 +1217,7 @@ function resetRigTuningToDefaults() {
   disposeImportedPreview();
   disposeImportedSkin();
   assignRigTuningValues(makeDefaultRigTuning());
+  state.runtimeArmBindRotationBackup = null;
   state.walkPhase = 0;
   rebuildSkeletonWorkshop();
   updateGuiDisplays();
@@ -918,6 +1257,8 @@ function buildSkeletonWorkshop() {
     should be rebuilt.
   */
   if (state.skeleton?.root) {
+    detachSwordFromSkeleton();
+    detachDevProbeFromSkeleton();
     scene.remove(state.skeleton.root);
     disposeObjectTree(state.skeleton.root);
     state.axisHelper = null;
@@ -949,11 +1290,14 @@ function buildSkeletonWorkshop() {
   state.debugView = createDebugView(state.skeleton, {
     markerRadius: 0.035,
     labelScale: rigTuning.labelScale,
+    opacity: rigTuning.skeletonOpacity,
     color: GUIDE_COLOR,
   });
   updateAxisMarkerAttachment();
   applyVisibility();
   selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
+  syncSwordAttachment();
+  syncDevProbeAttachment();
 }
 
 function rebuildSkeletonWorkshop() {
@@ -1349,6 +1693,33 @@ function createDebugView(skeleton, options = {}) {
   const labels = [];
   const boneLines = [];
   const selectableMarkers = [];
+  let skeletonOpacity = THREE.MathUtils.clamp(options.opacity ?? 1, 0, 1);
+  const applyObjectOpacity = (object, baseOpacity = object.userData.debugBaseOpacity ?? 1) => {
+    /*
+      Skeleton opacity is a multiplier, not a replacement.
+
+      Example:
+        marker base opacity = 0.70
+        skeletonOpacity     = 0.25
+        final marker opacity = 0.70 * 0.25 = 0.175
+
+      This preserves special cases such as the body-root line, which has a very
+      low base opacity, while still letting the whole guide layer fade together.
+    */
+    object.userData.debugBaseOpacity = baseOpacity;
+
+    const materials = Array.isArray(object.material)
+      ? object.material
+      : object.material
+        ? [object.material]
+        : [];
+
+    materials.forEach((material) => {
+      material.transparent = true;
+      material.opacity = baseOpacity * skeletonOpacity;
+      material.needsUpdate = true;
+    });
+  };
   const markerMaterial = new THREE.MeshBasicMaterial({
     color,
     wireframe: true,
@@ -1374,6 +1745,7 @@ function createDebugView(skeleton, options = {}) {
     marker.renderOrder = 20;
     marker.userData.jointKey = jointKey;
     marker.userData.isJointEditHandle = MOUSE_EDIT_JOINTS.includes(jointKey);
+    applyObjectOpacity(marker, 0.7);
 
     if (joint.name === "head") {
       marker.scale.set(10.5, 15.0, 12.0);
@@ -1387,6 +1759,7 @@ function createDebugView(skeleton, options = {}) {
     label.name = `${joint.name}-debug-label`;
     label.position.set(0, markerRadius * 2.6, 0);
     label.renderOrder = 21;
+    applyObjectOpacity(label, 1);
     joint.add(label);
     labels.push(label);
     objects.push(label);
@@ -1405,12 +1778,13 @@ function createDebugView(skeleton, options = {}) {
       const line = new THREE.Line(geometry, lineMaterial);
       line.name = `${joint.name}-to-${child.name}-debug-bone`;
       line.renderOrder = 19;
+      applyObjectOpacity(line, 0.65);
 
       if (joint.name === "body-root" && child.name === "pelvis") {
         // The body-root-to-pelvis line is visually useful but can become a
         // bright vertical distraction, so it is made almost transparent.
         line.material = line.material.clone();
-        line.material.opacity = 0.05;
+        applyObjectOpacity(line, 0.05);
       }
 
       joint.add(line);
@@ -1436,6 +1810,10 @@ function createDebugView(skeleton, options = {}) {
         label.scale.set(0.34 * scale, 0.085 * scale, 1);
       });
     },
+    setOpacity(opacity) {
+      skeletonOpacity = THREE.MathUtils.clamp(opacity, 0, 1);
+      objects.forEach((object) => applyObjectOpacity(object));
+    },
     setSelectedJoint(jointKey) {
       /*
         Gives the currently selected mouse-edit joint a warm highlight.
@@ -1446,13 +1824,13 @@ function createDebugView(skeleton, options = {}) {
       selectableMarkers.forEach((marker) => {
         if (!marker.userData.isJointEditHandle) {
           marker.material.color.set(color);
-          marker.material.opacity = 0.3;
+          applyObjectOpacity(marker, 0.3);
           return;
         }
 
         const selected = marker.userData.jointKey === jointKey;
         marker.material.color.set(selected ? "#ffec99" : color);
-        marker.material.opacity = selected ? 1 : 0.7;
+        applyObjectOpacity(marker, selected ? 1 : 0.7);
       });
     },
     refreshBones() {
@@ -1588,6 +1966,62 @@ function applyJointPointOffsets() {
   updateAxisMarkerAttachment();
 }
 
+function setJointPointOffsetFromLocalPosition(jointName, desiredLocal) {
+  /*
+    Writes one joint's desired parent-local position back into the existing
+    Joint Point Offset data structure.
+
+    This is the single-joint version of applyJointPointOffsets().
+
+    FORMULA:
+      offset = desiredLocal - baseBindLocalPosition
+
+    where:
+      desiredLocal          = the joint position we want in its PARENT space
+      baseBindLocalPosition = the original local position created by
+                              createSkeleton()
+      offset                = the saved slider/drag value in rigTuning
+
+    Why this helper exists:
+      Mouse dragging usually changes one selected joint. G53 "hold child points"
+      also changes descendant offsets to compensate for parent movement. Having
+      one helper keeps both writes identical, clamped to the same range, and easy
+      to reason about.
+  */
+  const joint = state.skeleton?.joints[jointName];
+
+  if (!joint?.userData?.baseBindLocalPosition) {
+    return false;
+  }
+
+  const base = joint.userData.baseBindLocalPosition;
+  const offset = getJointPointOffset(jointName);
+
+  offset.x = THREE.MathUtils.clamp(
+    desiredLocal.x - base.x,
+    JOINT_POINT_OFFSET_RANGE.min,
+    JOINT_POINT_OFFSET_RANGE.max,
+  );
+  offset.y = THREE.MathUtils.clamp(
+    desiredLocal.y - base.y,
+    JOINT_POINT_OFFSET_RANGE.min,
+    JOINT_POINT_OFFSET_RANGE.max,
+  );
+  offset.z = THREE.MathUtils.clamp(
+    desiredLocal.z - base.z,
+    JOINT_POINT_OFFSET_RANGE.min,
+    JOINT_POINT_OFFSET_RANGE.max,
+  );
+
+  joint.userData.bindLocalPosition.copy(base);
+  joint.userData.bindLocalPosition.add(
+    new THREE.Vector3(offset.x, offset.y, offset.z),
+  );
+  joint.position.copy(joint.userData.bindLocalPosition);
+
+  return true;
+}
+
 function resetJointPointOffsets() {
   // Zeroes all pivot offsets and returns the skeleton to the adjusted bind pose.
   const defaults = makeDefaultJointPointOffsets();
@@ -1667,12 +2101,138 @@ function resetBindRotationOffsets() {
   // Restores all bind-pose rotations to zero and rebuilds the mesh binding.
   const defaults = makeDefaultBindRotationOffsets();
 
+  state.runtimeArmBindRotationBackup = null;
+
   BIND_ROTATION_JOINTS.forEach((jointName) => {
     Object.assign(getBindRotationOffset(jointName), defaults[jointName]);
   });
 
   rerigImportedMeshAfterBindPoseChange();
   updateGuiDisplays();
+}
+
+function cloneArmBindRotationOffsets() {
+  /*
+    Copies the current arm bind-rotation slider values into plain JSON data.
+
+    We do not keep references to the live rigTuning objects because the T/A-pose
+    start presets overwrite those same objects. A clone preserves the relaxed
+    arm rest exactly as it was before the temporary rigging pose took over.
+  */
+  return ARM_RUNTIME_BIND_ROTATION_JOINTS.reduce((snapshot, jointName) => {
+    const offset = getBindRotationOffset(jointName);
+
+    snapshot[jointName] = {
+      x: offset.x,
+      y: offset.y,
+      z: offset.z,
+    };
+
+    return snapshot;
+  }, {});
+}
+
+function captureRuntimeArmBindRotations(reason) {
+  /*
+    Saves the current relaxed/gameplay arm rest before a mesh-fitting start pose
+    changes the arm bind sliders.
+
+    Important guard:
+      If a backup already exists, do not overwrite it. That prevents a second
+      click on "apply start pose" from saving the T-pose as the new relaxed
+      pose. The first snapshot is the one we want to return to.
+  */
+  if (state.runtimeArmBindRotationBackup) {
+    return;
+  }
+
+  state.runtimeArmBindRotationBackup = {
+    reason,
+    rotations: cloneArmBindRotationOffsets(),
+  };
+  console.info(`[rig] captured relaxed arm bind rotations before ${reason}`);
+}
+
+function clearArmControlStateForRelaxedPose() {
+  /*
+    Restoring bind rotations alone is not enough if a gameplay arm command is
+    still active.
+
+    Example:
+      If rightArm is "up", zeroing the bind sliders correctly returns the arm
+      rest to relaxed, but the next animation frame immediately adds the "up"
+      pose delta and the arm goes over the head. That made the old button feel
+      like it was causing the raise, even though the active command was doing it.
+
+    This helper explicitly returns arm controls to relaxed idle and hides the
+    sword prop so the next frame does not re-raise the arms.
+  */
+  controlState.waveUntil = 0;
+  controlState.wasWaving = false;
+  controlState.leftArm = "down";
+  controlState.rightArm = "down";
+  controlState.weaponEquipped = false;
+  controlState.swordSwingStart = 0;
+  controlState.swordSwingUntil = 0;
+
+  if (state.sword.group) {
+    state.sword.group.visible = false;
+  }
+}
+
+function restoreRuntimeArmBindRotations() {
+  /*
+    Returns only the arm bind-rotation sliders to the relaxed gameplay rest.
+
+    This is intentionally narrower than resetBindRotationOffsets():
+      - It does NOT change pivot point offsets.
+      - It does NOT change body, neck, head, hip, or leg bind rotations.
+      - It only restores the arm chain listed in ARM_RUNTIME_BIND_ROTATION_JOINTS.
+
+    Why this exists:
+      Mesh binding and gameplay animation use the same visible puppet, but they
+      need different meanings for "rest":
+
+        mesh binding rest = the modeling pose used to calculate skin weights
+        gameplay rest     = the pose animation deltas are added on top of
+
+      A T-pose is excellent for binding a T-posed GLB like Sigewynn.glb. If we
+      leave the shoulder bind sliders at +/- PI/2 afterward, then "arm down",
+      "combat", and "swing" all get added to T-arms. The result is the exact
+      stuck-at-T behavior you saw.
+
+    Restore source:
+      1. If applyRigMeshTPosePreset() or applyFemaleMeshAPosePreset() captured
+         the pre-rig relaxed arms, restore that exact snapshot.
+      2. If there is no snapshot, fall back to zero arm bind rotations because
+         the fresh Empyrean skeleton's relaxed arm rest is zero.
+
+    Three.js already captured the generated skin's bind matrices when
+    skinnedMesh.bind(skeleton) ran, so after binding we can safely return the
+    live puppet arms to the relaxed gameplay rest and let the skin deform from
+    its stored modeling-pose bind into the animated pose.
+  */
+  const defaults = makeDefaultBindRotationOffsets();
+  const backup = state.runtimeArmBindRotationBackup;
+  const restoreSource = backup?.rotations || defaults;
+
+  ARM_RUNTIME_BIND_ROTATION_JOINTS.forEach((jointName) => {
+    Object.assign(
+      getBindRotationOffset(jointName),
+      restoreSource[jointName] || defaults[jointName],
+    );
+  });
+
+  state.runtimeArmBindRotationBackup = null;
+  clearArmControlStateForRelaxedPose();
+  updateBindRotationPose();
+  syncSwordAttachment();
+  updateGuiDisplays();
+  console.info(
+    `[rig] restored arm bind rotations to relaxed gameplay rest${
+      backup ? ` from ${backup.reason} snapshot` : " from defaults"
+    }`,
+  );
 }
 
 function applyFemaleMeshAPosePreset() {
@@ -1682,6 +2242,8 @@ function applyFemaleMeshAPosePreset() {
     elbow, wrist, and hand pivots sit much closer to the imported mesh before
     generated skin weights are calculated.
   */
+  captureRuntimeArmBindRotations("A-pose start pose");
+
   const targets = {
     leftClavicle: { x: 0, y: 0, z: -0.16 },
     leftShoulder: { x: 0.02, y: 0, z: -1.08 },
@@ -1721,6 +2283,8 @@ function applyRigMeshTPosePreset() {
     This preset is intentionally simple. It is a starting pose, not a perfect
     anatomical rig solve.
   */
+  captureRuntimeArmBindRotations("T-pose start pose");
+
   const defaults = makeDefaultBindRotationOffsets();
   const targets = {
     leftClavicle: { x: 0, y: 0, z: -0.06 },
@@ -1760,6 +2324,7 @@ function applyRigMeshStartPose() {
     Keeping "current" as the default protects the pose you already tuned.
   */
   if (rigTuning.rigMeshStartPose === "current") {
+    state.runtimeArmBindRotationBackup = null;
     updateBindRotationPose();
     console.info("Rig Mesh Mode: keeping the current bind pose.");
     return;
@@ -1816,6 +2381,444 @@ function resetSkeletonToBindPose() {
   });
 }
 
+function updateG53RiggingStatus(text) {
+  state.g53RiggingMode.status = text;
+  state.g53RiggingMode.readoutControllers.forEach((controller) =>
+    controller.updateDisplay(),
+  );
+}
+
+function getG53WorldOpacityForRole(role) {
+  /*
+    Phase 2 visibility rules.
+
+    Role tags come from world.js:
+      floor   = leave a faint reference plane
+      wall    = hide room/outside walls
+      ceiling = hide ceilings
+      tree    = hide low-poly tree meshes
+
+    Unknown roles are left alone. This prevents the fixture from touching the
+    imported mesh, skeleton tools, devProbe, combat visuals, or future objects
+    that have not opted into G53 visibility behavior.
+  */
+  if (role === "floor") {
+    return G53_RIGGING_HOME.visibility.floorOpacity;
+  }
+
+  if (role === "wall") {
+    return G53_RIGGING_HOME.visibility.wallOpacity;
+  }
+
+  if (role === "ceiling") {
+    return G53_RIGGING_HOME.visibility.ceilingOpacity;
+  }
+
+  if (role === "tree") {
+    return G53_RIGGING_HOME.visibility.treeOpacity;
+  }
+
+  return null;
+}
+
+function rememberG53ObjectVisibility(
+  object,
+  capturedMaterials = new Set(),
+) {
+  /*
+    Stores the exact values we change so exitG53VisibilityFixture() can restore
+    them without guessing. This includes object.visible and per-material opacity.
+  */
+  const materials = Array.isArray(object.material)
+    ? object.material
+    : object.material
+      ? [object.material]
+      : [];
+
+  const entry = {
+    object,
+    visible: object.visible,
+    materials: materials
+      .filter((material) => {
+        if (capturedMaterials.has(material.uuid)) {
+          return false;
+        }
+
+        capturedMaterials.add(material.uuid);
+        return true;
+      })
+      .map((material) => ({
+        material,
+        transparent: material.transparent,
+        opacity: material.opacity,
+        depthWrite: material.depthWrite,
+      })),
+  };
+
+  state.g53RiggingMode.visibilityFixture.push(entry);
+  return entry;
+}
+
+function setObjectMaterialOpacity(object, opacity) {
+  const materials = Array.isArray(object.material)
+    ? object.material
+    : object.material
+      ? [object.material]
+      : [];
+
+  materials.forEach((material) => {
+    material.transparent = true;
+    material.opacity = opacity;
+    material.depthWrite = opacity >= 0.99;
+    material.needsUpdate = true;
+  });
+}
+
+function applyG53VisibilityFixture() {
+  /*
+    Phase 2: make the scene behave like a setup fixture.
+
+    We do NOT delete, rebuild, or disable collision. We only change rendering
+    state on selected world visuals:
+      - walls and ceilings go to opacity 0
+      - floors stay faint as reference planes
+      - trees, ghost spheres, and Jupiter hide
+
+    Because the original values are recorded first, exit restores the world to
+    exactly the opacity/visibility it had before G53 mode entered.
+  */
+  restoreG53VisibilityFixture();
+  const capturedMaterials = new Set();
+
+  explorationWorld.group.traverse((object) => {
+    const role = object.userData?.g53VisibilityRole;
+    const opacity = getG53WorldOpacityForRole(role);
+
+    if (opacity === null || !object.material) {
+      return;
+    }
+
+    rememberG53ObjectVisibility(object, capturedMaterials);
+    object.visible = true;
+    setObjectMaterialOpacity(object, opacity);
+  });
+
+  if (G53_RIGGING_HOME.visibility.hideGhostSpheres) {
+    ghostSpheres.forEach((sphere) => {
+      rememberG53ObjectVisibility(sphere.group, capturedMaterials);
+      sphere.group.visible = false;
+    });
+  }
+
+  if (G53_RIGGING_HOME.visibility.hideJupiter && jupiter) {
+    rememberG53ObjectVisibility(jupiter, capturedMaterials);
+    jupiter.visible = false;
+  }
+
+  setCombatRiggingVisibilitySuppressed(true);
+}
+
+function restoreG53VisibilityFixture() {
+  /*
+    Restores all rendering state captured by applyG53VisibilityFixture().
+
+    This function is safe to call even if no fixture is active. That lets enter
+    mode clean up a previous half-applied fixture before applying a new one.
+  */
+  state.g53RiggingMode.visibilityFixture.forEach((entry) => {
+    entry.object.visible = entry.visible;
+    entry.materials.forEach((snapshot) => {
+      snapshot.material.transparent = snapshot.transparent;
+      snapshot.material.opacity = snapshot.opacity;
+      snapshot.material.depthWrite = snapshot.depthWrite;
+      snapshot.material.needsUpdate = true;
+    });
+  });
+
+  state.g53RiggingMode.visibilityFixture = [];
+  setCombatRiggingVisibilitySuppressed(false);
+}
+
+function ensureWalkArmSwingState() {
+  /*
+    Guarantees the walk-arm-swing runtime object exists.
+
+    This is deliberately small and defensive. Normal startup now initializes
+    state.walkArmSwing, but this helper protects any future reset/import path
+    that might accidentally clear it.
+
+    Formula:
+      walkArmSwing = { left: 0, right: 0 } when missing
+
+    where:
+      left/right = shoulder counter-swing offsets written by updateWalkMotion()
+  */
+  if (!state.walkArmSwing) {
+    state.walkArmSwing = { left: 0, right: 0 };
+  }
+
+  if (!Number.isFinite(state.walkArmSwing.left)) {
+    state.walkArmSwing.left = 0;
+  }
+
+  if (!Number.isFinite(state.walkArmSwing.right)) {
+    state.walkArmSwing.right = 0;
+  }
+
+  return state.walkArmSwing;
+}
+
+function resetWalkArmSwingState() {
+  const walkArmSwing = ensureWalkArmSwingState();
+
+  walkArmSwing.left = 0;
+  walkArmSwing.right = 0;
+}
+
+function makeG53RiggingSnapshot() {
+  /*
+    Captures the temporary gameplay/view state that G53 mode is allowed to
+    change. It deliberately does NOT copy joint point offsets, bind rotations,
+    mesh settings, or imported skin data. Those are the workpiece, not the
+    temporary fixture.
+  */
+  return {
+    control: {
+      position: controlState.position.clone(),
+      yaw: controlState.yaw,
+      walkPhase: controlState.walkPhase,
+      isWalking: Boolean(controlState.isWalking),
+      cameraYaw: controlState.cameraYaw,
+      cameraDistance: controlState.cameraDistance,
+      cameraHeight: controlState.cameraHeight,
+      waveUntil: controlState.waveUntil,
+      wasWaving: Boolean(controlState.wasWaving),
+      leftArm: controlState.leftArm,
+      rightArm: controlState.rightArm,
+      weaponEquipped: Boolean(controlState.weaponEquipped),
+      swordSwingStart: controlState.swordSwingStart,
+      swordSwingUntil: controlState.swordSwingUntil,
+      jump: { ...controlState.jump },
+    },
+    rig: {
+      labEnabled: rigTuning.labEnabled,
+      skeletonVisible: rigTuning.skeletonVisible,
+      showJointLabels: rigTuning.showJointLabels,
+      showAxisMarker: rigTuning.showAxisMarker,
+      showRigCollider: rigTuning.showRigCollider,
+      skeletonOpacity: rigTuning.skeletonOpacity,
+      mouseJointEditMode: rigTuning.mouseJointEditMode,
+      idleMotion: rigTuning.idleMotion,
+      walkPreview: rigTuning.walkPreview,
+    },
+  };
+}
+
+function restoreG53RiggingSnapshot(saved) {
+  /*
+    Restores the gameplay/view state saved by makeG53RiggingSnapshot().
+
+    Keeping this as a helper matters because G53 now has two restore paths:
+      1. normal exit with F2
+      2. failed/partial enter recovery
+
+    Both paths should restore the exact same fields.
+  */
+  if (!saved) {
+    return;
+  }
+
+  controlState.keys.clear();
+  controlState.position.copy(saved.control.position);
+  controlState.yaw = saved.control.yaw;
+  controlState.walkPhase = saved.control.walkPhase;
+  controlState.isWalking = saved.control.isWalking;
+  controlState.cameraYaw = saved.control.cameraYaw;
+  controlState.cameraDistance = saved.control.cameraDistance;
+  controlState.cameraHeight = saved.control.cameraHeight;
+  controlState.waveUntil = saved.control.waveUntil;
+  controlState.wasWaving = saved.control.wasWaving;
+  controlState.leftArm = saved.control.leftArm;
+  controlState.rightArm = saved.control.rightArm;
+  controlState.weaponEquipped = saved.control.weaponEquipped;
+  controlState.swordSwingStart = saved.control.swordSwingStart;
+  controlState.swordSwingUntil = saved.control.swordSwingUntil;
+  Object.assign(controlState.jump, saved.control.jump);
+
+  Object.assign(rigTuning, saved.rig);
+  resetWalkArmSwingState();
+}
+
+function enterG53RiggingMode() {
+  /*
+    TEMP / DEV PRECISION RIGGING MODE: enter machine-home fixture.
+
+    Machining analogy:
+      - Save the current "program state".
+      - Go to a known machine-home reference.
+      - Lock out motion noise.
+      - Turn on the measuring/editing tools.
+
+    What gets frozen in Pass 1:
+      - player movement and yaw are held at home in updateKeyboardMotion()
+      - idle motion is turned off
+      - walk preview is turned off
+      - jump offset is reset
+
+    What stays active:
+      - camera orbit/zoom/height
+      - mesh preview/rig controls
+      - mouse joint point editing
+  */
+  if (state.g53RiggingMode.active) {
+    return;
+  }
+
+  const saved = makeG53RiggingSnapshot();
+
+  try {
+    state.g53RiggingMode.saved = saved;
+    state.g53RiggingMode.active = true;
+    updateG53RiggingStatus("ENTERING - HOME X0 Z0 YAW0");
+
+    controlState.keys.clear();
+    controlState.position.copy(G53_RIGGING_HOME.position);
+    controlState.yaw = G53_RIGGING_HOME.yaw;
+    controlState.walkPhase = 0;
+    controlState.isWalking = false;
+    controlState.waveUntil = 0;
+    controlState.wasWaving = false;
+    controlState.leftArm = "down";
+    controlState.rightArm = "down";
+    controlState.swordSwingStart = 0;
+    controlState.swordSwingUntil = 0;
+    resetWalkArmSwingState();
+    Object.assign(controlState.jump, {
+      phase: "grounded",
+      elapsed: 0,
+      offsetY: 0,
+      velocityY: 0,
+    });
+
+    if (controlState.weaponEquipped) {
+      controlState.weaponEquipped = false;
+      state.sword.group && (state.sword.group.visible = false);
+    }
+
+    rigTuning.idleMotion = false;
+    rigTuning.walkPreview = false;
+    rigTuning.labEnabled = true;
+    rigTuning.skeletonVisible = true;
+    rigTuning.showAxisMarker = true;
+    rigTuning.showRigCollider = true;
+    rigTuning.mouseJointEditMode = true;
+
+    resetSkeletonToBindPose();
+    syncSkeletonRoot();
+    if (state.skeleton?.root) {
+      state.skeleton.root.rotation.y = controlState.yaw;
+      state.skeleton.root.updateMatrixWorld(true);
+    }
+
+    selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
+    applyVisibility();
+    applyG53VisibilityFixture();
+    updateGuiDisplays();
+    updateG53RiggingStatus("ACTIVE - HOME X0 Z0 YAW0 - WORLD FADED");
+    console.info("[G53] rigging mode active: home position and mouse point edit enabled");
+  } catch (error) {
+    /*
+      If any setup step fails, G53 must not remain half-entered. A partial enter
+      is worse than a clean refusal because active=true freezes movement and the
+      pose loop, but the visibility fixture/status may not be applied.
+    */
+    console.error("[G53] failed to enter rigging mode; restoring saved state", error);
+    state.g53RiggingMode.active = false;
+    state.g53RiggingMode.saved = null;
+    restoreG53VisibilityFixture();
+    restoreG53RiggingSnapshot(saved);
+    resetSkeletonToBindPose();
+    syncSkeletonRoot();
+    if (state.skeleton?.root) {
+      state.skeleton.root.rotation.y = controlState.yaw;
+      state.skeleton.root.updateMatrixWorld(true);
+    }
+    syncSwordAttachment();
+    selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
+    applyVisibility();
+    updateGuiDisplays();
+    updateG53RiggingStatus("OFF - ENTER FAILED");
+  }
+}
+
+function exitG53RiggingMode() {
+  /*
+    TEMP / DEV PRECISION RIGGING MODE: leave machine-home fixture.
+
+    This restores gameplay/view state, but it does not undo pivot edits. If you
+    moved a joint point during rigging mode, that remains your new tuned value.
+  */
+  if (!state.g53RiggingMode.active) {
+    return;
+  }
+
+  const saved = state.g53RiggingMode.saved;
+
+  state.g53RiggingMode.active = false;
+  state.g53RiggingMode.saved = null;
+  restoreG53VisibilityFixture();
+  restoreG53RiggingSnapshot(saved);
+
+  resetSkeletonToBindPose();
+  syncSkeletonRoot();
+  if (state.skeleton?.root) {
+    state.skeleton.root.rotation.y = controlState.yaw;
+    state.skeleton.root.updateMatrixWorld(true);
+  }
+
+  syncSwordAttachment();
+  selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
+  applyVisibility();
+  updateGuiDisplays();
+  updateG53RiggingStatus("OFF");
+  console.info("[G53] rigging mode restored gameplay/view state");
+}
+
+function toggleG53RiggingMode() {
+  if (state.g53RiggingMode.active) {
+    exitG53RiggingMode();
+  } else {
+    enterG53RiggingMode();
+  }
+}
+
+function rigCurrentImportedMeshAndExitG53() {
+  /*
+    GUI wrapper for Mesh > 2 rig mesh.
+
+    In the G53 workflow, the usual sequence is:
+      preview mesh -> F2 home rigging mode -> tune pivots -> 2 rig mesh -> return
+
+    If a preview is already loaded, rigging is synchronous and we can restore
+    gameplay immediately afterward. If no preview exists, skin.js starts an
+    asynchronous GLB load; in that fallback case G53 mode stays active and the
+    user can press F2 after the load/rig finishes.
+  */
+  const canRestoreImmediately = Boolean(state.importedPreview?.gltf);
+
+  rigCurrentImportedMesh();
+
+  if (canRestoreImmediately) {
+    restoreRuntimeArmBindRotations();
+  }
+
+  if (state.g53RiggingMode.active && canRestoreImmediately) {
+    exitG53RiggingMode();
+  } else if (state.g53RiggingMode.active) {
+    updateG53RiggingStatus("ACTIVE - async mesh load; press F2 after rigging");
+  }
+}
+
 function buildGui() {
   /*
     GUI panel structure (top to bottom):
@@ -1827,8 +2830,11 @@ function buildGui() {
       Motion            â€” idle, walk, jump, damping, presets
       Skeleton Lab      â€” debug markers, labels, collider ring
       Workshop          â€” root alignment, mouse point editing, axis marker
+      G53 Rigging Mode  â€” temporary machine-home setup for pivot editing
       Save              â€” browser save/load and JSON export
       World Debug       â€” collision and encounter zone overlays
+      Combat            â€” sword buttons and enemy difficulty
+      Sword Offsets     â€” live sword path, scale, grip, position, rotation
 
     All folders except Mesh start closed so the panel is not overwhelming on
     first open. Click a folder header to expand it.
@@ -1852,7 +2858,7 @@ function buildGui() {
       3. Automatically loads a static preview so you can see the mesh right away.
 
     You can also type a relative path directly in the "path" field below
-    (e.g. assets/femaleMesh.glb) if the file is already in the project folder.
+    (e.g. assets/Sigewynn.glb) if the file is already in the project folder.
   */
   meshFolder
     .add(
@@ -1878,6 +2884,18 @@ function buildGui() {
             updateGuiDisplays();
             // Auto-preview on pick so you see the mesh immediately.
             loadImportedMeshPreviewFromPath(state.meshBlobUrl);
+            /*
+              Hand keyboard focus back to the scene after the OS file picker.
+
+              Without this, function-key shortcuts can be swallowed by the
+              browser/GUI focus state after choosing a new local mesh. The
+              capture-phase F2 handler below is the main safety net; this focus
+              restore makes the rest of the workshop feel normal too.
+            */
+            requestAnimationFrame(() => {
+              window.focus();
+              sceneContainer.focus({ preventScroll: true });
+            });
           });
           input.click();
         },
@@ -1887,7 +2905,7 @@ function buildGui() {
     .name("open fileâ€¦");
 
   /*
-    PATH FIELD â€” fallback for typing a relative path like "assets/femaleMesh.glb"
+    PATH FIELD â€” fallback for typing a relative path like "assets/Sigewynn.glb"
     or for re-loading a path that was exported with the rig package.
     When the file browser is used, this shows the chosen filename.
   */
@@ -1912,8 +2930,11 @@ function buildGui() {
   meshFolder
     .add({ fn: applyRigMeshStartPose }, "fn")
     .name("apply start pose");
+  meshFolder
+    .add({ fn: restoreRuntimeArmBindRotations }, "fn")
+    .name("restore gameplay arms");
   meshFolder.add({ fn: renderDefaultImportedMesh }, "fn").name("1  preview");
-  meshFolder.add({ fn: rigCurrentImportedMesh }, "fn").name("2  rig mesh");
+  meshFolder.add({ fn: rigCurrentImportedMeshAndExitG53 }, "fn").name("2  rig mesh");
   meshFolder.add({ fn: loadDefaultImportedMesh }, "fn").name("quick rig");
   meshFolder.add({ fn: rerigImportedMesh }, "fn").name("re-rig");
   meshFolder.add({ fn: clearImportedMesh }, "fn").name("clear mesh");
@@ -2128,6 +3149,9 @@ function buildGui() {
   addGuiController(labFolder, rigTuning, "skeletonVisible")
     .name("show pivots")
     .onChange(applyVisibility);
+  addGuiController(labFolder, rigTuning, "skeletonOpacity", 0, 1, 0.01)
+    .name("guide opacity")
+    .onChange(applyVisibility);
   addGuiController(labFolder, rigTuning, "showJointLabels")
     .name("joint labels")
     .onChange(applyVisibility);
@@ -2195,6 +3219,75 @@ function buildGui() {
     .onChange(selectMouseJointEditJoint);
   alignmentFolder.close();
 
+  // ==============================================================
+  // TEMP / DEV PRECISION RIGGING MODE: G53-style machine home
+  // F2 homes the rig, hides measuring clutter, and enables precise pivot edits.
+  // ==============================================================
+  const g53Folder = state.gui.addFolder("G53 Rigging Mode");
+  state.guiFolders.g53RiggingMode = g53Folder;
+  state.g53RiggingMode.readoutControllers.push(
+    g53Folder.add(state.g53RiggingMode, "status").name("status"),
+  );
+  g53Folder.add({ fn: enterG53RiggingMode }, "fn").name("enter / home");
+  g53Folder.add({ fn: exitG53RiggingMode }, "fn").name("exit / restore");
+  g53Folder.add({ fn: toggleG53RiggingMode }, "fn").name("F2 toggle");
+  addGuiController(g53Folder, rigTuning, "g53AllowX").name("allow X");
+  addGuiController(g53Folder, rigTuning, "g53AllowY").name("allow Y");
+  addGuiController(g53Folder, rigTuning, "g53AllowZ").name("allow Z");
+  addGuiController(g53Folder, rigTuning, "g53PreserveChildPoints").name(
+    "hold child points",
+  );
+  g53Folder.close();
+
+  // ==============================================================
+  // TEMP / DEV MODE: devProbe
+  // A movable measuring point for finding rig-local coordinates.
+  // ==============================================================
+  const devProbeFolder = state.gui.addFolder("TEMP Dev Probe");
+  state.guiFolders.devProbe = devProbeFolder;
+  addGuiController(devProbeFolder, rigTuning, "devProbeVisible")
+    .name("visible")
+    .onChange(syncDevProbeAttachment);
+  addGuiController(
+    devProbeFolder,
+    rigTuning,
+    "devProbeX",
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+    DEV_PROBE_TWEAKS.step,
+  )
+    .name("local X")
+    .onChange(applyDevProbePosition);
+  addGuiController(
+    devProbeFolder,
+    rigTuning,
+    "devProbeY",
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+    DEV_PROBE_TWEAKS.step,
+  )
+    .name("local Y")
+    .onChange(applyDevProbePosition);
+  addGuiController(
+    devProbeFolder,
+    rigTuning,
+    "devProbeZ",
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+    DEV_PROBE_TWEAKS.step,
+  )
+    .name("local Z")
+    .onChange(applyDevProbePosition);
+  addGuiController(devProbeFolder, rigTuning, "devProbeStep", 0.001, 0.25, 0.001)
+    .name("key step");
+  state.devProbe.readoutControllers.push(
+    devProbeFolder.add(state.devProbe.readout, "world").name("world"),
+    devProbeFolder.add(state.devProbe.readout, "rigLocal").name("rig local"),
+  );
+  devProbeFolder.add({ fn: logDevProbeValues }, "fn").name("log values");
+  devProbeFolder.add({ fn: copyDevProbeRigLocal }, "fn").name("copy rig local");
+  devProbeFolder.close();
+
   // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // SAVE
   // Browser save/load and JSON export. Tuning is auto-loaded on page refresh.
@@ -2242,6 +3335,63 @@ function buildGui() {
       }
     });
   worldDebugFolder.close();
+
+  // ==============================================================
+  // COMBAT
+  // Sword controls mirror the keyboard shortcuts so you can test from the GUI.
+  // Difficulty is saved with rig tuning and is pushed into combat_updated.js.
+  // ==============================================================
+  const combatFolder = state.gui.addFolder("Combat");
+  state.guiFolders.combat = combatFolder;
+  addGuiController(combatFolder, rigTuning, "combatDifficulty", [
+    "EASY",
+    "MEDIUM",
+    "HARD",
+  ])
+    .name("difficulty")
+    .onChange(setCombatDifficulty);
+  combatFolder.add({ fn: equipSword }, "fn").name("equip sword");
+  combatFolder.add({ fn: despawnSword }, "fn").name("stow sword");
+  combatFolder.add({ fn: startSwordSwing }, "fn").name("swing");
+  combatFolder.close();
+
+  // ==============================================================
+  // SWORD OFFSETS
+  // Live workholding controls for whatever sword GLB is currently used.
+  // These are saved/exported in rigTuning, just like mesh transform sliders.
+  // ==============================================================
+  const swordFolder = state.gui.addFolder("Sword Offsets");
+  state.guiFolders.swordOffsets = swordFolder;
+  addGuiController(swordFolder, rigTuning, "swordAssetPath")
+    .name("asset path")
+    .onFinishChange(reloadSwordAsset);
+  addGuiController(swordFolder, rigTuning, "swordTargetLength", 0.05, 4, 0.01)
+    .name("length / scale")
+    .onChange(refreshSwordOffsetPresentation);
+  addGuiController(swordFolder, rigTuning, "swordGripFromLowerEnd", 0, 1, 0.01)
+    .name("grip point")
+    .onChange(refreshSwordOffsetPresentation);
+  addGuiController(swordFolder, rigTuning, "swordOffsetX", -1, 1, 0.005)
+    .name("pos X")
+    .onChange(syncSwordAttachment);
+  addGuiController(swordFolder, rigTuning, "swordOffsetY", -1, 1, 0.005)
+    .name("pos Y")
+    .onChange(syncSwordAttachment);
+  addGuiController(swordFolder, rigTuning, "swordOffsetZ", -1, 1, 0.005)
+    .name("pos Z")
+    .onChange(syncSwordAttachment);
+  addGuiController(swordFolder, rigTuning, "swordPitch", -Math.PI, Math.PI, 0.005)
+    .name("pitch X")
+    .onChange(syncSwordAttachment);
+  addGuiController(swordFolder, rigTuning, "swordYaw", -Math.PI, Math.PI, 0.005)
+    .name("yaw Y")
+    .onChange(syncSwordAttachment);
+  addGuiController(swordFolder, rigTuning, "swordRoll", -Math.PI, Math.PI, 0.005)
+    .name("roll Z")
+    .onChange(syncSwordAttachment);
+  swordFolder.add({ fn: reloadSwordAsset }, "fn").name("reload sword");
+  swordFolder.add({ fn: resetSwordOffsets }, "fn").name("reset sword offsets");
+  swordFolder.close();
 }
 
 function buildJointPointControls(parentFolder) {
@@ -2417,6 +3567,7 @@ function applyVisibility() {
   state.debugView?.setVisible(
     rigTuning.labEnabled && rigTuning.skeletonVisible,
   );
+  state.debugView?.setOpacity(rigTuning.skeletonOpacity);
   state.debugView?.setLabelsVisible(
     rigTuning.labEnabled &&
       rigTuning.skeletonVisible &&
@@ -2511,13 +3662,16 @@ function animate(currentTime) {
       { audio: myAudio, jupiter, defaultJupiterColor: SOLO_TWEAKS.jupiter.color },
     );
   }
-  // Combat encounter tick: state machine handles trigger/start/roll/contact/end.
+  // Combat encounter tick: state machine handles trigger/start/roll/active/hiding/end.
   // It is a no-op while phase === "idle" and nothing is in the trigger.
+  // Sword swings are one-shot calls from handleKeyDown(); the frame tick owns
+  // continuous enemy movement, health-bar visibility, hiding, and audio fades.
   updateCombatEncounter(delta);
 
   updateJumpPhysics(delta);
   updateSkeleton(delta, elapsed, currentTime);
   syncImportedSkinToPuppet();
+  updateDevProbeReadout();
   updateGhostSphereMotion(ghostSpheres, elapsed);
   updateCamera(delta);
   renderer.render(scene, camera);
@@ -2541,8 +3695,13 @@ function updateKeyboardMotion(delta, currentTime) {
     tree colliders can reject or slide movement.
   */
   const keys = controlState.keys;
-  const moveInput = (keys.has("KeyW") ? 1 : 0) + (keys.has("KeyS") ? -1 : 0);
-  const turnInput = (keys.has("KeyA") ? 1 : 0) + (keys.has("KeyD") ? -1 : 0);
+  const machineHomeActive = state.g53RiggingMode.active;
+  const moveInput = machineHomeActive
+    ? 0
+    : (keys.has("KeyW") ? 1 : 0) + (keys.has("KeyS") ? -1 : 0);
+  const turnInput = machineHomeActive
+    ? 0
+    : (keys.has("KeyA") ? 1 : 0) + (keys.has("KeyD") ? -1 : 0);
   const orbitInput =
     (keys.has("ArrowLeft") ? 1 : 0) + (keys.has("ArrowRight") ? -1 : 0);
   const zoomInput =
@@ -2595,6 +3754,14 @@ function updateKeyboardMotion(delta, currentTime) {
   }
 
   controlState.isWalking = Math.abs(moveInput) > 0;
+  if (machineHomeActive) {
+    /*
+      G53 rigging mode keeps the rig at machine home. Camera controls above
+      remain live, but player movement/yaw do not move the workpiece.
+    */
+    controlState.position.copy(G53_RIGGING_HOME.position);
+    controlState.yaw = G53_RIGGING_HOME.yaw;
+  }
   state.skeleton.root.rotation.y = controlState.yaw;
 
   if (currentTime > controlState.waveUntil && controlState.wasWaving) {
@@ -2621,6 +3788,11 @@ function updateSkeleton(delta, elapsed, currentTime) {
 
   syncSkeletonRoot();
 
+  if (state.g53RiggingMode.active) {
+    freezeG53RiggingPose();
+    return;
+  }
+
   if (!rigTuning.labEnabled || !rigTuning.skeletonVisible) {
     return;
   }
@@ -2637,6 +3809,10 @@ function updateSkeleton(delta, elapsed, currentTime) {
     relaxLegs(delta);
   }
 
+  if (controlState.weaponEquipped && !controlState.isWalking) {
+    updateCombatStancePose(delta);
+  }
+
   updateControlledArms(delta, currentTime);
   updateJumpPose(delta);
 
@@ -2649,6 +3825,64 @@ function updateSkeleton(delta, elapsed, currentTime) {
     knee/ankle/foot positions every frame, the copied vertex must be refreshed
     here or the femur/shin/foot lines will visually detach from their markers.
   */
+  state.debugView?.refreshBones?.();
+}
+
+function freezeG53RiggingPose() {
+  /*
+    G53 RIGGING MODE POSE FREEZE.
+
+    WHY THIS EXISTS:
+      G53 is a measuring/fixture mode. While placing pivots against a mesh, the
+      rig should behave like a stable layout jig, not like a living animated
+      puppet.
+
+    The earlier G53 pass turned off idle motion and walk preview, but the arm
+    controller still ran every frame. Even the "down" arm pose is animated:
+
+      shoulder target includes arm trail
+      elbow target eases toward a relaxed bend
+      wrist/palm target includes hand float
+
+    Because updateControlledArms() uses damping, those joints visibly "settled"
+    after every mouse drag. It looked like moving any pivot affected both arms,
+    with the effect growing down the chain from shoulder -> elbow -> hand.
+
+    FREEZE RULE:
+      While G53 is active, do not run any pose solvers:
+        - no idle breathing
+        - no walk/leg relaxation
+        - no arm trail/control poses
+        - no jump pose overlay
+
+    FORMULA:
+      liveJointTransform = bindPoseTransform
+
+    where:
+      bindPoseTransform = the current saved pivot offsets + bind rotations
+
+    This still shows every pivot edit immediately because the bind pose is
+    rebuilt from rigTuning before this function runs. It simply prevents
+    animation layers from adding motion on top of those rigging edits.
+  */
+  controlState.isWalking = false;
+  controlState.waveUntil = 0;
+  controlState.wasWaving = false;
+  controlState.swordSwingStart = 0;
+  controlState.swordSwingUntil = 0;
+  resetWalkArmSwingState();
+
+  Object.assign(controlState.jump, {
+    phase: "grounded",
+    elapsed: 0,
+    offsetY: 0,
+    velocityY: 0,
+  });
+
+  resetSkeletonToBindPose();
+  syncSkeletonRoot();
+  state.skeleton.root.rotation.y = G53_RIGGING_HOME.yaw;
+  state.skeleton.root.updateMatrixWorld(true);
   state.debugView?.refreshBones?.();
 }
 
@@ -2839,6 +4073,750 @@ function startJump() {
   jump.velocityY = 0;
 }
 
+function equipSword() {
+  /*
+    Equips the right-hand sword and moves the puppet into a combat stance.
+
+    Important separation:
+      - This function owns the visible sword asset and arm pose.
+      - combat_updated.js owns enemy hit points, hiding, and victory.
+
+    If the GLB has not loaded yet, the stance still changes immediately. The
+    loader callback calls syncSwordAttachment() when the asset arrives.
+  */
+  controlState.weaponEquipped = true;
+  controlState.leftArm = "half";
+  controlState.rightArm = "combat";
+
+  loadSwordIfNeeded();
+  syncSwordAttachment();
+}
+
+function despawnSword() {
+  /*
+    Stows the sword and returns the arm toggles to idle.
+
+    We keep the loaded GLB in memory after it is first loaded. Hiding/re-showing
+    an existing object is much cheaper than loading assets every time 1 is
+    pressed.
+  */
+  controlState.weaponEquipped = false;
+  controlState.swordSwingStart = 0;
+  controlState.swordSwingUntil = 0;
+  controlState.leftArm = "down";
+  controlState.rightArm = "down";
+
+  if (state.sword.group) {
+    state.sword.group.visible = false;
+  }
+}
+
+function startSwordSwing() {
+  /*
+    Starts one sword swing and asks the combat module whether it connected.
+
+    The visual swing lasts SWORD_TWEAKS.swingDurationMs. The hit test happens at
+    the start of the swing for now because the enemy encounter is still a simple
+    prototype with one range/arc check, not frame-perfect weapon collision.
+
+    Player strike point:
+      x = controlState.position.x + rootOffsetX
+      z = controlState.position.z + rootOffsetZ
+
+    Forward attack arc:
+      yaw is the same yaw used by movement/camera facing.
+  */
+  if (!controlState.weaponEquipped) {
+    equipSword();
+  }
+
+  const now = performance.now();
+
+  if (now < controlState.swordSwingUntil) {
+    return;
+  }
+
+  controlState.swordSwingStart = now;
+  controlState.swordSwingUntil = now + SWORD_TWEAKS.swingDurationMs;
+  controlState.rightArm = "swing";
+
+  const result = attemptCombatSwordHit({
+    x: controlState.position.x + rigTuning.rootOffsetX,
+    z: controlState.position.z + rigTuning.rootOffsetZ,
+    yaw: controlState.yaw,
+    range: SWORD_TWEAKS.hitRange,
+    arcRadians: SWORD_TWEAKS.hitArcRadians,
+  });
+
+  console.info("[sword] swing result", result);
+}
+
+function getSwordAssetPath() {
+  /*
+    Returns the currently requested sword asset path.
+
+    The path now lives in rigTuning so you can change it from the GUI and save
+    it with the rest of the workshop setup. SWORD_TWEAKS remains the built-in
+    default, not the only source of truth.
+  */
+  return rigTuning.swordAssetPath?.trim() || SWORD_TWEAKS.assetPath;
+}
+
+function refreshSwordOffsetPresentation() {
+  /*
+    Applies live Sword Offsets GUI values to the already-loaded prop.
+
+    This is the sword equivalent of mesh transform sliders:
+      - length/grip changes re-normalize the imported GLB model,
+      - X/Y/Z and pitch/yaw/roll change the wrapper held by rightPalm.
+
+    It is safe to call before the sword is loaded. In that case sync does
+    nothing; the loader will apply the same values when the asset arrives.
+  */
+  if (state.sword.model) {
+    normalizeSwordModel(state.sword.model);
+  }
+
+  syncSwordAttachment();
+}
+
+function disposeSwordAsset() {
+  /*
+    Removes the current sword GLB from memory so a different path can be loaded.
+
+    This is intentionally separate from despawnSword():
+      despawnSword() hides the weapon but keeps the asset ready.
+      disposeSwordAsset() throws away the current asset because the workpiece
+      changed and the next equip/reload should load from swordAssetPath.
+  */
+  const swordGroup = state.sword.group;
+
+  if (swordGroup) {
+    swordGroup.parent?.remove(swordGroup);
+    disposeObjectTree(swordGroup);
+  }
+
+  state.sword.group = null;
+  state.sword.model = null;
+  state.sword.loading = false;
+  state.sword.loaded = false;
+  state.sword.loadedAssetPath = "";
+}
+
+function reloadSwordAsset() {
+  /*
+    GUI helper for changing to another sword GLB.
+
+    It disposes the old prop, then asks the normal loader path to load the
+    current swordAssetPath. If the player is already in combat stance, the new
+    sword appears in the same hand automatically after it loads.
+  */
+  disposeSwordAsset();
+  loadSwordIfNeeded();
+  updateGuiDisplays();
+}
+
+function resetSwordOffsets() {
+  /*
+    Restores the GUI-controlled sword numbers to their default values.
+
+    This does not touch enemy health, combat difficulty, arm pose, or mesh
+    rigging. It only resets the sword workholding setup.
+  */
+  Object.assign(rigTuning, {
+    swordAssetPath: SWORD_TWEAKS.assetPath,
+    swordTargetLength: SWORD_TWEAKS.targetLength,
+    swordGripFromLowerEnd: SWORD_TWEAKS.gripFromLowerEnd,
+    swordOffsetX: SWORD_TWEAKS.localPosition[0],
+    swordOffsetY: SWORD_TWEAKS.localPosition[1],
+    swordOffsetZ: SWORD_TWEAKS.localPosition[2],
+    swordPitch: SWORD_TWEAKS.localRotation[0],
+    swordYaw: SWORD_TWEAKS.localRotation[1],
+    swordRoll: SWORD_TWEAKS.localRotation[2],
+  });
+
+  if (state.sword.loadedAssetPath !== getSwordAssetPath()) {
+    reloadSwordAsset();
+  } else {
+    refreshSwordOffsetPresentation();
+  }
+
+  updateGuiDisplays();
+}
+
+function loadSwordIfNeeded() {
+  /*
+    Loads the configured sword GLB once.
+
+    GLTFLoader gives us a scene graph, not a single Mesh. We wrap the imported
+    scene in our own group so all future placement happens on the wrapper and
+    the GLB's internal mesh hierarchy can remain untouched.
+  */
+  const assetPath = getSwordAssetPath();
+
+  if (state.sword.loaded && state.sword.loadedAssetPath === assetPath) {
+    return;
+  }
+
+  if (state.sword.loaded && state.sword.loadedAssetPath !== assetPath) {
+    disposeSwordAsset();
+  }
+
+  if (state.sword.loading) {
+    return;
+  }
+
+  state.sword.loading = true;
+
+  const loader = new GLTFLoader();
+  loader.load(
+    assetPath,
+    (gltf) => {
+      const swordGroup = new THREE.Group();
+      swordGroup.name = "right-hand-sword";
+
+      const swordRoot = gltf.scene;
+      swordRoot.name = "right-hand-sword-model";
+      normalizeSwordModel(swordRoot);
+      swordGroup.add(swordRoot);
+
+      state.sword.group = swordGroup;
+      state.sword.model = swordRoot;
+      state.sword.loaded = true;
+      state.sword.loading = false;
+      state.sword.loadedAssetPath = assetPath;
+
+      syncSwordAttachment();
+      console.info("[sword] loaded", assetPath);
+    },
+    undefined,
+    (error) => {
+      state.sword.loading = false;
+      console.error("[sword] failed to load", assetPath, error);
+    },
+  );
+}
+
+function getSwordLocalBoundingBox(swordRoot) {
+  /*
+    Measures the sword in swordRoot-local coordinates.
+
+    Why not Box3().setFromObject(swordRoot)?
+      setFromObject measures in world space. Once the sword is parented to the
+      palm, world-space measurement includes the hand's rotation, which can make
+      repeated scale/grip tuning drift. This helper converts each mesh's bounds
+      back into swordRoot local space before unioning them.
+
+    Formula:
+      localMatrix = inverse(swordRoot.matrixWorld) * child.matrixWorld
+      childLocalBox = child.geometry.boundingBox transformed by localMatrix
+  */
+  swordRoot.updateMatrixWorld(true);
+
+  const rootInverse = swordRoot.matrixWorld.clone().invert();
+  const box = new THREE.Box3();
+  let foundMesh = false;
+
+  swordRoot.traverse((child) => {
+    if (!child.isMesh || !child.geometry) {
+      return;
+    }
+
+    child.geometry.computeBoundingBox();
+
+    if (!child.geometry.boundingBox) {
+      return;
+    }
+
+    const childBox = child.geometry.boundingBox.clone();
+    const localMatrix = rootInverse.clone().multiply(child.matrixWorld);
+
+    childBox.applyMatrix4(localMatrix);
+    box.union(childBox);
+    foundMesh = true;
+  });
+
+  return foundMesh ? box : null;
+}
+
+function rememberSwordImportTransform(swordRoot) {
+  /*
+    Stores the GLB scene root's authored transform the first time we normalize.
+
+    GUI tuning can call normalizeSwordModel() many times. Resetting to this
+    stored import transform before every measurement prevents scale and grip
+    changes from accumulating like repeated machine offsets.
+  */
+  if (swordRoot.userData.baseSwordTransform) {
+    return;
+  }
+
+  swordRoot.userData.baseSwordTransform = {
+    position: swordRoot.position.clone(),
+    quaternion: swordRoot.quaternion.clone(),
+    scale: swordRoot.scale.clone(),
+  };
+}
+
+function resetSwordToImportTransform(swordRoot) {
+  const base = swordRoot.userData.baseSwordTransform;
+
+  if (!base) {
+    return;
+  }
+
+  swordRoot.position.copy(base.position);
+  swordRoot.quaternion.copy(base.quaternion);
+  swordRoot.scale.copy(base.scale);
+}
+
+function getSwordMaterialList(material) {
+  return Array.isArray(material) ? material : [material].filter(Boolean);
+}
+
+function polishSwordMeshForVisibility(mesh) {
+  /*
+    Keeps imported swords visible in Empyrean's dark world.
+
+    Some GLBs import with very dark PBR textures. They can be technically
+    present but almost invisible against the black/green rooms. This does not
+    replace the authored material; it only adds a tiny emissive lift and renders
+    both sides so thin blade faces do not disappear at shallow camera angles.
+  */
+  mesh.frustumCulled = false;
+
+  getSwordMaterialList(mesh.material).forEach((material) => {
+    material.side = THREE.DoubleSide;
+
+    if (material.emissive) {
+      material.emissive.set("#1f1f1f");
+      material.emissiveIntensity = Math.max(material.emissiveIntensity || 0, 0.12);
+    }
+
+    if ("envMapIntensity" in material) {
+      material.envMapIntensity = Math.max(material.envMapIntensity || 0, 0.7);
+    }
+
+    material.needsUpdate = true;
+  });
+}
+
+function normalizeSwordModel(swordRoot) {
+  /*
+    Fits an arbitrary sword GLB into Empyrean scene units.
+
+    Formula:
+      scale = targetLength / longestBoundingBoxSide
+
+    Where:
+      targetLength = rigTuning.swordTargetLength, in Three.js units
+      longestBoundingBoxSide = max(width, height, depth) from the GLB bounds
+
+    After scaling, we move the model so the wrapper group's origin sits near a
+    grip point instead of the dead center of the sword. That origin is what
+    rightPalm holds. The Sword Offsets X/Y/Z sliders then act like a small
+    handle-placement shim.
+  */
+  rememberSwordImportTransform(swordRoot);
+  resetSwordToImportTransform(swordRoot);
+  swordRoot.updateMatrixWorld(true);
+
+  const sourceBox = getSwordLocalBoundingBox(swordRoot);
+
+  if (!sourceBox) {
+    console.warn("[sword] could not find sword mesh bounds; leaving scale unchanged");
+    return;
+  }
+
+  const sourceSize = sourceBox.getSize(new THREE.Vector3());
+  const longestSide = Math.max(sourceSize.x, sourceSize.y, sourceSize.z);
+
+  if (!Number.isFinite(longestSide) || longestSide <= 0.0001) {
+    console.warn("[sword] could not measure sword asset; leaving scale unchanged");
+    return;
+  }
+
+  const targetLength = THREE.MathUtils.clamp(rigTuning.swordTargetLength, 0.05, 4);
+  const gripFromLowerEnd = THREE.MathUtils.clamp(
+    rigTuning.swordGripFromLowerEnd,
+    0,
+    1,
+  );
+  const scale = targetLength / longestSide;
+  const basePosition = swordRoot.position.clone();
+  const longestAxis =
+    sourceSize.x >= sourceSize.y && sourceSize.x >= sourceSize.z
+      ? "x"
+      : sourceSize.y >= sourceSize.z
+        ? "y"
+        : "z";
+  const gripPoint = sourceBox.getCenter(new THREE.Vector3());
+
+  /*
+    Grip-point math:
+      gripPoint[axis] = sourceBox.min[axis] + sourceSize[axis] * gripFromLowerEnd
+
+    where:
+      axis = whichever local box dimension is longest after scaling
+
+    This is a practical prop heuristic. We do not know how every GLB author
+    oriented their sword, but the longest box dimension is almost always blade
+    length. Setting the wrapper origin close to one end makes the palm hold the
+    hilt area instead of the center of the blade.
+
+    Placement math:
+      gripOffset = gripPoint * swordRoot.scale, then rotated by swordRoot.quaternion
+      swordRoot.position = basePosition - gripOffset
+
+    This means the chosen grip point lands at the wrapper group's origin. The
+    wrapper is what gets attached to rightPalm. We intentionally calculate from
+    sourceBox, not from a remeasured "fitted" box, because this function can run
+    many times while sliders move. Starting from the saved import transform each
+    time prevents cumulative scale/offset drift.
+  */
+  gripPoint[longestAxis] =
+    sourceBox.min[longestAxis] + sourceSize[longestAxis] * gripFromLowerEnd;
+
+  swordRoot.scale.multiplyScalar(scale);
+
+  const gripOffset = gripPoint
+    .clone()
+    .multiply(swordRoot.scale)
+    .applyQuaternion(swordRoot.quaternion);
+
+  swordRoot.position.copy(basePosition).sub(gripOffset);
+  swordRoot.updateMatrixWorld(true);
+
+  swordRoot.traverse((child) => {
+    if (child.isMesh) {
+      polishSwordMeshForVisibility(child);
+    }
+  });
+}
+
+function syncSwordAttachment() {
+  /*
+    Parents the loaded sword to the current rightPalm joint.
+
+    Why this exists:
+      buildSkeletonWorkshop() destroys and recreates the skeleton when rig
+      dimensions change. A child object would be disposed with the old skeleton
+      unless we detach it first and reattach it to the new rightPalm here.
+  */
+  const swordGroup = state.sword.group;
+  const rightPalm = state.skeleton?.joints?.rightPalm;
+
+  if (!swordGroup || !rightPalm) {
+    return;
+  }
+
+  if (swordGroup.parent !== rightPalm) {
+    swordGroup.parent?.remove(swordGroup);
+    rightPalm.add(swordGroup);
+  }
+
+  swordGroup.position.set(
+    rigTuning.swordOffsetX,
+    rigTuning.swordOffsetY,
+    rigTuning.swordOffsetZ,
+  );
+  swordGroup.rotation.set(
+    rigTuning.swordPitch,
+    rigTuning.swordYaw,
+    rigTuning.swordRoll,
+  );
+  swordGroup.visible = controlState.weaponEquipped;
+}
+
+function detachSwordFromSkeleton() {
+  /*
+    Protects the loaded sword during a skeleton rebuild.
+
+    Removing the sword from its parent before disposeObjectTree(state.skeleton)
+    means the object is not disposed with the old rightPalm. The next rebuild
+    calls syncSwordAttachment() to attach it to the fresh rightPalm.
+  */
+  const swordGroup = state.sword.group;
+
+  if (!swordGroup) {
+    return;
+  }
+
+  swordGroup.parent?.remove(swordGroup);
+}
+
+function syncDevProbeAttachment() {
+  /*
+    TEMP / DEV MODE: creates and attaches the coordinate probe.
+
+    The probe is intentionally separate from gameplay systems. It does not take
+    part in collision, combat, skinning, or saving mesh weights. It is only a
+    visible coordinate measuring point.
+
+    Why parent it to state.skeleton.root?
+      If a child is parented to the rig root, then child.position is already in
+      the rig's local coordinate space. That is exactly the kind of number you
+      need when tuning a sword offset or a hit-arc anchor.
+  */
+  if (!state.skeleton?.root) {
+    return;
+  }
+
+  if (!state.devProbe.group) {
+    buildDevProbe();
+  }
+
+  if (state.devProbe.group.parent !== state.skeleton.root) {
+    state.devProbe.group.parent?.remove(state.devProbe.group);
+    state.skeleton.root.add(state.devProbe.group);
+  }
+
+  applyDevProbePosition();
+}
+
+function buildDevProbe() {
+  /*
+    Builds one small visible sphere named devProbe.
+
+    depthTest is false so the marker can be seen through the mesh/rig while you
+    are using it as a measuring tool. renderOrder keeps it visually on top of
+    most debug helpers.
+  */
+  const group = new THREE.Group();
+  group.name = "devProbe";
+
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(DEV_PROBE_TWEAKS.radius, 16, 12),
+    new THREE.MeshBasicMaterial({
+      color: DEV_PROBE_TWEAKS.color,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+    }),
+  );
+
+  mesh.name = "devProbe-visible-sphere";
+  mesh.renderOrder = 40;
+  group.add(mesh);
+
+  const axes = new THREE.AxesHelper(DEV_PROBE_TWEAKS.radius * 4);
+  axes.name = "devProbe-mini-axes";
+  axes.renderOrder = 41;
+  group.add(axes);
+
+  state.devProbe.group = group;
+  state.devProbe.mesh = mesh;
+}
+
+function applyDevProbePosition() {
+  /*
+    Writes rigTuning.devProbeX/Y/Z into the visible marker.
+
+    Since devProbe is parented to skeleton.root:
+      group.position.x = local X relative to rig root
+      group.position.y = local Y relative to rig root
+      group.position.z = local Z relative to rig root
+  */
+  if (!state.devProbe.group) {
+    return;
+  }
+
+  state.devProbe.group.position.set(
+    rigTuning.devProbeX,
+    rigTuning.devProbeY,
+    rigTuning.devProbeZ,
+  );
+  state.devProbe.group.visible = Boolean(rigTuning.devProbeVisible);
+  updateDevProbeReadout();
+}
+
+function detachDevProbeFromSkeleton() {
+  /*
+    Protects the probe during skeleton rebuilds.
+
+    Sliders can rebuild the whole skeleton hierarchy. If the probe stayed inside
+    the old root, disposeObjectTree(state.skeleton.root) would dispose it too.
+    Detaching first keeps the probe object alive; syncDevProbeAttachment() then
+    attaches it to the fresh root.
+  */
+  state.devProbe.group?.parent?.remove(state.devProbe.group);
+}
+
+function toggleDevProbe() {
+  // Y key convenience toggle.
+  rigTuning.devProbeVisible = !rigTuning.devProbeVisible;
+  syncDevProbeAttachment();
+  updateGuiDisplays();
+  logDevProbeValues();
+}
+
+function moveDevProbeLocal(dx = 0, dy = 0, dz = 0) {
+  /*
+    Keyboard movement moves the probe in RIG-LOCAL space.
+
+    local += delta
+
+    Where:
+      local = { devProbeX, devProbeY, devProbeZ }
+      delta = small keyboard step on one or more axes
+  */
+  rigTuning.devProbeX = THREE.MathUtils.clamp(
+    rigTuning.devProbeX + dx,
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+  );
+  rigTuning.devProbeY = THREE.MathUtils.clamp(
+    rigTuning.devProbeY + dy,
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+  );
+  rigTuning.devProbeZ = THREE.MathUtils.clamp(
+    rigTuning.devProbeZ + dz,
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+  );
+
+  applyDevProbePosition();
+  updateGuiDisplays();
+}
+
+function handleDevProbeKeyboard(event) {
+  /*
+    TEMP / DEV MODE keyboard nudges.
+
+    Hold Shift so these controls do not steal normal gameplay keys:
+      Shift + J/L = local X left/right
+      Shift + U/O = local Y up/down
+      Shift + I/K = local Z forward/back
+
+    In this rig, local +Z is "forward" because movement uses:
+      forward = (sin(yaw), 0, cos(yaw))
+
+    At yaw = 0, forward is +Z.
+  */
+  if (!rigTuning.devProbeVisible || !event.shiftKey) {
+    return false;
+  }
+
+  const step = event.ctrlKey
+    ? rigTuning.devProbeStep * 4
+    : event.altKey
+      ? rigTuning.devProbeStep * 0.25
+      : rigTuning.devProbeStep;
+
+  if (event.code === "KeyJ") {
+    moveDevProbeLocal(-step, 0, 0);
+  } else if (event.code === "KeyL") {
+    moveDevProbeLocal(step, 0, 0);
+  } else if (event.code === "KeyU") {
+    moveDevProbeLocal(0, step, 0);
+  } else if (event.code === "KeyO") {
+    moveDevProbeLocal(0, -step, 0);
+  } else if (event.code === "KeyI") {
+    moveDevProbeLocal(0, 0, step);
+  } else if (event.code === "KeyK") {
+    moveDevProbeLocal(0, 0, -step);
+  } else {
+    return false;
+  }
+
+  event.preventDefault();
+  logDevProbeValues();
+  return true;
+}
+
+function getDevProbeVectors() {
+  /*
+    Returns both coordinate spaces for the same point.
+
+    The important Three.js conversion is:
+
+      rigLocalPoint = skeletonRoot.worldToLocal(worldPoint.clone())
+
+    Meaning:
+      worldPoint is the absolute scene coordinate.
+      skeletonRoot.worldToLocal(...) converts that absolute point into the
+      coordinate space of the rig/player root.
+
+    Because devProbe is already parented to skeletonRoot, devProbe.position and
+    rigLocalPoint should match. We still do the explicit worldToLocal conversion
+    here because it is the reusable formula for future tools.
+  */
+  const world = new THREE.Vector3();
+  const rigLocal = new THREE.Vector3();
+
+  if (!state.devProbe.group || !state.skeleton?.root) {
+    return { world, rigLocal };
+  }
+
+  state.skeleton.root.updateMatrixWorld(true);
+  state.devProbe.group.getWorldPosition(world);
+  rigLocal.copy(world);
+  state.skeleton.root.worldToLocal(rigLocal);
+
+  return { world, rigLocal };
+}
+
+function roundDevProbeValue(value) {
+  // Keeps copied coordinates readable without throwing away useful precision.
+  return Math.round(value * 1000) / 1000;
+}
+
+function formatDevProbeVector(vector) {
+  return `{ x: ${roundDevProbeValue(vector.x)}, y: ${roundDevProbeValue(
+    vector.y,
+  )}, z: ${roundDevProbeValue(vector.z)} }`;
+}
+
+function updateDevProbeReadout() {
+  if (!state.devProbe.group) {
+    return;
+  }
+
+  const { world, rigLocal } = getDevProbeVectors();
+
+  state.devProbe.readout.world = formatDevProbeVector(world);
+  state.devProbe.readout.rigLocal = formatDevProbeVector(rigLocal);
+  state.devProbe.readoutControllers.forEach((controller) =>
+    controller.updateDisplay(),
+  );
+}
+
+function logDevProbeValues() {
+  const { world, rigLocal } = getDevProbeVectors();
+
+  console.info("[devProbe] world", {
+    x: roundDevProbeValue(world.x),
+    y: roundDevProbeValue(world.y),
+    z: roundDevProbeValue(world.z),
+  });
+  console.info("[devProbe] rig local", {
+    x: roundDevProbeValue(rigLocal.x),
+    y: roundDevProbeValue(rigLocal.y),
+    z: roundDevProbeValue(rigLocal.z),
+  });
+}
+
+async function copyDevProbeRigLocal() {
+  /*
+    Copies the rig-local coordinate string.
+
+    Clipboard writes generally require a user gesture. A lil-gui button click is
+    a user gesture, so this should work in Live Server. If the browser blocks it,
+    the value is still logged to the console.
+  */
+  const { rigLocal } = getDevProbeVectors();
+  const text = formatDevProbeVector(rigLocal);
+
+  console.info("[devProbe] copy rig local", text);
+
+  try {
+    await navigator.clipboard?.writeText(text);
+  } catch (error) {
+    console.warn("[devProbe] clipboard write blocked; value logged instead", error);
+  }
+}
+
 function updateJumpPhysics(delta) {
   updateJumpState(controlState.jump, rigTuning, delta);
 }
@@ -2984,12 +4962,10 @@ function updateWalkMotion(delta, elapsed, options = {}) {
       the same way leg swing does. The 0.22 factor is about 65% of the leg swing
       amplitude â€” arms swing somewhat less dramatically than legs in most gaits.
   */
-  if (!state.walkArmSwing) {
-    state.walkArmSwing = { left: 0, right: 0 };
-  }
+  const walkArmSwing = ensureWalkArmSwingState();
 
-  state.walkArmSwing.left = -leftSwing * 0.22 * amplitude;
-  state.walkArmSwing.right = -rightSwing * 0.22 * amplitude;
+  walkArmSwing.left = -leftSwing * 0.22 * amplitude;
+  walkArmSwing.right = -rightSwing * 0.22 * amplitude;
 
   updateLegWalk("left", -1, phase, delta, amplitude);
   updateLegWalk("right", 1, phase + Math.PI, delta, amplitude);
@@ -3126,10 +5102,7 @@ function relaxLegs(delta) {
     The damp in updateControlledArm will smoothly interpolate from whatever
     swing was last set toward the now-zero target over the next few frames.
   */
-  if (state.walkArmSwing) {
-    state.walkArmSwing.left = 0;
-    state.walkArmSwing.right = 0;
-  }
+  resetWalkArmSwingState();
   const joints = state.skeleton.joints;
 
   /*
@@ -3175,6 +5148,76 @@ function relaxLegs(delta) {
         rigTuning.damping * 0.9,
       );
     });
+  });
+}
+
+function updateCombatStancePose(delta) {
+  /*
+    Small full-body combat stance layered after idle/leg relaxation.
+
+    This is intentionally conservative. The sword is still a prototype, so the
+    stance should read as "ready" without making the rig hard to inspect:
+      - body lowers a hair,
+      - pelvis/chest counter-rotate slightly,
+      - knees bend just enough to stop the T-pose mannequin feeling.
+
+    The arms are handled separately by getControlledArmPoseTargets("combat").
+    Keeping legs/body here and arms there makes future stance authoring easier:
+      body stance = this function
+      arm stance  = named pose block in getControlledArmPoseTargets()
+  */
+  if (controlState.jump.phase !== "grounded") {
+    return;
+  }
+
+  const joints = state.skeleton.joints;
+
+  dampJointPositionFromBind(
+    joints.body,
+    { x: 0, y: -0.026, z: -0.012 },
+    delta,
+    rigTuning.damping * 0.82,
+  );
+  dampJointRotation(
+    joints.pelvis,
+    new THREE.Euler(0.02, -0.055, 0.035),
+    delta,
+    rigTuning.damping * 0.78,
+  );
+  dampJointRotation(
+    joints.chest,
+    new THREE.Euler(-0.045, 0.07, -0.035),
+    delta,
+    rigTuning.damping * 0.76,
+  );
+  dampJointRotation(
+    joints.head,
+    new THREE.Euler(-0.012, 0.035, 0.01),
+    delta,
+    rigTuning.damping * 0.7,
+  );
+
+  ["left", "right"].forEach((sideName) => {
+    const side = sideName === "left" ? -1 : 1;
+
+    dampJointRotation(
+      joints[`${sideName}Hip`],
+      new THREE.Euler(0.075, side * 0.018, side * 0.055),
+      delta,
+      rigTuning.damping * 0.78,
+    );
+    dampJointRotation(
+      joints[`${sideName}Knee`],
+      new THREE.Euler(0.15, 0, side * 0.018),
+      delta,
+      rigTuning.damping * 0.78,
+    );
+    dampJointRotation(
+      joints[`${sideName}Ankle`],
+      new THREE.Euler(-0.045, side * 0.012, 0),
+      delta,
+      rigTuning.damping * 0.78,
+    );
   });
 }
 
@@ -3295,28 +5338,167 @@ function updateControlledArms(delta, currentTime) {
     Chooses active arm poses.
 
     A timed wave overrides normal left/right arm toggles until waveUntil passes.
+    A sword swing overrides the right arm for only the swing window, then drops
+    back to the combat stance if the weapon is still equipped.
   */
   const isWaving = currentTime < controlState.waveUntil;
+  const swordSwinging =
+    controlState.weaponEquipped && currentTime < controlState.swordSwingUntil;
+
+  if (
+    controlState.weaponEquipped &&
+    !swordSwinging &&
+    controlState.rightArm === "swing"
+  ) {
+    controlState.rightArm = "combat";
+  }
+
   const leftState = isWaving ? "wave" : controlState.leftArm;
-  const rightState = isWaving ? "wave" : controlState.rightArm;
+  let rightState = controlState.rightArm;
+
+  if (isWaving) {
+    rightState = "wave";
+  }
+
+  if (swordSwinging) {
+    rightState = "swing";
+  }
 
   updateControlledArm("left", -1, leftState, delta, currentTime);
   updateControlledArm("right", 1, rightState, delta, currentTime);
 }
 
-function updateControlledArm(sideName, side, pose, delta, currentTime) {
+function getControlledArmPoseTargets(sideName, side, pose, currentTime) {
   /*
-    Applies one controlled arm pose.
+    Returns target rotations for one controlled arm pose.
+
+    This is the "stance and swing library" starting point.
+
+    To add a future stance:
+      1. Pick a pose name, such as "guardHigh" or "thrust".
+      2. Add another else-if block below.
+      3. Return target Euler rotations for shoulder, elbow, wrist, and palm.
+      4. Set controlState.leftArm or controlState.rightArm to that pose name.
+
+    The updater below handles damping and joint lookup. Keeping the math here
+    makes it much easier to reason about what a pose actually means.
 
     Poses:
       down = relaxed idle trail  (default while standing or walking)
       half = both hands half high
       up   = selected arm high
       wave = temporary waving pose with wrist/palm oscillation
+      combat = right hand forward, ready to hold a weapon
+      swing  = timed sword attack pose
 
     side mirrors the pose across the body:
       left  side = -1
       right side = +1
+
+    Returned target meaning:
+      shoulder/elbow/wrist/palm are animation deltas, not absolute rotations.
+      dampJointRotation() adds each delta on top of that joint's bind pose.
+  */
+  const time = currentTime * 0.001;
+  const trail = Math.sin(time * 0.72 - 1.1) * rigTuning.armTrailAmplitude;
+  const handFloat =
+    Math.sin(time * 0.9 - 1.65) * rigTuning.armTrailAmplitude * 0.45;
+  const wave = pose === "wave" ? Math.sin(time * 9) * 0.45 : 0;
+  const swingProgress = THREE.MathUtils.clamp(
+    (currentTime - controlState.swordSwingStart) / SWORD_TWEAKS.swingDurationMs,
+    0,
+    1,
+  );
+  const swingSweep = physicsSmoothstep(0, 1, swingProgress);
+  const swingAccent = Math.sin(swingProgress * Math.PI);
+
+  /*
+    Read the current walk arm swing for this side.
+    state.walkArmSwing is written each frame by updateWalkMotion() when
+    the walk preview or active movement is running. It is zero otherwise.
+  */
+  const walkSwing = state.walkArmSwing?.[sideName] ?? 0;
+
+  /*
+    Default "down" pose: arm hangs with a slow independent trail oscillation.
+    walkSwing is added to the shoulder X to create natural gait counter-swing.
+    The trail's X contribution (trail * 0.12) still blends in. During walking,
+    the trail amplitude is typically small so it only adds subtle variation on
+    top of the gait swing.
+  */
+  let shoulder = new THREE.Euler(trail * 0.12 + walkSwing, 0, side * 0.16);
+  let elbow = new THREE.Euler(0.08, 0, side * 0.08);
+  let wrist = new THREE.Euler(handFloat * 0.08, 0, -side * handFloat * 0.26);
+  let palm = new THREE.Euler(0, 0, side * 0.04);
+
+  if (pose === "up") {
+    shoulder = new THREE.Euler(-0.2, 0, side * 2.2);
+    elbow = new THREE.Euler(0.16, 0, side * 0.22);
+  } else if (pose === "half") {
+    shoulder = new THREE.Euler(-0.08, 0, side * 1.12);
+    elbow = new THREE.Euler(0.18, 0, side * 0.2);
+  } else if (pose === "wave") {
+    shoulder = new THREE.Euler(-0.12, 0, side * 1.85);
+    elbow = new THREE.Euler(0.18, 0, side * (0.25 + wave));
+    wrist = new THREE.Euler(0.1, 0, side * wave * 0.8);
+    palm = new THREE.Euler(0.08, 0, side * wave * 0.65);
+  } else if (pose === "combat") {
+    /*
+      Sword guard pose:
+        shoulder brings the weapon side forward and away from the ribs,
+        elbow bends enough to keep the hand in front of the torso,
+        wrist/palm align the grip so the blade can read as held, not pasted on.
+
+      This is deliberately named "combat" for backward compatibility with the
+      existing Digit1 input and GUI buttons. Future named stances can live next
+      to this block without changing the key handling.
+    */
+    shoulder = new THREE.Euler(-0.48, side * 0.16, side * 0.96);
+    elbow = new THREE.Euler(0.58, -side * 0.04, side * 0.2);
+    wrist = new THREE.Euler(-0.24, side * 0.06, -side * 0.28);
+    palm = new THREE.Euler(0.1, 0, side * 0.14);
+  } else if (pose === "swing") {
+    /*
+      Sword swing pose:
+        swingProgress = elapsedSwingTime / swingDuration
+        swingSweep    = smoothstep(0, 1, swingProgress)
+        swingAccent   = sin(progress * PI)
+
+      swingSweep carries the arm from ready pose into follow-through.
+      swingAccent adds a middle-of-swing snap without changing the start/end.
+    */
+    shoulder = new THREE.Euler(
+      -0.7 + swingSweep * 0.86,
+      side * (0.16 - swingSweep * 0.42),
+      side * (1.08 - swingSweep * 0.86),
+    );
+    elbow = new THREE.Euler(
+      0.48 + swingAccent * 0.46,
+      -side * 0.03,
+      side * (0.22 - swingSweep * 0.2),
+    );
+    wrist = new THREE.Euler(
+      -0.34 + swingSweep * 0.62,
+      side * 0.04,
+      -side * (0.3 + swingAccent * 0.42),
+    );
+    palm = new THREE.Euler(
+      0.16 + swingAccent * 0.22,
+      0,
+      side * (0.18 - swingSweep * 0.62),
+    );
+  }
+
+  return { shoulder, elbow, wrist, palm };
+}
+
+function updateControlledArm(sideName, side, pose, delta, currentTime) {
+  /*
+    Applies one controlled arm pose.
+
+    getControlledArmPoseTargets() decides what the named pose should look like.
+    This function only finds the live joints and damps them toward those target
+    rotations, which keeps pose design separate from frame-by-frame plumbing.
 
     ARM COUNTER-SWING DURING WALK:
       When the puppet is walking, updateWalkMotion() stores the current arm
@@ -3337,56 +5519,17 @@ function updateControlledArm(sideName, side, pose, delta, currentTime) {
   const elbow = joints[`${sideName}Elbow`];
   const wrist = joints[`${sideName}Wrist`];
   const palm = joints[`${sideName}Palm`];
-  const time = currentTime * 0.001;
-  const trail = Math.sin(time * 0.72 - 1.1) * rigTuning.armTrailAmplitude;
-  const handFloat =
-    Math.sin(time * 0.9 - 1.65) * rigTuning.armTrailAmplitude * 0.45;
-  const wave = pose === "wave" ? Math.sin(time * 9) * 0.45 : 0;
-
-  /*
-    Read the current walk arm swing for this side.
-    state.walkArmSwing is written each frame by updateWalkMotion() when
-    the walk preview or active movement is running. It is zero otherwise.
-  */
-  const walkSwing = state.walkArmSwing?.[sideName] ?? 0;
-
-  /*
-    Default "down" pose: arm hangs with a slow independent trail oscillation.
-    walkSwing is added to the shoulder X to create natural gait counter-swing.
-    The trail's X contribution (trail * 0.12) still blends in â€” during walking,
-    the trail amplitude is typically small so it only adds subtle variation on
-    top of the gait swing.
-  */
-  let shoulderTarget = new THREE.Euler(
-    trail * 0.12 + walkSwing,
-    0,
-    side * 0.16,
+  const targets = getControlledArmPoseTargets(
+    sideName,
+    side,
+    pose,
+    currentTime,
   );
-  let elbowTarget = new THREE.Euler(0.08, 0, side * 0.08);
-  let wristTarget = new THREE.Euler(
-    handFloat * 0.08,
-    0,
-    -side * handFloat * 0.26,
-  );
-  let palmTarget = new THREE.Euler(0, 0, side * 0.04);
 
-  if (pose === "up") {
-    shoulderTarget = new THREE.Euler(-0.2, 0, side * 2.2);
-    elbowTarget = new THREE.Euler(0.16, 0, side * 0.22);
-  } else if (pose === "half") {
-    shoulderTarget = new THREE.Euler(-0.08, 0, side * 1.12);
-    elbowTarget = new THREE.Euler(0.18, 0, side * 0.2);
-  } else if (pose === "wave") {
-    shoulderTarget = new THREE.Euler(-0.12, 0, side * 1.85);
-    elbowTarget = new THREE.Euler(0.18, 0, side * (0.25 + wave));
-    wristTarget = new THREE.Euler(0.1, 0, side * wave * 0.8);
-    palmTarget = new THREE.Euler(0.08, 0, side * wave * 0.65);
-  }
-
-  dampJointRotation(shoulder, shoulderTarget, delta, rigTuning.damping);
-  dampJointRotation(elbow, elbowTarget, delta, rigTuning.damping);
-  dampJointRotation(wrist, wristTarget, delta, rigTuning.damping);
-  dampJointRotation(palm, palmTarget, delta, rigTuning.damping);
+  dampJointRotation(shoulder, targets.shoulder, delta, rigTuning.damping);
+  dampJointRotation(elbow, targets.elbow, delta, rigTuning.damping);
+  dampJointRotation(wrist, targets.wrist, delta, rigTuning.damping);
+  dampJointRotation(palm, targets.palm, delta, rigTuning.damping);
 }
 
 function updateCamera(delta) {
@@ -3463,6 +5606,133 @@ function getScenePointer(event) {
   return mouseJointEditor.pointer;
 }
 
+function handleDevProbePointerDown(event) {
+  /*
+    TEMP / DEV MODE mouse drag start for devProbe.
+
+    This is deliberately separate from handleJointEditPointerDown():
+      - joint dragging edits skeleton pivot data
+      - probe dragging edits only devProbeX/Y/Z
+
+    Both systems use the same Three.js idea:
+      1. raycast from the camera through the mouse
+      2. find the clicked object
+      3. create a camera-facing drag plane
+      4. convert dragged world points into the desired local space
+  */
+  if (
+    event.defaultPrevented ||
+    !rigTuning.devProbeVisible ||
+    !state.devProbe.mesh ||
+    !state.skeleton?.root
+  ) {
+    return;
+  }
+
+  state.devProbe.raycaster.setFromCamera(getScenePointer(event), camera);
+  const intersections = state.devProbe.raycaster.intersectObject(
+    state.devProbe.mesh,
+    false,
+  );
+
+  if (!intersections.length) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopImmediatePropagation?.();
+  sceneContainer.setPointerCapture?.(event.pointerId);
+
+  state.skeleton.root.updateMatrixWorld(true);
+  state.devProbe.group.getWorldPosition(state.devProbe.dragStartWorld);
+  state.devProbe.dragStartLocal.copy(state.devProbe.group.position);
+
+  const cameraNormal = new THREE.Vector3();
+  camera.getWorldDirection(cameraNormal).normalize();
+  state.devProbe.dragPlane.setFromNormalAndCoplanarPoint(
+    cameraNormal,
+    state.devProbe.dragStartWorld,
+  );
+
+  state.devProbe.raycaster.ray.intersectPlane(
+    state.devProbe.dragPlane,
+    state.devProbe.dragCurrentWorld,
+  );
+
+  state.devProbe.dragStartRootLocal.copy(state.devProbe.dragCurrentWorld);
+  state.skeleton.root.worldToLocal(state.devProbe.dragStartRootLocal);
+  state.devProbe.dragging = true;
+}
+
+function handleDevProbePointerMove(event) {
+  /*
+    Drags devProbe along the camera-facing plane.
+
+    Formula:
+      currentRootLocal = root.worldToLocal(currentWorldPoint)
+      localDelta       = currentRootLocal - dragStartRootLocal
+      desiredLocal     = dragStartLocal + localDelta
+
+    desiredLocal is then stored in rigTuning.devProbeX/Y/Z so GUI sliders,
+    keyboard movement, copy/log, and mouse drag all share the same source data.
+  */
+  if (!state.devProbe.dragging || !state.skeleton?.root) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopImmediatePropagation?.();
+  state.devProbe.raycaster.setFromCamera(getScenePointer(event), camera);
+
+  const hit = state.devProbe.raycaster.ray.intersectPlane(
+    state.devProbe.dragPlane,
+    state.devProbe.dragCurrentWorld,
+  );
+
+  if (!hit) {
+    return;
+  }
+
+  state.devProbe.dragCurrentRootLocal.copy(state.devProbe.dragCurrentWorld);
+  state.skeleton.root.worldToLocal(state.devProbe.dragCurrentRootLocal);
+
+  const localDelta = state.devProbe.dragCurrentRootLocal
+    .clone()
+    .sub(state.devProbe.dragStartRootLocal);
+  const desiredLocal = state.devProbe.dragStartLocal.clone().add(localDelta);
+
+  rigTuning.devProbeX = THREE.MathUtils.clamp(
+    desiredLocal.x,
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+  );
+  rigTuning.devProbeY = THREE.MathUtils.clamp(
+    desiredLocal.y,
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+  );
+  rigTuning.devProbeZ = THREE.MathUtils.clamp(
+    desiredLocal.z,
+    DEV_PROBE_TWEAKS.min,
+    DEV_PROBE_TWEAKS.max,
+  );
+
+  applyDevProbePosition();
+  updateGuiDisplays();
+}
+
+function handleDevProbePointerUp(event) {
+  if (!state.devProbe.dragging) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopImmediatePropagation?.();
+  state.devProbe.dragging = false;
+  sceneContainer.releasePointerCapture?.(event.pointerId);
+  logDevProbeValues();
+}
+
 function handleJointEditPointerDown(event) {
   /*
     Starts a joint-point drag.
@@ -3505,6 +5775,10 @@ function handleJointEditPointerDown(event) {
     the render loop just ran before the user clicked. See handleJointEditPointerMove
     for the explanation of why later events need an explicit updateMatrixWorld().
   */
+  if (event.defaultPrevented) {
+    return;
+  }
+
   if (
     !rigTuning.mouseJointEditMode ||
     !rigTuning.labEnabled ||
@@ -3557,6 +5831,18 @@ function handleJointEditPointerDown(event) {
   mouseJointEditor.dragStartLocal.copy(joint.userData.bindLocalPosition);
 
   /*
+    G53 "hold child points" records descendant positions before the selected
+    joint starts moving. During pointermove, those descendants can then be
+    written back to the same rig-local locations by changing their local offsets.
+
+    This makes pivot placement feel like moving independent layout points while
+    still storing the final result in the real parent-child skeleton.
+  */
+  state.skeleton.root.updateMatrixWorld(true);
+  mouseJointEditor.preservedDescendantRootLocals =
+    captureG53PreservedDescendantRootLocals(joint);
+
+  /*
     Build the camera-facing drag plane.
 
     getWorldDirection() returns a unit vector pointing OUT of the camera lens.
@@ -3590,6 +5876,192 @@ function handleJointEditPointerDown(event) {
   );
 
   mouseJointEditor.dragging = true;
+}
+
+function applyG53AxisLocksToDesiredLocal(desiredLocal, dragStartLocal) {
+  /*
+    TEMP / DEV PRECISION RIGGING: G53 axis locks.
+
+    WHY THIS EXISTS:
+      In a 3D scene viewed through a 2D screen, a mouse drag can accidentally
+      introduce movement on an axis that is hard to see from the current camera
+      angle. That is especially annoying during rigging, because a tiny unseen
+      Z drift can spoil a carefully placed X/Y joint.
+
+    WHEN IT RUNS:
+      Only while G53 machine-home rigging mode is active. Outside G53 mode,
+      mouse point editing behaves exactly like it did before this feature.
+
+    FORMULA:
+      finalAxis = allowAxis ? desiredAxis : dragStartAxis
+
+      where:
+        desiredAxis   = the local coordinate produced by the mouse drag
+        dragStartAxis = the local coordinate the joint had when the click began
+        allowAxis     = the checkbox value in G53 Rigging Mode
+
+    EXAMPLE:
+      If "allow X" is on and "allow Y/Z" are off, the pointer may still move
+      across the screen freely, but only desiredLocal.x is allowed to change.
+      desiredLocal.y and desiredLocal.z are restored to their drag-start values
+      before offsets are calculated.
+
+    MUTATION NOTE:
+      This function intentionally edits desiredLocal in place. The caller then
+      uses that one corrected vector to calculate saved joint offsets.
+  */
+  if (!state.g53RiggingMode.active) {
+    return desiredLocal;
+  }
+
+  if (!rigTuning.g53AllowX) {
+    desiredLocal.x = dragStartLocal.x;
+  }
+
+  if (!rigTuning.g53AllowY) {
+    desiredLocal.y = dragStartLocal.y;
+  }
+
+  if (!rigTuning.g53AllowZ) {
+    desiredLocal.z = dragStartLocal.z;
+  }
+
+  return desiredLocal;
+}
+
+function captureG53PreservedDescendantRootLocals(selectedJoint) {
+  /*
+    Captures where the selected joint's descendants are at drag start, measured
+    in skeleton-root local space.
+
+    This is only used when:
+      - G53 rigging mode is active
+      - "hold child points" is enabled
+
+    WHY ROOT-LOCAL SPACE:
+      World space includes the player's current scene position and yaw. Root-local
+      space strips that away and gives us "coordinates on the workpiece," which
+      is the machinist-friendly coordinate system for rigging.
+
+    WHAT GETS STORED:
+      [
+        { jointKey: "leftElbow", rootLocal: Vector3, depth: 1 },
+        { jointKey: "leftWrist", rootLocal: Vector3, depth: 2 },
+        ...
+      ]
+
+    Descendants are sorted parent-first so compensation is stable:
+      shoulder compensation runs before elbow compensation,
+      elbow compensation runs before wrist compensation,
+      and so on.
+  */
+  if (!state.g53RiggingMode.active || !rigTuning.g53PreserveChildPoints) {
+    return [];
+  }
+
+  const root = state.skeleton?.root;
+
+  if (!selectedJoint || !root) {
+    return [];
+  }
+
+  const jointKeyByObject = new Map(
+    Object.entries(state.skeleton.joints).map(([key, joint]) => [joint, key]),
+  );
+  const preserved = [];
+  const worldPosition = new THREE.Vector3();
+
+  function visitDescendant(joint, depth) {
+    if (!joint.userData.isPuppetJoint) {
+      return;
+    }
+
+    const jointKey = jointKeyByObject.get(joint);
+
+    if (jointKey && JOINT_ORDER.includes(jointKey)) {
+      joint.getWorldPosition(worldPosition);
+      preserved.push({
+        jointKey,
+        rootLocal: root.worldToLocal(worldPosition.clone()),
+        depth,
+      });
+    }
+
+    joint.children.forEach((child) => {
+      visitDescendant(child, depth + 1);
+    });
+  }
+
+  selectedJoint.children.forEach((child) => {
+    visitDescendant(child, 1);
+  });
+
+  return preserved.sort((a, b) => a.depth - b.depth);
+}
+
+function applyG53PreservedDescendantRootLocals() {
+  /*
+    Keeps child points visually fixed while their parent point is dragged.
+
+    THE PROBLEM THIS SOLVES:
+      In a normal skeleton, moving a parent joint carries every child joint. That
+      is exactly what we want during animation, but it feels too rigid during
+      mesh fitting. When placing pivots, you often want to move the shoulder
+      socket without dragging the elbow/wrist points you already placed.
+
+    THE IDEA:
+      During pointerdown, capture each descendant's root-local coordinate.
+      During pointermove, after the selected parent joint moves, convert each
+      captured root-local coordinate back into the descendant's CURRENT parent
+      space and save that as a new local offset.
+
+    FORMULA FOR EACH PRESERVED DESCENDANT:
+      desiredWorld       = skeletonRoot.localToWorld(savedRootLocal)
+      desiredParentLocal = descendant.parent.worldToLocal(desiredWorld)
+      offset             = desiredParentLocal - baseBindLocalPosition
+
+    The hierarchy is still real. We are not deleting parent-child relationships.
+    We are simply recalculating child local positions so the final bind pose
+    matches the geometry you placed on screen.
+  */
+  if (
+    !state.g53RiggingMode.active ||
+    !rigTuning.g53PreserveChildPoints ||
+    !mouseJointEditor.preservedDescendantRootLocals.length
+  ) {
+    return;
+  }
+
+  const root = state.skeleton?.root;
+
+  if (!root) {
+    return;
+  }
+
+  mouseJointEditor.preservedDescendantRootLocals.forEach(
+    ({ jointKey, rootLocal }) => {
+      const joint = state.skeleton.joints[jointKey];
+
+      if (!joint?.parent) {
+        return;
+      }
+
+      const desiredParentLocal = root.localToWorld(rootLocal.clone());
+
+      joint.parent.worldToLocal(desiredParentLocal);
+      setJointPointOffsetFromLocalPosition(jointKey, desiredParentLocal);
+
+      /*
+        Update immediately because later descendants may use this joint as their
+        parent. Example: after preserving the elbow, the wrist conversion needs
+        the elbow's fresh matrixWorld.
+      */
+      root.updateMatrixWorld(true);
+    },
+  );
+
+  state.debugView?.refreshBones?.();
+  updateAxisMarkerAttachment();
 }
 
 function handleJointEditPointerMove(event) {
@@ -3645,7 +6117,11 @@ function handleJointEditPointerMove(event) {
     have fired since the last render.
   */
 
-  if (!mouseJointEditor.dragging || !mouseJointEditor.selectedJointKey) {
+  if (
+    event.defaultPrevented ||
+    !mouseJointEditor.dragging ||
+    !mouseJointEditor.selectedJointKey
+  ) {
     return;
   }
 
@@ -3715,30 +6191,18 @@ function handleJointEditPointerMove(event) {
   const desiredLocal = mouseJointEditor.dragStartLocal.clone().add(localDelta);
 
   /*
-    Offsets are stored relative to the BASE bind position, not absolute local
-    positions. This means:
-      offset = desiredLocal - baseBindLocalPosition
-
-    Keeping offsets separate from the base position makes it easy to reset to
-    defaults (zero the offset) or export/import rig tuning snapshots.
+    G53 axis locks happen before offset math. That means the locked coordinate
+    never gets saved into rigTuning in the first place; the prevented movement is
+    not merely hidden on screen.
   */
-  const base = joint.userData.baseBindLocalPosition;
-  const offset = getJointPointOffset(mouseJointEditor.selectedJointKey);
+  applyG53AxisLocksToDesiredLocal(
+    desiredLocal,
+    mouseJointEditor.dragStartLocal,
+  );
 
-  offset.x = THREE.MathUtils.clamp(
-    desiredLocal.x - base.x,
-    JOINT_POINT_OFFSET_RANGE.min,
-    JOINT_POINT_OFFSET_RANGE.max,
-  );
-  offset.y = THREE.MathUtils.clamp(
-    desiredLocal.y - base.y,
-    JOINT_POINT_OFFSET_RANGE.min,
-    JOINT_POINT_OFFSET_RANGE.max,
-  );
-  offset.z = THREE.MathUtils.clamp(
-    desiredLocal.z - base.z,
-    JOINT_POINT_OFFSET_RANGE.min,
-    JOINT_POINT_OFFSET_RANGE.max,
+  setJointPointOffsetFromLocalPosition(
+    mouseJointEditor.selectedJointKey,
+    desiredLocal,
   );
 
   applyJointPointOffsets();
@@ -3764,6 +6228,8 @@ function handleJointEditPointerMove(event) {
     skeleton will return correct results for the rest of this event cycle.
   */
   state.skeleton.root.updateMatrixWorld(true);
+  applyG53PreservedDescendantRootLocals();
+  state.skeleton.root.updateMatrixWorld(true);
 
   syncImportedSkinToPuppet();
   updateGuiDisplays();
@@ -3775,6 +6241,7 @@ function handleJointEditPointerUp(event) {
   }
 
   mouseJointEditor.dragging = false;
+  mouseJointEditor.preservedDescendantRootLocals = [];
   sceneContainer.releasePointerCapture?.(event.pointerId);
 }
 
@@ -3797,7 +6264,35 @@ function handleWheelZoom(event) {
   );
 }
 
-//function handleKeyDown(event) {
+function handleG53HotkeyCapture(event) {
+  /*
+    Capture-phase safety net for F2.
+
+    WHY THIS EXISTS:
+      The normal handleKeyDown() listener runs during the bubbling phase. That is
+      fine while the canvas has focus, but after using the file picker or certain
+      lil-gui controls, the focused UI element/browser layer may intercept
+      function keys before the bubbling listener receives them.
+
+    F2 is important enough to treat like an emergency machine-home switch:
+      - catch it early in the capture phase
+      - prevent browser/default UI behavior
+      - stop it from reaching the bubbling handleKeyDown() and toggling twice
+
+    This function ONLY handles F2. Regular movement, combat, devProbe, and other
+    keys still go through the existing handleKeyDown() path.
+  */
+  if (event.code !== "F2") {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopImmediatePropagation();
+
+  if (!event.repeat) {
+    toggleG53RiggingMode();
+  }
+}
 
 function handleKeyUp(event) {
   // Key state is stored as a set so multiple keys can be held at the same time.
@@ -3819,7 +6314,29 @@ function handleKeyDown(event) {
       H     = toggle both hands half high
       Space = wave
       J     = jump
+      1     = equip sword and enter combat stance
+      2     = despawn sword and return arms to idle
+      Enter = sword swing / combat hit attempt
+      F2    = toggle G53 machine-home rigging mode
+      Y     = toggle TEMP devProbe marker
+      Shift + J/L = move devProbe local X
+      Shift + U/O = move devProbe local Y
+      Shift + I/K = move devProbe local Z
   */
+  if (event.code === "F2") {
+    event.preventDefault();
+
+    if (!event.repeat) {
+      toggleG53RiggingMode();
+    }
+
+    return;
+  }
+
+  if (handleDevProbeKeyboard(event)) {
+    return;
+  }
+
   if (event.repeat) {
     return;
   }
@@ -3849,6 +6366,14 @@ function handleKeyDown(event) {
     controlState.wasWaving = true;
   } else if (event.code === "KeyJ") {
     startJump();
+  } else if (event.code === "Digit1") {
+    equipSword();
+  } else if (event.code === "Digit2") {
+    despawnSword();
+  } else if (event.code === "Enter" || event.code === "NumpadEnter") {
+    startSwordSwing();
+  } else if (event.code === "KeyY") {
+    toggleDevProbe();
   }
 }
 
@@ -3874,10 +6399,15 @@ buildSkeletonWorkshop();
 buildGui();
 resizeRendererToContainer();
 
+window.addEventListener("keydown", handleG53HotkeyCapture, { capture: true });
 window.addEventListener("keydown", handleKeyDown);
 window.addEventListener("keyup", handleKeyUp);
 window.addEventListener("resize", resizeRendererToContainer);
 sceneContainer.addEventListener("wheel", handleWheelZoom, { passive: false });
+sceneContainer.addEventListener("pointerdown", handleDevProbePointerDown);
+sceneContainer.addEventListener("pointermove", handleDevProbePointerMove);
+sceneContainer.addEventListener("pointerup", handleDevProbePointerUp);
+sceneContainer.addEventListener("pointercancel", handleDevProbePointerUp);
 sceneContainer.addEventListener("pointerdown", handleJointEditPointerDown);
 sceneContainer.addEventListener("pointermove", handleJointEditPointerMove);
 sceneContainer.addEventListener("pointerup", handleJointEditPointerUp);

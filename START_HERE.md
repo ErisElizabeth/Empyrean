@@ -22,7 +22,7 @@ If those three things work, the project is in a sane state.
 
 ## Current Build
 
-Current build: `0.1.21-alpha`
+Current build: `0.1.36-alpha`
 
 The project currently has:
 
@@ -37,6 +37,24 @@ The project currently has:
 - Rig Mesh Mode
 - World Debug collision overlays
 - encounter trigger zones
+- sword combat prototype
+- enemy health bar and difficulty setting
+- TEMP devProbe coordinate marker
+- Skeleton Lab guide opacity slider
+- G53-style machine-home rigging mode shell
+- G53 visibility fixture for uncluttered pivot tuning
+- G53 combat visual suppression
+- G53 X/Y/Z axis locks for precision joint dragging
+- G53 hold-child-points mode for less rigid pivot fitting
+- G53 pose freeze that disables arm/jump/relaxation solvers while rigging
+- capture-phase F2 hotkey recovery after local mesh loading
+- cold-start-safe G53 entry and recovery
+- bind-pose-aware generated skin side selection
+- Sigewynn default temp mesh and plainSword combat prop
+- post-rig gameplay arm restore after preview rigging
+- named arm pose resolver for easier stance/swing edits
+- relaxed-arm snapshot restore for returning from T/A rigging poses
+- Sword Offsets GUI for tuning/reloading the weapon prop without code edits
 - solo workflow docs
 - checkpoint and verify scripts
 
@@ -59,6 +77,7 @@ main.js
 physics.js
 rig.js
 encounters.js
+combat_updated.js
 styles.css
 index.html
 ```
@@ -103,8 +122,9 @@ Recommended flow:
 3. Click `1 render mesh`.
 4. Tune pivots with `Joint Point Offsets`.
 5. Try `A pose` only if the mesh shoulders need it.
-6. Click `2 rig rendered mesh`.
-7. Test walk, jump, arms, and idle.
+6. Use `T pose` when the source mesh is modeled straight out from the shoulders.
+7. Click `2 rig mesh`; preview rigging now restores the captured relaxed gameplay arms after binding.
+8. Test walk, jump, arms, idle, `1` combat stance, and `Enter` sword swing.
 
 ## Good 15-Minute Tasks
 
@@ -114,6 +134,11 @@ Recommended flow:
 - Tune camera distance in `SOLO_TWEAKS.camera`.
 - Turn on World Debug and screenshot the collision layout for yourself.
 - Export a rig package from the GUI after a good tuning pass.
+- Open `Combat`, set difficulty, press `1`, and test whether the sword scale/hand angle feels right.
+- Use `Sword Offsets` to tune `plainSword.glb` position, length, grip point, pitch, yaw, and roll live.
+- Use `Mesh > restore gameplay arms` if a test pose or old saved arm command leaves the arms raised after rigging.
+- Press `Y`, move `devProbe`, and copy rig-local values for sword or hitbox experiments.
+- Press `F2`, tune a pivot at machine home, then press `F2` again to confirm gameplay restores cleanly.
 
 ## Save These For A Longer Session
 

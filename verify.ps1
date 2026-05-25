@@ -83,7 +83,10 @@ Write-Host ""
 Write-Host "Checking common assets..."
 $AssetFiles = @(
   "assets/femaleMesh.glb",
+  "assets/Sigewynn.glb",
   "assets/enemy.glb",
+  "assets/sword.glb",
+  "assets/plainSword.glb",
   "assets/Jupiter.jpg",
   "assets/background.mp3",
   "assets/battle.mp3",

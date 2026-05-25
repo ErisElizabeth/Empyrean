@@ -4,7 +4,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.21-alpha`
+- Empyrean build: `0.1.36-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -37,7 +37,21 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - mouse drag joint point editing
 - first physics and rig module split
 - 5% opacity default-height wireframe disk
-- combat encounter prototype with enemy GLB, battle audio, dice roll, hitbox, and evasion
+- combat encounter prototype with enemy GLB, battle audio, dice roll, hitbox, evasion, health bar, and right-hand sword attacks
+- TEMP devProbe coordinate marker for measuring rig-relative attachment points
+- skeleton guide opacity control for viewing the rigged mesh more clearly
+- G53-style machine-home rigging mode shell for stable pivot tuning
+- G53 visibility fixture that hides walls/ceilings/clutter while rigging
+- G53 combat-visual suppression for cleaner measuring near machine home
+- G53 X/Y/Z axis locks for mouse joint dragging
+- G53 hold-child-points mode for independent pivot fitting
+- G53 pose freeze that disables animation solvers during pivot fitting
+- capture-phase F2 hotkey recovery after local mesh loading
+- cold-start-safe G53 entry and failed-enter recovery
+- bind-pose-aware generated skin side selection for rotated meshes
+- Sigewynn default temp mesh, plainSword combat prop, post-rig gameplay arm restore, and a named arm pose resolver for easier stance/swing work
+- relaxed-arm snapshot restore so T/A rigging poses do not become permanent gameplay poses
+- saved `Sword Offsets` GUI controls for sword path, length, grip, position, pitch, yaw, and roll
 
 ---
 
@@ -70,7 +84,8 @@ skin.js             ← the mesh-fitting station
 
 combat_updated.js   <- the encounter prototype station
                       owns the combat trigger, enemy.glb loader/fit, hitbox,
-                      battle.mp3 crossfade, d20 roll, and simple evasion
+                      battle.mp3 crossfade, d20 roll, simple evasion,
+                      health, hiding, and sword-hit validation
 
 physics.js          ← the math reference binder
                       pure formulas only — jump gravity, launch velocity,
@@ -123,13 +138,16 @@ encounters.js
 
 The rule: nothing imports from main.js. main.js is the only thing that pulls everything together. If world.js or skin.js needed something from main.js, that would be a circular dependency — like a parts station trying to call the floor supervisor to ask for a part the floor supervisor asked the parts station to make in the first place. Instead, main.js passes what each station needs as a parameter when it calls them.
 
-Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, and calls `updateCombatEncounter(delta)` once per animation frame. `combat_updated.js` owns its own trigger, enemy GLB fitting, hitbox, d20, battle audio, and evasion state.
+Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, calls `updateCombatEncounter(delta)` once per animation frame, and calls `attemptCombatSwordHit()` only when the player swings. `main.js` owns the sword model and arm pose. `combat_updated.js` owns trigger state, enemy GLB fitting, hitbox, d20, battle audio, evasion, health, hiding, and victory.
 
 ### Where to Make Common Changes
 
 | You want to change... | Go to... |
 |---|---|
 | Movement speed, camera feel, colors, audio | `SOLO_TWEAKS` near the top of `main.js` |
+| Sword asset path, scale, grip origin, hand offset, pitch/yaw/roll | `Sword Offsets` in the GUI |
+| Sword default values, swing timing, hit range | `SWORD_TWEAKS` near the top of `main.js` |
+| Arm stances and sword swing rotations | `getControlledArmPoseTargets()` in `main.js` |
 | Room size, wall colors, ghost sphere count | `WORLD_TWEAKS` near the top of `world.js` |
 | Default body proportions | `DEFAULT_RIG_DIMENSIONS` in `rig.js` |
 | Trigger zones (enter/exit events) | `encounters.js` |
@@ -141,6 +159,21 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 
 ## Change Notes
 
+- `0.1.36-alpha`: Fixed sword visibility by repairing the grip-point normalization path that aborted sword loading, retuning the default sword pitch away from the screen edge, lightly boosting dark sword materials, and simplifying sword fitting so repeated length/grip slider edits recalculate from the original GLB transform without drift.
+- `0.1.35-alpha`: Added a saved `Sword Offsets` GUI section so sword asset path, length/scale, grip point, position, pitch, yaw, and roll can be tuned live instead of hard-coded.
+- `0.1.34-alpha`: Fixed the T-pose restore workflow by capturing the relaxed arm bind rotations before applying A/T start poses, restoring that snapshot after rigging, and clearing active arm/sword commands so `restore gameplay arms` returns to true relaxed posture.
+- `0.1.33-alpha`: Switched the combat prop to `assets/plainSword.glb`, added grip-point sword normalization, made `assets/Sigewynn.glb` the default temp mesh, added post-rig gameplay arm restoration after preview rigging, separated arm stance/swing math into `getControlledArmPoseTargets()`, and added a subtle full-body combat stance.
+- `0.1.32-alpha`: Fixed cold-start F2/G53 entry by initializing walk-arm swing state at startup, guarding G53 pose freeze, and adding rollback recovery if G53 setup ever fails mid-entry.
+- `0.1.31-alpha`: Added a capture-phase F2 hotkey safety net and scene-focus restore after local file picker imports so G53 mode still toggles after loading a new mesh.
+- `0.1.30-alpha`: Added a full G53 pose freeze so arm trail, arm damping, leg relaxation, and jump pose overlays cannot move skeleton points while rigging pivots.
+- `0.1.29-alpha`: Added G53 `hold child points`, which keeps descendants visually fixed while dragging a parent pivot by recalculating descendant local offsets from saved root-local positions.
+- `0.1.28-alpha`: Updated generated skin weighting so left/right arm and leg regions choose the nearest bind-pose skeleton side instead of assuming negative X is always left. This keeps side assignment stable when a 180-degree Y bind rotation flips the visible skeleton sides.
+- `0.1.27-alpha`: Added G53 X/Y/Z axis locks to mouse joint dragging so unchecked axes remain fixed at their drag-start local coordinate during precision pivot tuning.
+- `0.1.26-alpha`: Added combat visual suppression to G53 mode so the encounter trigger cylinder, enemy hitbox, enemy health bar, and d20 are hidden during precision rigging and restored afterward.
+- `0.1.25-alpha`: Added Pass 2 of G53 rigging mode: tagged world geometry for rigging visibility, hid walls/ceilings/trees/ghost spheres/Jupiter during G53 mode, kept floors as faint reference planes, and restored original visibility/material state on exit.
+- `0.1.24-alpha`: Added Pass 1 of G53-style machine-home rigging mode: `F2` toggle, state save/restore, home position/yaw, frozen idle/walk drift, locked player movement during rigging, enabled mouse joint editing, and GUI status/buttons.
+- `0.1.23-alpha`: Added the TEMP `devProbe` coordinate marker with GUI sliders, mouse drag, Shift-key nudging, world/rig-local readouts, copy/log buttons, and a Skeleton Lab guide-opacity slider.
+- `0.1.22-alpha`: Added right-hand sword loading from `assets/sword.glb`, keyboard/GUI combat stance and swing controls, enemy health bar, Easy/Medium/Hard hit counts, and the hide/re-find loop after each non-lethal hit.
 - `0.1.21-alpha`: Moved the active combat module to `combat_updated.js` because VS Code was refusing to save `combat.js`; `main.js` and `verify.ps1` now import/check the new file.
 - `0.1.20-alpha`: Tightened the combat prototype by parenting the enemy hitbox to the enemy group, auto-fitting `enemy.glb` to a target height and floor alignment, and making the d20 evasion tier actually move the enemy during the active phase.
 - `0.1.19-alpha`: Added pelvis carrier walk motion with tunable hip sway, bob, tilt, and twist sliders so the hips shift weight over the planted foot instead of riding forward like a locked block.
@@ -179,8 +212,101 @@ Open this folder with VS Code Live Server and launch `index.html`.
 - `H`: toggle both hands half high.
 - `J`: jump.
 - `Space`: wave both arms.
+- `1`: equip `assets/plainSword.glb` in the right hand and enter combat stance.
+- `2`: despawn the sword and return arms to idle.
+- `Enter`: swing the sword and attempt a combat hit.
+- `F2`: toggle G53-style machine-home rigging mode.
+- `Y`: toggle the TEMP `devProbe` coordinate marker.
+- `Shift` + `J` / `L`: move `devProbe` local X left/right.
+- `Shift` + `U` / `O`: move `devProbe` local Y up/down.
+- `Shift` + `I` / `K`: move `devProbe` local Z forward/back.
 - `R`: toggle skeleton lab.
 - `L`: toggle joint labels.
+
+## TEMP Dev Probe
+
+`devProbe` is a temporary measuring marker, not gameplay. It lives in `main.js` and is clearly marked `TEMP / DEV MODE`.
+
+Step-by-step use:
+
+1. Press `Y`, or open `TEMP Dev Probe > visible`.
+2. Move the marker with the GUI `local X/Y/Z` sliders, mouse-drag the yellow sphere, or use the Shift-key nudges.
+3. Watch `world` and `rig local` in the `TEMP Dev Probe` GUI folder.
+4. Click `log values` to print both coordinate spaces to the console.
+5. Click `copy rig local` to copy a value like `{ x: 0.25, y: 1.1, z: -0.4 }`.
+
+Why the rig-local number matters:
+
+```js
+const worldPoint = new THREE.Vector3();
+devProbe.getWorldPosition(worldPoint);
+
+const rigLocalPoint = worldPoint.clone();
+skeletonRoot.worldToLocal(rigLocalPoint);
+```
+
+`getWorldPosition()` gives the absolute scene coordinate. `skeletonRoot.worldToLocal()` converts that same point into the player/root coordinate system. Because `devProbe` is parented to `skeletonRoot`, its `.position` is already rig-local; the explicit conversion is included so the formula is obvious and reusable.
+
+Use `Skeleton Lab > guide opacity` when the rigged mesh needs to be visible without the skeleton guide dominating the view.
+
+## G53 Rigging Mode
+
+This is the machine-home rigging workflow. It is a temporary setup mode, not gameplay.
+
+Step-by-step:
+
+1. Load a mesh preview with `Mesh > 1 preview`.
+2. Press `F2`, or open `G53 Rigging Mode > enter / home`.
+3. The rig moves to home position `X0 Z0` and `yaw 0`.
+4. Idle motion and walk preview turn off.
+5. Player movement/turning is locked, but camera orbit/zoom/height still works.
+6. Walls, ceilings, trees, ghost spheres, and Jupiter hide.
+7. Floors remain as faint reference planes.
+8. Combat trigger/hitbox/d20 visuals hide.
+9. Mouse joint point editing turns on.
+10. Use `G53 Rigging Mode > allow X`, `allow Y`, and `allow Z` to choose which axes can move during mouse dragging.
+11. Leave `G53 Rigging Mode > hold child points` enabled when you want already-placed limb points to stay put while moving their parent.
+12. Adjust pivots using the existing joint tools.
+13. Click `Mesh > 2 rig mesh`; if a preview is loaded, it rigs the mesh and restores gameplay state.
+14. Press `F2` again any time to exit/restore without undoing your pivot edits.
+
+Axis lock formula:
+
+```text
+finalAxis = allowAxis ? desiredAxis : dragStartAxis
+```
+
+where:
+
+- `desiredAxis` is the coordinate produced by the mouse drag.
+- `dragStartAxis` is the coordinate the joint had when the drag began.
+- `allowAxis` is the matching checkbox in `G53 Rigging Mode`.
+
+That means if only `allow X` is checked, the pointer can move freely on the screen, but the joint only stores X-axis movement. Y and Z are restored to their drag-start values before the offset is saved.
+
+Hold-child-points formula:
+
+```text
+desiredWorld       = skeletonRoot.localToWorld(savedRootLocal)
+desiredParentLocal = descendant.parent.worldToLocal(desiredWorld)
+offset             = desiredParentLocal - baseBindLocalPosition
+```
+
+where:
+
+- `savedRootLocal` is where the descendant point was when the drag began.
+- `desiredParentLocal` is the new local coordinate needed to keep that point visually fixed after its parent moved.
+- `offset` is the same Joint Point Offset value used by the sliders.
+
+This does not remove the parent-child skeleton. It uses the hierarchy to calculate new local offsets that match the point layout you placed on screen.
+
+While G53 is active, the animation pose solvers are skipped. The rig displays:
+
+```text
+liveJointTransform = bindPoseTransform
+```
+
+where `bindPoseTransform` means the saved pivot offsets plus bind-pose rotations. This prevents the arm controller's damping/trail motion from making the shoulders, elbows, wrists, and palms drift while you are placing points.
 
 ## Notes
 
@@ -192,15 +318,27 @@ empyrean.puppetWorkshop.rigTuning.v1
 
 Use `Rig Save > copy/log JSON` to copy a portable tuning snapshot into the console/clipboard.
 
-Use `Mesh Import / Export > 1 render mesh` to load `assets/femaleMesh.glb` as a static reference. After placing pivots, use `Mesh Import / Export > 2 rig rendered mesh` to generate skin weights and drive the GLB from the visible Empyrean puppet rig. `export rig package` copies/logs both the rig tuning and imported mesh binding settings.
+Use `Mesh > 1 preview` to load `assets/Sigewynn.glb` as the current default static reference. After placing pivots, use `Mesh > 2 rig mesh` to generate skin weights and drive the GLB from the visible Empyrean puppet rig. `export rig package` copies/logs both the rig tuning and imported mesh binding settings.
 
-Use `Bind Pose Rotations > female GLB A-pose` before or after loading the mesh to rotate the rest pose closer to the GLB's arms-out modeling pose. The bind-pose rotation sliders are in radians and are saved/exported with the rest of the rig tuning.
+If a GLB is facing backward, prefer `Mesh > Transform > rot Y` for the whole-model turn. That rotates the imported geometry before weights are generated. `Bind Pose Rotations` are best used for joint rest-pose alignment, such as lifting shoulders into an A-pose or T-pose.
+
+Use `Mesh > start pose` plus `Mesh > apply start pose` before rigging when the source mesh is modeled in A-pose or T-pose. The bind-pose rotation sliders are in radians and are saved/exported with the rest of the rig tuning.
+
+After a preview rig, `Mesh > 2 rig mesh` automatically restores the arm bind rotations to the relaxed gameplay rest. Formula:
+
+```text
+relaxed arm rest    = arm bind rotations captured before A/T start pose
+generated skin bind = mesh modeling pose at skinnedMesh.bind(skeleton)
+live puppet arms    = relaxed arm rest + animation pose deltas
+```
+
+That keeps a T-posed mesh bindable without leaving the gameplay arms stuck in T-pose. The manual `Mesh > restore gameplay arms` button runs the same arm-only restore if you need it after an experimental binding pass. It also clears active arm commands and stows the sword so an old `up`, `half`, `combat`, or `swing` state does not immediately raise the arms again.
 
 New mesh workflow:
 
-1. `Mesh Import / Export > 1 render mesh`
+1. `Mesh > 1 preview`
 2. Adjust `Rig Dimensions`, `Joint Point Offsets`, and `Bind Pose Rotations` while the mesh is only a static reference.
-3. `Mesh Import / Export > 2 rig rendered mesh`
+3. `Mesh > 2 rig mesh`
 
 Use the mouse wheel over the scene to zoom the camera in and out while placing pivots.
 
@@ -753,3 +891,173 @@ This build moves the active combat module away from the `combat.js` file that VS
 - Pointed `verify.ps1` at `combat_updated.js`.
 - Kept the original `combat.js` file untouched so it can be removed manually after VS Code settles down.
 - Kept the `0.1.20-alpha` combat fixes active in the new module.
+
+## V0.1.22 Alpha Dev Build
+
+This build adds the first sword-combat loop.
+
+- Added `assets/sword.glb` loading through `GLTFLoader` in `main.js`.
+- Added `SWORD_TWEAKS` near the top of `main.js` for scale, hand offset, hand rotation, swing duration, range, and attack arc.
+- The sword is parented to the `rightPalm` joint, so it follows the existing skeleton and survives skeleton rebuilds by detaching before disposal and reattaching afterward.
+- Added keyboard controls: `1` equips the sword/combat stance, `2` stows it, and `Enter` swings.
+- Added a `Combat` GUI folder with difficulty and sword test buttons.
+- Added `setCombatDifficulty()` and `attemptCombatSwordHit()` to `combat_updated.js`.
+- Added enemy HP rules: Easy = 3 hits, Medium = 4 hits, Hard = 5 hits.
+- Added an in-world enemy health bar that follows `enemy.glb`.
+- After a non-lethal sword hit, the enemy hides, relocates, and reappears so the player has to find it before landing the next hit.
+- Added `assets/sword.glb` to `verify.ps1`.
+
+## V0.1.23 Alpha Dev Build
+
+This build adds a temporary coordinate measuring tool and a softer skeleton-view option.
+
+- Added `DEV_PROBE_TWEAKS` near the top of `main.js`.
+- Added a small yellow sphere named `devProbe`, parented to the skeleton root.
+- Added `TEMP Dev Probe` GUI controls for visibility, local X/Y/Z, keyboard step, world readout, rig-local readout, console logging, and copying rig-local coordinates.
+- Added `Y` to toggle the probe.
+- Added Shift-key probe nudges: `Shift+J/L` for local X, `Shift+U/O` for local Y, and `Shift+I/K` for local Z.
+- Added mouse dragging for the probe using the same raycast-plus-camera-plane method as joint editing, but writing only to probe tuning values.
+- Documented the Three.js conversion formula: `rigLocalPoint = skeletonRoot.worldToLocal(worldPoint.clone())`.
+- Added `Skeleton Lab > guide opacity` so the debug skeleton can be faded while the rigged mesh remains visible and animated.
+
+## V0.1.24 Alpha Dev Build
+
+This build adds Pass 1 of G53-style machine-home rigging mode.
+
+- Added `G53_RIGGING_HOME` near the top of `main.js`.
+- Added runtime `state.g53RiggingMode` for active/off status and temporary saved gameplay state.
+- Added `F2` as the enter/exit toggle.
+- Entering G53 mode saves current player/camera/motion/visibility state.
+- Entering G53 mode homes the rig to `X0 Z0`, `yaw 0`.
+- Entering G53 mode turns off idle motion and walk preview, resets jump offset, shows the skeleton tools, and enables mouse joint point editing.
+- While G53 mode is active, player movement and yaw are locked at home, but camera orbit/zoom/height still work.
+- Exiting G53 mode restores the saved gameplay/view state without undoing any pivot edits.
+- Added a `G53 Rigging Mode` GUI folder with status plus enter/exit/toggle buttons.
+- Wrapped `Mesh > 2 rig mesh` so it restores gameplay state after rigging when G53 mode is active and a preview is loaded.
+- Left X/Y/Z axis locks for later passes.
+
+## V0.1.25 Alpha Dev Build
+
+This build adds Pass 2 of G53-style machine-home rigging mode.
+
+- Tagged room floors, room walls, room ceilings, outside enclosure parts, and low-poly trees in `world.js` with `userData.g53VisibilityRole`.
+- Added a G53 visibility fixture in `main.js`.
+- Entering G53 mode now makes walls and ceilings opacity `0`.
+- Entering G53 mode hides trees, ghost spheres, and Jupiter.
+- Floors remain visible at low opacity as setup reference planes.
+- Exiting G53 mode restores original object visibility, material opacity, transparency, and depth-write settings.
+- The restore logic records shared materials only once so room floors/walls return to their true original opacity.
+
+## V0.1.26 Alpha Dev Build
+
+This build cleans up a G53 mode measuring obstruction.
+
+- Added `setCombatRiggingVisibilitySuppressed()` to `combat_updated.js`.
+- G53 mode now hides the combat trigger cylinder, enemy group, enemy hitbox, enemy health bar, and d20 while active.
+- Exiting G53 mode restores the combat visuals to their previous visible state.
+- `updateCombatEncounter()` pauses combat visual state changes while G53 suppression is active, so the trigger does not pop back on during rigging.
+
+## V0.1.27 Alpha Dev Build
+
+This build adds the precision candy: G53 axis locks for mouse joint dragging.
+
+- Added saved rig tuning flags `g53AllowX`, `g53AllowY`, and `g53AllowZ`.
+- Added `allow X`, `allow Y`, and `allow Z` checkboxes to the `G53 Rigging Mode` GUI folder.
+- Added `applyG53AxisLocksToDesiredLocal()` in `main.js`.
+- Axis locks only run while G53 mode is active.
+- Unchecked axes are held at the joint's drag-start local coordinate before joint offsets are calculated.
+- Normal non-G53 mouse joint editing is unchanged.
+
+## V0.1.28 Alpha Dev Build
+
+This build tightens generated skin side selection for rotated bind poses.
+
+- Added `chooseNearestBindSide()` to `skin.js`.
+- Arm vertices now choose left/right by comparing their X coordinate to the current bind-pose `leftShoulder` and `rightShoulder` positions.
+- Leg vertices now choose left/right by comparing their X coordinate to the current bind-pose `leftHip` and `rightHip` positions.
+- This fixes the case where a 180-degree Y bind rotation moves left-named joints to positive X and right-named joints to negative X.
+- The recommended workflow is still to fix a backwards-facing GLB with `Mesh > Transform > rot Y`, then use `Bind Pose Rotations` for pose alignment.
+
+## V0.1.29 Alpha Dev Build
+
+This build makes G53 limb fitting less rigid.
+
+- Added saved rig tuning flag `g53PreserveChildPoints`.
+- Added `hold child points` to the `G53 Rigging Mode` GUI folder.
+- Added drag-start capture of descendant root-local coordinates.
+- Added compensation that recalculates descendant local offsets after a parent pivot moves.
+- This lets you move a shoulder, hip, elbow, or knee without visually dragging already-placed child points away from the mesh.
+- The behavior only runs in G53 mode and can be toggled off when you want normal parent-child dragging.
+
+## V0.1.30 Alpha Dev Build
+
+This build freezes animation pose solvers during G53 rigging mode.
+
+- Added `freezeG53RiggingPose()` to `main.js`.
+- G53 mode now skips idle breathing, walk pose, leg relaxation, arm control poses, and jump pose overlays.
+- The fix targets the arm drift/settling seen during point dragging.
+- The visible skeleton now holds the current bind pose while G53 is active, so moving a foot should not cause shoulder/elbow/hand markers to ease toward arm animation targets.
+
+## V0.1.31 Alpha Dev Build
+
+This build makes the F2 G53 hotkey survive local mesh loading.
+
+- Added `sceneContainer.tabIndex = -1` so the scene can receive programmatic focus without entering normal tab order.
+- After choosing a mesh through `Mesh > open file...`, the app now calls `window.focus()` and `sceneContainer.focus()`.
+- Added `handleG53HotkeyCapture()` as a capture-phase F2 listener.
+- The capture listener only handles F2, prevents browser/default function-key behavior, and stops the normal bubbling handler from toggling G53 twice.
+- Regular movement, combat, devProbe, and workshop keys still use the existing keydown path.
+
+## V0.1.32 Alpha Dev Build
+
+This build fixes cold-start G53 entry.
+
+- Initialized `state.walkArmSwing` during startup instead of only after movement/reset paths.
+- Added `ensureWalkArmSwingState()` and `resetWalkArmSwingState()`.
+- Updated G53 pose freeze, walk motion, and leg relaxation to use the same defensive walk-arm-swing helpers.
+- Added `restoreG53RiggingSnapshot()` so normal exit and failed-entry recovery restore the same saved fields.
+- Wrapped G53 entry in a recovery block: if setup fails, active mode is cleared, visibility is restored, saved gameplay state is restored, and status becomes `OFF - ENTER FAILED`.
+- This fixes the crash where pressing `F2` before any movement froze the app because `state.walkArmSwing` did not exist yet.
+
+## V0.1.33 Alpha Dev Build
+
+This build starts tightening the player combat workflow.
+
+- Switched the right-hand sword asset to `assets/plainSword.glb`.
+- Added `gripFromLowerEnd` to `SWORD_TWEAKS` so sword normalization puts the wrapper origin near the hilt instead of the center of the model.
+- Changed the default imported temp mesh to `assets/Sigewynn.glb`.
+- Added `restoreRuntimeArmBindRotations()` and a `Mesh > restore gameplay arms` button.
+- `Mesh > 2 rig mesh` now restores arm bind rotations after preview rigging, so T/A-pose mesh binding does not leave gameplay arms stuck outward.
+- Split arm stance and swing math into `getControlledArmPoseTargets()` so future stances and attacks can be added in one place.
+- Added a subtle full-body combat stance when the sword is equipped and the player is grounded/not walking.
+
+## V0.1.34 Alpha Dev Build
+
+This build fixes the T-pose-to-relaxed-arm workflow.
+
+- Added a temporary relaxed-arm bind-rotation snapshot before applying the A-pose or T-pose rigging start pose.
+- Updated `restoreRuntimeArmBindRotations()` so it restores that captured relaxed arm rest instead of blindly assuming zero rotations.
+- Added a zero-rotation fallback for older sessions that have no captured snapshot.
+- Cleared active arm commands, wave state, sword-equipped state, and swing timers during arm restore so gameplay does not immediately re-raise the arms after the bind restore.
+- Kept the restore scoped to arms only; body, head, leg, pivot, and mesh transform tuning stay untouched.
+
+## V0.1.35 Alpha Dev Build
+
+This build makes sword fitting a first-class workshop task.
+
+- Added a top-level `Sword Offsets` GUI folder.
+- Moved live sword setup into saved `rigTuning` values: asset path, length/scale, grip point, X/Y/Z position, pitch, yaw, and roll.
+- Added `reload sword` so a new GLB path can be loaded without editing code.
+- Added `reset sword offsets` to return the sword setup to the built-in `plainSword.glb` defaults.
+- Updated sword normalization so repeated length/grip tuning resets from the imported GLB transform first, preventing cumulative scale/offset drift.
+- Kept `SWORD_TWEAKS` as the default/reference zone for swing duration, hit range, and fallback prop settings.
+
+## V0.1.36 Alpha Dev Build
+
+This build fixes the invisible sword regression.
+
+- Fixed a runtime error in `normalizeSwordModel()` where a removed `fittedCenter` variable was still referenced.
+- Simplified sword grip placement so it computes from the original local GLB bounds, applies the requested length scale, and moves the chosen grip point to the hand wrapper origin.
+- Preserved the no-drift behavior for repeated `Sword Offsets` length/grip edits by resetting from the saved import transform before each normalization pass.
+- Retuned the built-in `plainSword.glb` pitch from `+PI / 2` to `-PI / 2` so the default blade does not aim into the right-side GUI/screen edge.
+- Added a tiny material visibility lift for imported swords so very dark blade materials remain readable in Empyrean's dark rooms.
