@@ -35,6 +35,7 @@ $RequiredFiles = @(
   "rig.js",
   "world.js",
   "skin.js",
+  "combatPhysics.js",
   "combat_updated.js",
   "encounters.js",
   "styles.css",
@@ -61,6 +62,7 @@ node --check physics.js
 node --check rig.js
 node --check world.js
 node --check skin.js
+node --check combatPhysics.js
 node --check combat_updated.js
 node --check encounters.js
 Write-Host "  OK JavaScript syntax"
@@ -93,7 +95,12 @@ $AssetFiles = @(
   "assets/diffuse.jpg",
   "assets/normal.jpg",
   "assets/ao.jpg",
-  "assets/displacement.jpg"
+  "assets/displacement.jpg",
+  "assets/stoneFloorDiff.jpg",
+  "assets/stoneFloorDisp.png",
+  "assets/stoneWallDiff.jpg",
+  "assets/StoneWallDisp.png",
+  "assets/torch.glb"
 )
 
 foreach ($Asset in $AssetFiles) {

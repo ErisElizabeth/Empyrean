@@ -11,12 +11,14 @@
     - Shared utilities: disposeObjectTree, makeLabelSprite
 
   Import rule:
-    This module imports only from three. It does not import from main.js,
-    rig.js, physics.js, or encounters.js. Call sites in main.js pass runtime
-    values (encounterRuntime, playerRadius, sceneRefs) as parameters instead.
+    This module imports Three.js and the official GLTFLoader for static world
+    props such as torch.glb. It does not import from main.js, rig.js, physics.js,
+    or encounters.js. Call sites in main.js pass runtime values
+    (encounterRuntime, playerRadius, sceneRefs) as parameters instead.
 */
 
 import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // =============================================================
 // WORLD TWEAK ZONE
@@ -29,7 +31,9 @@ const WORLD_TWEAKS = {
   world: {
     roomSize: 24,
     wallThickness: 0.1,
-    roomTransparency: 0.2,
+    roomWallOpacity: 0.8,
+    roomFloorOpacity: 0.95,
+    roomCeilingOpacity: 0.8,
     doorWidth: 4.4,
     doorHeight: 5.1,
     outsideSize: 96,
@@ -39,12 +43,31 @@ const WORLD_TWEAKS = {
     outsideFloorColor: "#7BB369",
   },
   roomColors: {
-    north: 0x5d608c,
-    south: 0x131a13,
-    east: 0x1e856d,
-    west: 0x3e0b4d,
-    floor: 0xb89898,
-    ceiling: 0x591a1a,
+    /*
+      Room surfaces are intentionally dull gray. The stone texture provides the
+      detail; the color tint keeps the rooms from becoming loud or cartoony.
+    */
+    wall: 0x8a8a82,
+    floor: 0x777871,
+    ceiling: 0x74766f,
+  },
+  roomTextures: {
+    floorDiffuse: "assets/stoneFloorDiff.jpg",
+    floorDisplacement: "assets/stoneFloorDisp.png",
+    wallDiffuse: "assets/stoneWallDiff.jpg",
+    wallDisplacement: "assets/StoneWallDisp.png",
+  },
+  torches: {
+    assetPath: "assets/torch.glb",
+    perWall: 2,
+    height: 1.45,
+    wallInset: 0.34,
+    heightAboveFloor: 2.85,
+    alongOffset: 7.2,
+    lightColor: "#ffb06a",
+    lightIntensity: 0.42,
+    lightDistance: 7.2,
+    lightDecay: 2,
   },
   ghostSpheres: {
     count: 170,
@@ -67,7 +90,9 @@ const WORLD_TWEAKS = {
 // ---------------------------------------------------------------------------
 const roomSize         = WORLD_TWEAKS.world.roomSize;
 const wallThickness    = WORLD_TWEAKS.world.wallThickness;
-const roomTransparency = WORLD_TWEAKS.world.roomTransparency;
+const roomWallOpacity  = WORLD_TWEAKS.world.roomWallOpacity;
+const roomFloorOpacity = WORLD_TWEAKS.world.roomFloorOpacity;
+const roomCeilingOpacity = WORLD_TWEAKS.world.roomCeilingOpacity;
 const doorWidth        = WORLD_TWEAKS.world.doorWidth;
 const doorHeight       = WORLD_TWEAKS.world.doorHeight;
 const outsideSize      = WORLD_TWEAKS.world.outsideSize;
@@ -87,6 +112,10 @@ export const GUIDE_COLOR = "#e0dcdc";
 // TEXTURE HELPERS
 // ---------------------------------------------------------------------------
 const textureLoader = new THREE.TextureLoader();
+const gltfLoader = new GLTFLoader();
+let torchPrototype = null;
+let torchIsLoading = false;
+const pendingTorchMounts = [];
 
 function loadRepeatedTexture(path, repeatX, repeatY, colorSpace = null) {
   /*
@@ -105,29 +134,46 @@ function loadRepeatedTexture(path, repeatX, repeatY, colorSpace = null) {
   return texture;
 }
 
-function loadRoomTextureSet(folder, repeatX = 4, repeatY = 4, options = {}) {
+function loadStoneSurfaceMaterial({
+  diffusePath,
+  displacementPath,
+  repeatX = 4,
+  repeatY = 4,
+  color = 0xffffff,
+  opacity = 1,
+  displacementScale = 0.018,
+}) {
   /*
-    Builds one MeshStandardMaterial from a folder containing
-    diffuse.jpg, normal.jpg, ao.jpg, and displacement.jpg.
+    Builds a stone surface material from the specific room assets.
+
+    diffusePath:
+      Color texture. Loaded in sRGB space because it is meant to be seen.
+
+    displacementPath:
+      Height texture. Loaded as linear data because it modifies geometry.
+
+    color:
+      Multiplies the diffuse texture. This is how the rooms become dull gray
+      while still preserving the texture detail.
+
+    opacity:
+      Room walls are now intentionally more solid at 80%. Floors are nearly
+      opaque so the stone reads underfoot.
   */
   const diffuse = loadRepeatedTexture(
-    `${folder}/diffuse.jpg`, repeatX, repeatY, THREE.SRGBColorSpace,
+    diffusePath, repeatX, repeatY, THREE.SRGBColorSpace,
   );
-  const normal      = loadRepeatedTexture(`${folder}/normal.jpg`,      repeatX, repeatY);
-  const ao          = loadRepeatedTexture(`${folder}/ao.jpg`,          repeatX, repeatY);
-  const displacement = loadRepeatedTexture(`${folder}/displacement.jpg`, repeatX, repeatY);
+  const displacement = loadRepeatedTexture(displacementPath, repeatX, repeatY);
 
   return new THREE.MeshStandardMaterial({
-    color: options.color || 0xffffff,
+    color,
     map: diffuse,
-    normalMap: normal,
-    aoMap: ao,
     displacementMap: displacement,
-    displacementScale: options.displacementScale ?? 0.018,
-    roughness: 0.86,
-    metalness: 0.02,
+    displacementScale,
+    roughness: 0.9,
+    metalness: 0,
     transparent: true,
-    opacity: options.opacity ?? roomTransparency,
+    opacity,
   });
 }
 
@@ -152,23 +198,43 @@ function enableAmbientOcclusion(geometry) {
 // ---------------------------------------------------------------------------
 // MATERIALS
 // ---------------------------------------------------------------------------
-const wallTextureMaterial = loadRoomTextureSet("assets", 4, 2, {
-  opacity: roomTransparency,
+const wallTextureMaterial = loadStoneSurfaceMaterial({
+  diffusePath: WORLD_TWEAKS.roomTextures.wallDiffuse,
+  displacementPath: WORLD_TWEAKS.roomTextures.wallDisplacement,
+  repeatX: 5,
+  repeatY: 4,
+  color: WORLD_TWEAKS.roomColors.wall,
+  opacity: roomWallOpacity,
+  displacementScale: 0.018,
 });
-const floorTextureMaterial = loadRoomTextureSet("assets", 8, 8, {
-  opacity: roomTransparency,
-  displacementScale: 0.01,
-});
-const ceilingTextureMaterial = loadRoomTextureSet("assets", 4, 2, {
-  opacity: roomTransparency,
+const floorTextureMaterial = loadStoneSurfaceMaterial({
+  diffusePath: WORLD_TWEAKS.roomTextures.floorDiffuse,
+  displacementPath: WORLD_TWEAKS.roomTextures.floorDisplacement,
+  repeatX: 8,
+  repeatY: 8,
+  color: WORLD_TWEAKS.roomColors.floor,
+  opacity: roomFloorOpacity,
   displacementScale: 0.012,
+});
+const ceilingTextureMaterial = loadStoneSurfaceMaterial({
+  /*
+    There is no separate ceiling texture yet, so the ceiling borrows the wall
+    stone. It keeps the rooms cohesive without touching the outside enclosure.
+  */
+  diffusePath: WORLD_TWEAKS.roomTextures.wallDiffuse,
+  displacementPath: WORLD_TWEAKS.roomTextures.wallDisplacement,
+  repeatX: 5,
+  repeatY: 4,
+  color: WORLD_TWEAKS.roomColors.ceiling,
+  opacity: roomCeilingOpacity,
+  displacementScale: 0.01,
 });
 
 const roomSurfaceMaterials = {
-  north:   cloneRoomMaterial(wallTextureMaterial,     WORLD_TWEAKS.roomColors.north),
-  south:   cloneRoomMaterial(wallTextureMaterial,     WORLD_TWEAKS.roomColors.south),
-  east:    cloneRoomMaterial(wallTextureMaterial,     WORLD_TWEAKS.roomColors.east),
-  west:    cloneRoomMaterial(wallTextureMaterial,     WORLD_TWEAKS.roomColors.west),
+  north:   cloneRoomMaterial(wallTextureMaterial,    WORLD_TWEAKS.roomColors.wall),
+  south:   cloneRoomMaterial(wallTextureMaterial,    WORLD_TWEAKS.roomColors.wall),
+  east:    cloneRoomMaterial(wallTextureMaterial,    WORLD_TWEAKS.roomColors.wall),
+  west:    cloneRoomMaterial(wallTextureMaterial,    WORLD_TWEAKS.roomColors.wall),
   floor:   cloneRoomMaterial(floorTextureMaterial,   WORLD_TWEAKS.roomColors.floor),
   ceiling: cloneRoomMaterial(ceilingTextureMaterial, WORLD_TWEAKS.roomColors.ceiling),
 };
@@ -345,8 +411,215 @@ function createRoom({ name, center, doors = {} }) {
   addRoomWall(roomGroup, center, "south", doors.south);
   addRoomWall(roomGroup, center, "east",  doors.east);
   addRoomWall(roomGroup, center, "west",  doors.west);
+  addRoomTorches(roomGroup);
 
   return roomGroup;
+}
+
+function addRoomTorches(roomGroup) {
+  /*
+    Adds two torch mounts to each inside wall of one room.
+
+    Important:
+      Torches are visual props and light sources only. They do not add collision
+      rectangles. The player should not get snagged on decoration while moving
+      through doors and around the workshop.
+
+    Coordinate convention:
+      Room groups are centered at roomSize / 2 in world Y. Local floor Y is
+      -roomSize / 2, so:
+
+        localTorchY = -roomSize / 2 + heightAboveFloor
+
+      Each mount's local +Z points out from the wall toward the room interior.
+      The GLB clone is parented under that mount, and the point light lives in
+      the same local space so the torch acts as its own dim light source.
+  */
+  const y = -roomSize / 2 + WORLD_TWEAKS.torches.heightAboveFloor;
+  const offset = WORLD_TWEAKS.torches.alongOffset;
+
+  ["north", "south", "east", "west"].forEach((side) => {
+    [-offset, offset].forEach((alongOffset, index) => {
+      const mount = createTorchMount(roomGroup.name, side, index, alongOffset, y);
+
+      roomGroup.add(mount);
+      attachTorchModelWhenReady(mount);
+    });
+  });
+}
+
+function createTorchMount(roomName, side, index, alongOffset, y) {
+  /*
+    Builds the empty mount immediately, then the GLB loader fills in the torch
+    model asynchronously.
+
+    The point light is created now so rooms still get their warm torch lighting
+    even if the GLB takes a moment to arrive.
+  */
+  const mount = new THREE.Group();
+  const inset = WORLD_TWEAKS.torches.wallInset;
+
+  mount.name = `${roomName}-${side}-torch-${index + 1}`;
+  mount.userData.g53VisibilityRole = "wall";
+
+  if (side === "north") {
+    mount.position.set(alongOffset, y, -roomSize / 2 + inset);
+    mount.rotation.y = 0;
+  } else if (side === "south") {
+    mount.position.set(alongOffset, y, roomSize / 2 - inset);
+    mount.rotation.y = Math.PI;
+  } else if (side === "east") {
+    mount.position.set(roomSize / 2 - inset, y, alongOffset);
+    mount.rotation.y = -Math.PI / 2;
+  } else {
+    mount.position.set(-roomSize / 2 + inset, y, alongOffset);
+    mount.rotation.y = Math.PI / 2;
+  }
+
+  addTorchLight(mount);
+  return mount;
+}
+
+function addTorchLight(mount) {
+  /*
+    The torch is the room's local light source.
+
+    This is intentionally dim. There are many torches, so a small point light
+    on each reads warmer without washing the stone walls flat.
+  */
+  const flame = new THREE.PointLight(
+    WORLD_TWEAKS.torches.lightColor,
+    WORLD_TWEAKS.torches.lightIntensity,
+    WORLD_TWEAKS.torches.lightDistance,
+    WORLD_TWEAKS.torches.lightDecay,
+  );
+  const glow = new THREE.Mesh(
+    new THREE.SphereGeometry(0.34, 12, 8),
+    new THREE.MeshBasicMaterial({
+      color: WORLD_TWEAKS.torches.lightColor,
+      transparent: true,
+      opacity: 0.52,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }),
+  );
+  const flameCore = new THREE.Mesh(
+    new THREE.SphereGeometry(0.13, 10, 8),
+    new THREE.MeshBasicMaterial({
+      color: "#ffd29a",
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    }),
+  );
+  const bracket = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.035, 0.045, 0.55, 8),
+    new THREE.MeshStandardMaterial({
+      color: "#2b2925",
+      roughness: 0.85,
+      metalness: 0.25,
+    }),
+  );
+
+  flame.name = `${mount.name}-warm-point-light`;
+  glow.name = `${mount.name}-flame-glow`;
+  flameCore.name = `${mount.name}-flame-core`;
+  bracket.name = `${mount.name}-primitive-bracket`;
+  glow.userData.g53VisibilityRole = "wall";
+  flameCore.userData.g53VisibilityRole = "wall";
+  bracket.userData.g53VisibilityRole = "wall";
+  flame.position.set(0, 0.08, 0.22);
+  glow.position.copy(flame.position);
+  flameCore.position.copy(flame.position);
+  bracket.position.set(0, -0.16, 0.08);
+  bracket.rotation.x = Math.PI * 0.36;
+  mount.add(bracket, flame, glow, flameCore);
+}
+
+function attachTorchModelWhenReady(mount) {
+  /*
+    Loads torch.glb once, then clones it for every wall mount.
+
+    Why the queue:
+      createRoom() runs synchronously during startup. GLB loading is async. Each
+      mount registers itself here; when the prototype arrives, every pending
+      mount receives a normalized clone.
+  */
+  if (torchPrototype) {
+    mount.add(cloneTorchModel(mount.name));
+    return;
+  }
+
+  pendingTorchMounts.push(mount);
+
+  if (torchIsLoading) {
+    return;
+  }
+
+  torchIsLoading = true;
+  gltfLoader.load(
+    WORLD_TWEAKS.torches.assetPath,
+    (gltf) => {
+      torchPrototype = gltf.scene;
+      torchPrototype.name = "torch-prototype";
+      normalizeTorchPrototype(torchPrototype);
+      pendingTorchMounts.splice(0).forEach((pendingMount) => {
+        pendingMount.add(cloneTorchModel(pendingMount.name));
+      });
+      torchIsLoading = false;
+    },
+    undefined,
+    (error) => {
+      console.warn("[world] failed to load torch.glb", error);
+      torchIsLoading = false;
+    },
+  );
+}
+
+function normalizeTorchPrototype(model) {
+  /*
+    Fits an arbitrary torch GLB to a predictable workshop size.
+
+    Formula:
+      scale = targetHeight / measuredHeight
+
+    After scaling, the model's bounding-box center is moved to the mount origin.
+    That makes every clone easy to place: the mount position is the torch center,
+    not some unknown authoring origin from Blender or another tool.
+  */
+  model.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+
+  if (size.y <= 0.0001) {
+    return;
+  }
+
+  model.scale.multiplyScalar(WORLD_TWEAKS.torches.height / size.y);
+  model.updateMatrixWorld(true);
+
+  const fittedBox = new THREE.Box3().setFromObject(model);
+  const center = fittedBox.getCenter(new THREE.Vector3());
+
+  model.position.sub(center);
+  model.traverse((child) => {
+    child.userData.g53VisibilityRole = "wall";
+
+    if (child.isMesh) {
+      child.castShadow = false;
+      child.receiveShadow = false;
+    }
+  });
+}
+
+function cloneTorchModel(namePrefix) {
+  const clone = torchPrototype.clone(true);
+
+  clone.name = `${namePrefix}-model`;
+  clone.traverse((child) => {
+    child.userData.g53VisibilityRole = "wall";
+  });
+  return clone;
 }
 
 function addRoomWall(roomGroup, roomCenter, side, hasDoor = false) {
@@ -402,7 +675,7 @@ function addWallSegment(
   mesh.name = `${roomGroup.name}-${side}-wall-segment`;
   mesh.userData.g53VisibilityRole = "wall";
   mesh.material.transparent = true;
-  mesh.material.opacity = roomTransparency;
+  mesh.material.opacity = roomWallOpacity;
   roomGroup.add(mesh);
 
   if (blocksMovement) {
@@ -599,19 +872,20 @@ export function updateGhostSphereMotion(spheres, elapsed) {
 export function buildLighting(scene) {
   /*
     Lighting stack:
-      HemisphereLight = soft ambient sky/ground fill
-      DirectionalLight = main readable key light
+      HemisphereLight = low ambient fill, just enough to keep shapes readable
+      DirectionalLight = weak global key light
       PointLight = small green character/world accent
+      Room torches = warm local point lights created by addTorchLight()
 
     MeshBasicMaterial objects (ghost spheres, Jupiter) ignore these lights.
   */
-  scene.add(new THREE.HemisphereLight("#91aa91", "#020202", 1.25));
+  scene.add(new THREE.HemisphereLight("#91aa91", "#020202", 0.58));
 
-  const keyLight = new THREE.DirectionalLight("#dff5df", 2.15);
+  const keyLight = new THREE.DirectionalLight("#dff5df", 0.72);
   keyLight.position.set(-2.5, 5.5, 3.5);
   scene.add(keyLight);
 
-  const pointLight = new THREE.PointLight("#639464", 1.45, 6.5);
+  const pointLight = new THREE.PointLight("#639464", 0.35, 6.5);
   pointLight.position.set(0, 2.5, 2.2);
   scene.add(pointLight);
 }

@@ -4,7 +4,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.36-alpha`
+- Empyrean build: `0.1.40-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -52,6 +52,9 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - Sigewynn default temp mesh, plainSword combat prop, post-rig gameplay arm restore, and a named arm pose resolver for easier stance/swing work
 - relaxed-arm snapshot restore so T/A rigging poses do not become permanent gameplay poses
 - saved `Sword Offsets` GUI controls for sword path, length, grip, position, pitch, yaw, and roll
+- pure combat balance math module and Low Guard stance on sword draw
+- neutral body/knee facing correction so anatomical right/left and foot direction read correctly while the related Y bind-rotation sliders read zero
+- Empyrean room aesthetic pass with stone floor/wall textures, 80% room walls, dim torch props, and warm torch light sources
 
 ---
 
@@ -86,6 +89,12 @@ combat_updated.js   <- the encounter prototype station
                       owns the combat trigger, enemy.glb loader/fit, hitbox,
                       battle.mp3 crossfade, d20 roll, simple evasion,
                       health, hiding, and sword-hit validation
+
+combatPhysics.js    <- the combat math station
+                      pure formulas only: base of support, combined center of
+                      mass, stability margin, critical tipping angle, and
+                      named stance profiles such as Low Guard. No scene
+                      objects, no GUI, no animation frame side effects.
 
 physics.js          ← the math reference binder
                       pure formulas only — jump gravity, launch velocity,
@@ -138,7 +147,7 @@ encounters.js
 
 The rule: nothing imports from main.js. main.js is the only thing that pulls everything together. If world.js or skin.js needed something from main.js, that would be a circular dependency — like a parts station trying to call the floor supervisor to ask for a part the floor supervisor asked the parts station to make in the first place. Instead, main.js passes what each station needs as a parameter when it calls them.
 
-Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, calls `updateCombatEncounter(delta)` once per animation frame, and calls `attemptCombatSwordHit()` only when the player swings. `main.js` owns the sword model and arm pose. `combat_updated.js` owns trigger state, enemy GLB fitting, hitbox, d20, battle audio, evasion, health, hiding, and victory.
+Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, calls `updateCombatEncounter(delta)` once per animation frame, and calls `attemptCombatSwordHit()` only when the player swings. `main.js` owns the sword model and arm pose. `combat_updated.js` owns trigger state, enemy GLB fitting, hitbox, d20, battle audio, evasion, health, hiding, and victory. `combatPhysics.js` owns the readable balance formulas and stance profiles, while `main.js` converts the live Three.js joint positions into the root-local numbers those formulas need.
 
 ### Where to Make Common Changes
 
@@ -148,6 +157,8 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 | Sword asset path, scale, grip origin, hand offset, pitch/yaw/roll | `Sword Offsets` in the GUI |
 | Sword default values, swing timing, hit range | `SWORD_TWEAKS` near the top of `main.js` |
 | Arm stances and sword swing rotations | `getControlledArmPoseTargets()` in `main.js` |
+| Combat balance formulas or Low Guard body/leg stance | `combatPhysics.js` |
+| Neutral anatomical facing correction | `RIG_BASE_BODY_YAW` near the top of `main.js` |
 | Room size, wall colors, ghost sphere count | `WORLD_TWEAKS` near the top of `world.js` |
 | Default body proportions | `DEFAULT_RIG_DIMENSIONS` in `rig.js` |
 | Trigger zones (enter/exit events) | `encounters.js` |
@@ -159,6 +170,10 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 
 ## Change Notes
 
+- `0.1.40-alpha`: Applied `stoneFloorDiff.jpg`/`stoneFloorDisp.png` to room floors, `stoneWallDiff.jpg`/`StoneWallDisp.png` to room walls and ceilings, shifted room surfaces to dull gray, raised room wall opacity to 80%, added two `torch.glb` props per inside wall, and made each torch a dim warm point-light source.
+- `0.1.39-alpha`: Applied the same fixture-zero facing correction to `leftKnee` and `rightKnee`, giving each knee a neutral `-PI` base yaw so the shin/ankle/foot chains face correctly while their GUI Y bind-rotation sliders remain `0`; old near-PI knee Y fixes migrate back to zero.
+- `0.1.38-alpha`: Baked the 180-degree body-facing correction into the body joint's base bind pose so anatomical right/left matches the feet while the GUI bind-pose body Y value reads `0`; old saved `body Y ~= +/-PI` facing fixes now migrate back to zero.
+- `0.1.37-alpha`: Added `combatPhysics.js` with base-of-support, center-of-mass, stability-margin, and tipping-angle formulas, then wired sword draw to enter a named Low Guard stance that uses the new profile for body, leg, and arm pose setup.
 - `0.1.36-alpha`: Fixed sword visibility by repairing the grip-point normalization path that aborted sword loading, retuning the default sword pitch away from the screen edge, lightly boosting dark sword materials, and simplifying sword fitting so repeated length/grip slider edits recalculate from the original GLB transform without drift.
 - `0.1.35-alpha`: Added a saved `Sword Offsets` GUI section so sword asset path, length/scale, grip point, position, pitch, yaw, and roll can be tuned live instead of hard-coded.
 - `0.1.34-alpha`: Fixed the T-pose restore workflow by capturing the relaxed arm bind rotations before applying A/T start poses, restoring that snapshot after rigging, and clearing active arm/sword commands so `restore gameplay arms` returns to true relaxed posture.
@@ -1061,3 +1076,46 @@ This build fixes the invisible sword regression.
 - Preserved the no-drift behavior for repeated `Sword Offsets` length/grip edits by resetting from the saved import transform before each normalization pass.
 - Retuned the built-in `plainSword.glb` pitch from `+PI / 2` to `-PI / 2` so the default blade does not aim into the right-side GUI/screen edge.
 - Added a tiny material visibility lift for imported swords so very dark blade materials remain readable in Empyrean's dark rooms.
+
+## V0.1.37 Alpha Dev Build
+
+This build moves the first sword-stance physics into a reusable module.
+
+- Added `combatPhysics.js` as a pure math station for combat formulas.
+- Documented base of support, combined center of mass, stability margin, and critical tipping angle directly in the module comments.
+- Added a named Low Guard stance profile with body, pelvis, chest, head, leg, and sword center-of-mass parameters.
+- Updated sword draw so pressing `1` equips the sword and enters Low Guard instead of the older generic combat arm pose.
+- Added a `lowGuard` arm pose and made post-swing recovery return to the current ready sword pose.
+- Added a live `state.combatBalance` estimate so future stagger, guard-break, or overextended-swing behavior has a clean math hook.
+
+## V0.1.38 Alpha Dev Build
+
+This build moves the left/right facing fix into the rig's neutral zero.
+
+- Added `RIG_BASE_BODY_YAW = -Math.PI` as the body joint's base bind rotation.
+- Kept the GUI `body` bind-rotation Y slider at `0` for the corrected facing, so the fix behaves like fixture zero instead of a visible setup offset.
+- Left the root/player coordinate system alone so collision, G53 home, devProbe coordinates, and room navigation stay stable.
+- Added a saved-tuning migration: old `body Y` values very close to `+PI` or `-PI` are treated as the old manual facing fix and reset to zero.
+- Kept the sword attached to `rightPalm`; the correction changes which way the puppet anatomy faces instead of swapping sword code.
+
+## V0.1.39 Alpha Dev Build
+
+This build applies the same neutral-zero idea to the lower legs.
+
+- Added `RIG_BASE_KNEE_YAW = -Math.PI` for both knee joints.
+- Applied that yaw to `leftKnee` and `rightKnee` base bind quaternions so the ankle/foot chains flip without moving hip points.
+- Kept the visible `leftKnee` and `rightKnee` Y bind-rotation sliders at `0` for the corrected leg direction.
+- Extended the saved-tuning migration so old `leftKnee Y` or `rightKnee Y` values near `+PI` or `-PI` are treated as old manual facing fixes and reset to zero.
+- Left the root, hips, collision, camera, and sword attachment unchanged.
+
+## V0.1.40 Alpha Dev Build
+
+This build gives the rooms their first dedicated Empyrean stone pass.
+
+- Swapped room floors to `assets/stoneFloorDiff.jpg` plus `assets/stoneFloorDisp.png`.
+- Swapped room walls and ceilings to `assets/stoneWallDiff.jpg` plus `assets/StoneWallDisp.png`.
+- Retinted room stone to dull gray and raised room wall opacity to `0.8`.
+- Added two `assets/torch.glb` mounts to each inside wall of each room.
+- Added a dim warm point light and small glow marker to every torch mount.
+- Reduced the global room lighting so the torches carry more of the interior mood.
+- Kept the outside enclosure materials untouched.

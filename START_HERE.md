@@ -22,7 +22,7 @@ If those three things work, the project is in a sane state.
 
 ## Current Build
 
-Current build: `0.1.36-alpha`
+Current build: `0.1.40-alpha`
 
 The project currently has:
 
@@ -55,6 +55,10 @@ The project currently has:
 - named arm pose resolver for easier stance/swing edits
 - relaxed-arm snapshot restore for returning from T/A rigging poses
 - Sword Offsets GUI for tuning/reloading the weapon prop without code edits
+- combatPhysics.js math module for center of mass, base of support, stability margin, and tipping angle
+- Low Guard stance on sword draw
+- neutral body/knee facing correction so `rightPalm` reads as anatomical right and lower legs/feet face correctly
+- stone room textures and dim torch lighting for the interior rooms
 - solo workflow docs
 - checkpoint and verify scripts
 
@@ -75,6 +79,7 @@ Use these when editing code:
 ```text
 main.js
 physics.js
+combatPhysics.js
 rig.js
 encounters.js
 combat_updated.js
@@ -135,6 +140,7 @@ Recommended flow:
 - Turn on World Debug and screenshot the collision layout for yourself.
 - Export a rig package from the GUI after a good tuning pass.
 - Open `Combat`, set difficulty, press `1`, and test whether the sword scale/hand angle feels right.
+- Press `1` while standing still and check whether Low Guard reads as grounded instead of stiff.
 - Use `Sword Offsets` to tune `plainSword.glb` position, length, grip point, pitch, yaw, and roll live.
 - Use `Mesh > restore gameplay arms` if a test pose or old saved arm command leaves the arms raised after rigging.
 - Press `Y`, move `devProbe`, and copy rig-local values for sword or hitbox experiments.

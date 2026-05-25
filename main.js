@@ -12,6 +12,12 @@ import {
   updateCombatEncounter,
 } from "./combat_updated.js";
 import {
+  COMBAT_STANCE_NAMES,
+  combineMassPoints,
+  evaluateCombatBalance,
+  getCombatStanceProfile,
+} from "./combatPhysics.js";
+import {
   clamp01 as physicsClamp01,
   cycle01 as physicsCycle01,
   getJumpGravityValue,
@@ -64,7 +70,7 @@ import {
   syncImportedSkinToPuppet,
 } from "./skin.js";
 
-const APP_VERSION = "0.1.36-alpha";
+const APP_VERSION = "0.1.40-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -245,6 +251,34 @@ const G53_RIGGING_HOME = {
     hideJupiter: true,
   },
 };
+
+const RIG_BASE_BODY_YAW = -Math.PI;
+const RIG_BASE_KNEE_YAW = -Math.PI;
+const FACING_MIGRATION_EPSILON = 0.01;
+/*
+  Neutral facing correction.
+
+  The rig originally treated local +Z as the visible puppet's front. From the
+  camera/foot direction, that made the labels read mirrored: the joint named
+  rightPalm was mechanically correct, but visually/anatomically it landed on
+  what reads as the left hand.
+
+  Instead of chasing this through sword attachment, arm poses, skin weighting,
+  and combat code, the body joint now owns a 180 degree base bind yaw:
+
+    base body yaw = -PI radians
+    GUI body Y bind-rotation value = 0
+
+  In machining terms: we moved the fixture zero. The correction is baked into
+  the base rest pose, so a visible bind-pose slider value of 0 means "correct
+  anatomical facing" from here on.
+
+  V0.1.39 note:
+    The upper body correction fixed the hand labels, but the feet still read
+    backwards. Knees now use the same fixture-zero trick. A -PI base yaw on each
+    knee flips the shin/ankle/foot chain without changing hips, root movement,
+    collision, camera, or G53 machine home.
+*/
 
 //=============================================================
 // LOADER OVERLAY LOGIC BEGIN
@@ -762,6 +796,20 @@ const state = {
     loaded: false,
     loadedAssetPath: "",
   },
+  combatBalance: {
+    /*
+      Runtime balance estimate from combatPhysics.js.
+
+      This is not saved. It is a live diagnostic/mechanics value updated while
+      a combat stance is active. Future passes can expose this in the GUI or use
+      it for stagger/recovery decisions.
+    */
+    stance: COMBAT_STANCE_NAMES.NONE,
+    supportBox: null,
+    centerOfMass: { x: 0, y: 0, z: 0 },
+    stability: { margin: 0, normalized: 0, overbalanced: false },
+    criticalTipAngle: 0,
+  },
   /*
     Temporary arm-rest snapshot for rigging start poses.
 
@@ -794,6 +842,7 @@ const controlState = {
   waveUntil: 0,
   leftArm: "down",
   rightArm: "down",
+  combatStance: COMBAT_STANCE_NAMES.NONE,
   // Sword state is input/animation state only. The GLB object itself lives in
   // state.sword because it is a runtime asset, not a saved rig dimension.
   weaponEquipped: false,
@@ -1128,9 +1177,39 @@ function sanitizeBindRotationOffsets(
   */
   return BIND_ROTATION_JOINTS.reduce((offsets, jointName) => {
     const source = candidate?.[jointName] || defaults[jointName];
+    const sourceY = Number.isFinite(source?.y)
+      ? source.y
+      : defaults[jointName].y;
+    const isNeutralFacingJoint =
+      jointName === "body" ||
+      jointName === "leftKnee" ||
+      jointName === "rightKnee";
+    const migratedFacingY =
+      isNeutralFacingJoint &&
+      Math.abs(Math.abs(sourceY) - Math.PI) < FACING_MIGRATION_EPSILON
+        ? defaults[jointName].y
+        : sourceY;
+
+    /*
+      V0.1.38 / V0.1.39 facing migration:
+
+      Before the neutral body-facing correction, the quick manual fix was to
+      type body bind-rotation Y = -3.14159 in the GUI. That worked visually, but
+      it made "correct facing" look like a non-zero setup error.
+
+      V0.1.39 applies the same fixture-zero idea to leftKnee and rightKnee so
+      the shin/ankle/foot chain points the readable way while the sliders still
+      say zero.
+
+      Now the base quaternions already own those -PI yaw corrections. If an old
+      browser save or imported rig package still contains one of these Y values
+      near +/-PI, treating it as an additional offset would double-apply the
+      correction. So a near-PI yaw on body/leftKnee/rightKnee is interpreted as
+      "this was the old manual facing fix" and migrated back to slider zero.
+    */
     offsets[jointName] = {
       x: Number.isFinite(source?.x) ? source.x : defaults[jointName].x,
-      y: Number.isFinite(source?.y) ? source.y : defaults[jointName].y,
+      y: migratedFacingY,
       z: Number.isFinite(source?.z) ? source.z : defaults[jointName].z,
     };
     return offsets;
@@ -1358,8 +1437,13 @@ function createJoint(name, position = [0, 0, 0]) {
         offset. resetSkeletonToBindPose() copies this back to joint.position.
 
       baseBindLocalQuaternion:
-        The joint's ORIGINAL rotation from createSkeleton(). All joints start
-        at identity (no rotation), so this is typically (0,0,0,1).
+        The joint's ORIGINAL rotation from createSkeleton(). Most joints start
+        at identity (no rotation). The body joint gets one deliberate exception:
+        applyNeutralBodyFacingCorrection() bakes in a 180 degree yaw so the
+        puppet's anatomical left/right agrees with the visible foot direction.
+        The knee joints get the same style of correction through
+        applyNeutralKneeFacingCorrection() so the lower legs/feet face the
+        readable way while the GUI bind-rotation sliders still read zero.
 
       bindLocalQuaternion:
         base rotation multiplied by any bind-pose rotation offsets. Updated by
@@ -1387,6 +1471,70 @@ function createJoint(name, position = [0, 0, 0]) {
   return joint;
 }
 
+function applyNeutralBodyFacingCorrection(bodyJoint) {
+  /*
+    Makes the 180-degree body facing correction the rig's neutral zero.
+
+    Why body, not root:
+      root is the player/collider/world anchor. Movement, camera, G53 home,
+      encounter range checks, and devProbe coordinates all use the root as the
+      stable machine coordinate system.
+
+      body is the visible puppet carrier under that root. Rotating body changes
+      which way the skeleton's feet/chest/arms face without moving the player
+      anchor or rewriting room navigation.
+
+    "Call it zero" mechanics:
+      1. Set body.rotation.y to RIG_BASE_BODY_YAW.
+      2. Copy that quaternion into baseBindLocalQuaternion.
+      3. Copy it into bindLocalQuaternion.
+      4. Leave bindLocalEuler at 0,0,0.
+
+    applyBindRotationOffsets() later does:
+
+      bindLocalQuaternion = baseBindLocalQuaternion * offsetQuaternion
+
+    So when the GUI slider offset is zero, the corrected facing is still active.
+  */
+  bodyJoint.rotation.y = RIG_BASE_BODY_YAW;
+  bodyJoint.userData.baseBindLocalQuaternion.copy(bodyJoint.quaternion);
+  bodyJoint.userData.bindLocalQuaternion.copy(bodyJoint.quaternion);
+  bodyJoint.userData.bindLocalEuler.set(0, 0, 0);
+}
+
+function applyNeutralKneeFacingCorrection(kneeJoint, sideName) {
+  /*
+    Makes each knee's lower-leg direction correction part of neutral zero.
+
+    What this affects:
+      knee -> ankle -> foot
+
+    What this does NOT affect:
+      pelvis, hip, upper-leg placement, root movement, collision, camera, or
+      sword attachment.
+
+    Why knee:
+      The thigh line is just hip-to-knee. The readable "which way is the foot
+      pointing?" cue lives below the knee, because the foot marker is a child of
+      the ankle and the ankle inherits the knee's rotation. Rotating the knee
+      around Y by -PI flips the shin/ankle/foot chain while keeping the knee
+      point itself in place.
+
+    "Call it zero" is identical to the body correction:
+
+      base knee yaw = -PI radians
+      GUI knee Y bind-rotation value = 0
+
+    sideName is only here for debugging/readability; both knees get the same
+    neutral yaw.
+  */
+  kneeJoint.rotation.y = RIG_BASE_KNEE_YAW;
+  kneeJoint.userData.baseBindLocalQuaternion.copy(kneeJoint.quaternion);
+  kneeJoint.userData.bindLocalQuaternion.copy(kneeJoint.quaternion);
+  kneeJoint.userData.bindLocalEuler.set(0, 0, 0);
+  kneeJoint.userData.neutralFacingCorrection = `${sideName} knee yaw`;
+}
+
 function createSkeleton(dimensions = {}) {
   /*
     Builds the parent/child hierarchy for the puppet.
@@ -1411,6 +1559,7 @@ function createSkeleton(dimensions = {}) {
 
   joints.root = createJoint("rig-root");
   joints.body = createJoint("body-root");
+  applyNeutralBodyFacingCorrection(joints.body);
   joints.root.add(joints.body);
 
   joints.pelvis = createJoint("pelvis", [0, d.pelvisY, 0]);
@@ -1503,6 +1652,7 @@ function addLegChain(joints, sideName, side, d) {
     -d.thighLength,
     0,
   ]);
+  applyNeutralKneeFacingCorrection(joints[`${prefix}Knee`], sideName);
   joints[`${prefix}Ankle`] = createJoint(`${prefix}-ankle`, [
     0,
     -d.shinLength,
@@ -2171,6 +2321,7 @@ function clearArmControlStateForRelaxedPose() {
   controlState.wasWaving = false;
   controlState.leftArm = "down";
   controlState.rightArm = "down";
+  controlState.combatStance = COMBAT_STANCE_NAMES.NONE;
   controlState.weaponEquipped = false;
   controlState.swordSwingStart = 0;
   controlState.swordSwingUntil = 0;
@@ -2595,6 +2746,7 @@ function makeG53RiggingSnapshot() {
       wasWaving: Boolean(controlState.wasWaving),
       leftArm: controlState.leftArm,
       rightArm: controlState.rightArm,
+      combatStance: controlState.combatStance,
       weaponEquipped: Boolean(controlState.weaponEquipped),
       swordSwingStart: controlState.swordSwingStart,
       swordSwingUntil: controlState.swordSwingUntil,
@@ -2640,6 +2792,8 @@ function restoreG53RiggingSnapshot(saved) {
   controlState.wasWaving = saved.control.wasWaving;
   controlState.leftArm = saved.control.leftArm;
   controlState.rightArm = saved.control.rightArm;
+  controlState.combatStance =
+    saved.control.combatStance || COMBAT_STANCE_NAMES.NONE;
   controlState.weaponEquipped = saved.control.weaponEquipped;
   controlState.swordSwingStart = saved.control.swordSwingStart;
   controlState.swordSwingUntil = saved.control.swordSwingUntil;
@@ -2688,10 +2842,12 @@ function enterG53RiggingMode() {
     controlState.isWalking = false;
     controlState.waveUntil = 0;
     controlState.wasWaving = false;
-    controlState.leftArm = "down";
-    controlState.rightArm = "down";
-    controlState.swordSwingStart = 0;
-    controlState.swordSwingUntil = 0;
+  controlState.leftArm = "down";
+  controlState.rightArm = "down";
+  controlState.combatStance = COMBAT_STANCE_NAMES.NONE;
+  resetCombatBalanceEstimate();
+  controlState.swordSwingStart = 0;
+  controlState.swordSwingUntil = 0;
     resetWalkArmSwingState();
     Object.assign(controlState.jump, {
       phase: "grounded",
@@ -4075,18 +4231,20 @@ function startJump() {
 
 function equipSword() {
   /*
-    Equips the right-hand sword and moves the puppet into a combat stance.
+    Equips the right-hand sword and moves the puppet into Low Guard.
 
     Important separation:
       - This function owns the visible sword asset and arm pose.
       - combat_updated.js owns enemy hit points, hiding, and victory.
+      - combatPhysics.js owns the balance math for what Low Guard means.
 
     If the GLB has not loaded yet, the stance still changes immediately. The
     loader callback calls syncSwordAttachment() when the asset arrives.
   */
   controlState.weaponEquipped = true;
-  controlState.leftArm = "half";
-  controlState.rightArm = "combat";
+  controlState.combatStance = COMBAT_STANCE_NAMES.LOW_GUARD;
+  controlState.leftArm = "lowGuard";
+  controlState.rightArm = "lowGuard";
 
   loadSwordIfNeeded();
   syncSwordAttachment();
@@ -4105,6 +4263,8 @@ function despawnSword() {
   controlState.swordSwingUntil = 0;
   controlState.leftArm = "down";
   controlState.rightArm = "down";
+  controlState.combatStance = COMBAT_STANCE_NAMES.NONE;
+  resetCombatBalanceEstimate();
 
   if (state.sword.group) {
     state.sword.group.visible = false;
@@ -5151,74 +5311,352 @@ function relaxLegs(delta) {
   });
 }
 
+function getReadySwordArmPose() {
+  /*
+    Returns the non-swing arm pose that should hold the sword.
+
+    This tiny resolver keeps the sword flow from hard-coding "combat" in
+    multiple places. When we add high guard, thrust prep, shield guard, or
+    stance-dependent idle holds later, this is the switchboard that decides
+    which named arm pose is the current ready pose.
+  */
+  if (controlState.combatStance === COMBAT_STANCE_NAMES.LOW_GUARD) {
+    return "lowGuard";
+  }
+
+  return "combat";
+}
+
+function makeSideScaledVector(target = {}, side = 1) {
+  /*
+    Converts a stance-profile vector into a plain x/y/z offset.
+
+    The combat stance profiles in combatPhysics.js use two kinds of fields:
+
+      x      = same value for left and right
+      xSide  = mirrored value, multiplied by side
+
+    where:
+      side = -1 for left
+      side = +1 for right
+
+    Example:
+      { xSide: 0.05, y: 0, z: 0.02 }
+
+    becomes:
+      left  = { x: -0.05, y: 0, z: 0.02 }
+      right = { x:  0.05, y: 0, z: 0.02 }
+
+    This lets one Low Guard profile describe both legs without duplicating the
+    same numbers twice.
+  */
+  return {
+    x: (target.x ?? 0) + (target.xSide ?? 0) * side,
+    y: (target.y ?? 0) + (target.ySide ?? 0) * side,
+    z: (target.z ?? 0) + (target.zSide ?? 0) * side,
+  };
+}
+
+function makeSideScaledEuler(target = {}, side = 1) {
+  /*
+    Same idea as makeSideScaledVector(), but returned as a Three.js Euler.
+
+    Stance profiles stay plain data in combatPhysics.js. main.js turns that
+    data into the Three.js-specific rotation object only at the animation edge.
+  */
+  const v = makeSideScaledVector(target, side);
+  return new THREE.Euler(v.x, v.y, v.z);
+}
+
+function getJointRootLocalPosition(joint) {
+  /*
+    Measures a joint in rig-local coordinates.
+
+    Formula:
+
+      rootLocalPoint = skeletonRoot.worldToLocal(jointWorldPoint)
+
+    where:
+      jointWorldPoint = joint.getWorldPosition(...)
+      skeletonRoot    = state.skeleton.root
+
+    Why this matters:
+      The math module does not know about Three.js parent chains. It needs all
+      numbers in one shared coordinate system. Root-local is perfect for this:
+      x = left/right from the player, y = height, z = forward/back from player.
+  */
+  const root = state.skeleton?.root;
+
+  if (!root || !joint) {
+    return new THREE.Vector3();
+  }
+
+  const worldPoint = new THREE.Vector3();
+  joint.getWorldPosition(worldPoint);
+  return root.worldToLocal(worldPoint);
+}
+
+function getJointLocalOffsetAsRootLocalPosition(joint, offset = {}) {
+  /*
+    Converts a point near a joint into rig-local coordinates.
+
+    Used for the sword center of mass:
+
+      1. Start with an offset in rightPalm-local space.
+      2. localToWorld() moves that point through the palm/wrist/elbow/shoulder
+         hierarchy into the scene.
+      3. root.worldToLocal() brings it back into player/root coordinates.
+
+    That means the sword CoM follows the actual arm pose instead of pretending
+    the hand is never rotated.
+  */
+  const root = state.skeleton?.root;
+
+  if (!root || !joint) {
+    return new THREE.Vector3();
+  }
+
+  const localPoint = new THREE.Vector3(
+    offset.x ?? 0,
+    offset.y ?? 0,
+    offset.z ?? 0,
+  );
+  const worldPoint = joint.localToWorld(localPoint);
+  return root.worldToLocal(worldPoint);
+}
+
+function estimateBodyCenterOfMassRootLocal() {
+  /*
+    Estimates body center of mass from major skeleton landmarks.
+
+    Formula:
+
+      bodyCoM = sum(m_i * p_i) / sum(m_i)
+
+    where:
+      p_i = pelvis/chest/head positions in rig-local coordinates
+      m_i = simple scene-unit mass weights
+
+    These are not anatomical lab values. They are stable animation weights:
+      pelvis = 45%  lower mass carrier
+      chest  = 42%  torso mass carrier
+      head   = 13%  visible upper mass
+
+    The useful part is not perfect biology. The useful part is that stance
+    changes, sword offsets, and later strike poses can all speak the same
+    center-of-mass language.
+  */
+  const joints = state.skeleton?.joints;
+
+  if (!joints) {
+    return { x: 0, y: 0, z: 0, totalMass: 0 };
+  }
+
+  return combineMassPoints([
+    { mass: 0.45, position: getJointRootLocalPosition(joints.pelvis) },
+    { mass: 0.42, position: getJointRootLocalPosition(joints.chest) },
+    { mass: 0.13, position: getJointRootLocalPosition(joints.head) },
+  ]);
+}
+
+function resetCombatBalanceEstimate() {
+  /*
+    Clears the live balance readout when no combat stance is active.
+
+    Nothing in gameplay depends on this value yet. Keeping it clean now makes
+    future GUI/debug readouts easier because stale Low Guard numbers will not
+    hang around after the sword is stowed.
+  */
+  state.combatBalance = {
+    stance: COMBAT_STANCE_NAMES.NONE,
+    supportBox: null,
+    centerOfMass: { x: 0, y: 0, z: 0 },
+    stability: { margin: 0, normalized: 0, overbalanced: false },
+    criticalTipAngle: 0,
+  };
+}
+
+function updateCombatBalanceEstimate(profile) {
+  /*
+    Runs the document math against the live puppet pose.
+
+    All positions passed to combatPhysics.js are in root-local coordinates:
+
+      leftFoot/rightFoot = base of support contact anchors
+      bodyCom            = weighted average of pelvis/chest/head
+      swordCom           = right palm plus the stance profile's sword offset
+
+    combatPhysics.js then calculates:
+      supportBox       = simplified floor footprint around both feet
+      centerOfMass     = (bodyMass * bodyCom + swordMass * swordCom) /
+                         (bodyMass + swordMass)
+      stability.margin = distance from projected CoM to nearest support edge
+      criticalTipAngle = atan(edgeDistance / centerOfMassY)
+
+    This is a live diagnostic today. Later it can drive stumble checks, guard
+    recovery, enemy knockback, or "this swing is overextended" feedback.
+  */
+  const root = state.skeleton?.root;
+  const joints = state.skeleton?.joints;
+
+  if (!root || !joints || !profile) {
+    resetCombatBalanceEstimate();
+    return;
+  }
+
+  root.updateMatrixWorld(true);
+
+  const bodyCom = estimateBodyCenterOfMassRootLocal();
+  const swordCom = getJointLocalOffsetAsRootLocalPosition(
+    joints.rightPalm,
+    profile.swordComOffsetFromRightPalm,
+  );
+  const balance = evaluateCombatBalance({
+    leftFoot: getJointRootLocalPosition(joints.leftFoot),
+    rightFoot: getJointRootLocalPosition(joints.rightFoot),
+    bodyCom,
+    swordCom,
+    bodyMass: profile.bodyMass,
+    swordMass: profile.swordMass,
+    footHalfWidth: profile.footHalfWidth,
+    footHalfDepth: profile.footHalfDepth,
+  });
+
+  state.combatBalance = {
+    stance: profile.name,
+    supportBox: balance.supportBox,
+    centerOfMass: balance.centerOfMass,
+    stability: balance.stability,
+    criticalTipAngle: balance.criticalTipAngle,
+  };
+}
+
 function updateCombatStancePose(delta) {
   /*
-    Small full-body combat stance layered after idle/leg relaxation.
+    Applies the active full-body combat stance from combatPhysics.js.
 
-    This is intentionally conservative. The sword is still a prototype, so the
-    stance should read as "ready" without making the rig hard to inspect:
-      - body lowers a hair,
-      - pelvis/chest counter-rotate slightly,
-      - knees bend just enough to stop the T-pose mannequin feeling.
+    This function is the bridge between:
 
-    The arms are handled separately by getControlledArmPoseTargets("combat").
-    Keeping legs/body here and arms there makes future stance authoring easier:
-      body stance = this function
-      arm stance  = named pose block in getControlledArmPoseTargets()
+      combatPhysics.js = named stance profile and balance formulas
+      main.js          = actual Three.js joints that need to move
+
+    Low Guard now comes from the profile instead of hard-coded numbers in this
+    function. That means future stances can be added as data:
+
+      profile.pose.bodyOffset
+      profile.pose.pelvisRotation
+      profile.pose.leg.hipOffset
+      profile.pose.leg.kneeRotation
+      etc.
+
+    The arms are still handled by getControlledArmPoseTargets() because hand
+    poses need their own swing/wave/weapon timing logic.
   */
+  const profile = getCombatStanceProfile(controlState.combatStance);
+
+  if (!profile?.pose) {
+    resetCombatBalanceEstimate();
+    return;
+  }
+
   if (controlState.jump.phase !== "grounded") {
     return;
   }
 
   const joints = state.skeleton.joints;
+  const pose = profile.pose;
+  const legPose = pose.leg || {};
 
   dampJointPositionFromBind(
     joints.body,
-    { x: 0, y: -0.026, z: -0.012 },
+    pose.bodyOffset || { x: 0, y: 0, z: 0 },
     delta,
     rigTuning.damping * 0.82,
   );
   dampJointRotation(
     joints.pelvis,
-    new THREE.Euler(0.02, -0.055, 0.035),
+    makeSideScaledEuler(pose.pelvisRotation),
     delta,
     rigTuning.damping * 0.78,
   );
   dampJointRotation(
     joints.chest,
-    new THREE.Euler(-0.045, 0.07, -0.035),
+    makeSideScaledEuler(pose.chestRotation),
     delta,
     rigTuning.damping * 0.76,
   );
   dampJointRotation(
     joints.head,
-    new THREE.Euler(-0.012, 0.035, 0.01),
+    makeSideScaledEuler(pose.headRotation),
     delta,
     rigTuning.damping * 0.7,
   );
 
   ["left", "right"].forEach((sideName) => {
     const side = sideName === "left" ? -1 : 1;
+    const hip = joints[`${sideName}Hip`];
+    const knee = joints[`${sideName}Knee`];
+    const ankle = joints[`${sideName}Ankle`];
+    const foot = joints[`${sideName}Foot`];
+
+    /*
+      Position offsets widen the stance and sink the knee/ankle line.
+
+      Rotation offsets create the visual bend. The side-scaled profile fields
+      mirror the same stance to both legs while preserving left/right symmetry.
+    */
+    dampJointPositionFromBind(
+      hip,
+      makeSideScaledVector(legPose.hipOffset, side),
+      delta,
+      rigTuning.damping * 0.8,
+    );
+    dampJointPositionFromBind(
+      knee,
+      makeSideScaledVector(legPose.kneeOffset, side),
+      delta,
+      rigTuning.damping * 0.8,
+    );
+    dampJointPositionFromBind(
+      ankle,
+      makeSideScaledVector(legPose.ankleOffset, side),
+      delta,
+      rigTuning.damping * 0.8,
+    );
+    dampJointPositionFromBind(
+      foot,
+      makeSideScaledVector(legPose.footOffset, side),
+      delta,
+      rigTuning.damping * 0.8,
+    );
 
     dampJointRotation(
-      joints[`${sideName}Hip`],
-      new THREE.Euler(0.075, side * 0.018, side * 0.055),
+      hip,
+      makeSideScaledEuler(legPose.hipRotation, side),
       delta,
       rigTuning.damping * 0.78,
     );
     dampJointRotation(
-      joints[`${sideName}Knee`],
-      new THREE.Euler(0.15, 0, side * 0.018),
+      knee,
+      makeSideScaledEuler(legPose.kneeRotation, side),
       delta,
       rigTuning.damping * 0.78,
     );
     dampJointRotation(
-      joints[`${sideName}Ankle`],
-      new THREE.Euler(-0.045, side * 0.012, 0),
+      ankle,
+      makeSideScaledEuler(legPose.ankleRotation, side),
+      delta,
+      rigTuning.damping * 0.78,
+    );
+    dampJointRotation(
+      foot,
+      makeSideScaledEuler(legPose.footRotation, side),
       delta,
       rigTuning.damping * 0.78,
     );
   });
+
+  updateCombatBalanceEstimate(profile);
 }
 
 function updateJumpPose(delta) {
@@ -5350,7 +5788,7 @@ function updateControlledArms(delta, currentTime) {
     !swordSwinging &&
     controlState.rightArm === "swing"
   ) {
-    controlState.rightArm = "combat";
+    controlState.rightArm = getReadySwordArmPose();
   }
 
   const leftState = isWaving ? "wave" : controlState.leftArm;
@@ -5388,6 +5826,7 @@ function getControlledArmPoseTargets(sideName, side, pose, currentTime) {
       half = both hands half high
       up   = selected arm high
       wave = temporary waving pose with wrist/palm oscillation
+      lowGuard = sword drawn, blade/hand carried low and grounded
       combat = right hand forward, ready to hold a weapon
       swing  = timed sword attack pose
 
@@ -5442,6 +5881,32 @@ function getControlledArmPoseTargets(sideName, side, pose, currentTime) {
     elbow = new THREE.Euler(0.18, 0, side * (0.25 + wave));
     wrist = new THREE.Euler(0.1, 0, side * wave * 0.8);
     palm = new THREE.Euler(0.08, 0, side * wave * 0.65);
+  } else if (pose === "lowGuard") {
+    /*
+      Low Guard arm pose:
+        The body/legs lower and widen through updateCombatStancePose().
+        The arms here keep the hands down near the lower torso so the drawn
+        sword reads as carried, ready, and stable instead of held high.
+
+      Right arm:
+        The weapon hand sits forward and low. The elbow stays bent so a swing
+        can launch from the guard without snapping out of a straight arm.
+
+      Left arm:
+        The off hand comes slightly forward for balance. It does not grab the
+        sword yet, but it gives the pose a deliberate two-sided guard.
+    */
+    if (sideName === "right") {
+      shoulder = new THREE.Euler(0.1, side * 0.08, side * 0.58);
+      elbow = new THREE.Euler(0.72, -side * 0.05, side * 0.14);
+      wrist = new THREE.Euler(0.28, side * 0.04, -side * 0.18);
+      palm = new THREE.Euler(0.04, 0, side * 0.08);
+    } else {
+      shoulder = new THREE.Euler(-0.02, side * 0.04, side * 0.68);
+      elbow = new THREE.Euler(0.52, -side * 0.02, side * 0.12);
+      wrist = new THREE.Euler(0.16, 0, -side * 0.1);
+      palm = new THREE.Euler(0.04, 0, side * 0.06);
+    }
   } else if (pose === "combat") {
     /*
       Sword guard pose:
