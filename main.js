@@ -70,7 +70,7 @@ import {
   syncImportedSkinToPuppet,
 } from "./skin.js";
 
-const APP_VERSION = "0.1.40-alpha";
+const APP_VERSION = "0.1.41-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -123,20 +123,24 @@ const SOLO_TWEAKS = {
     wheelMaxDistance: 18,
   },
 
-  jupiter: {
-    // This uses the texture you added in assets/Jupiter.jpg.
-    texturePath: "assets/Jupiter.jpg",
-    radius: 8,
-    widthSegments: 32,
-    heightSegments: 16,
-    position: [0, 15, -20],
-    color: 0x7a7979,
+  skyMoon: {
+    /*
+      Replaces the old procedural Jupiter sphere with your moon.glb.
+
+      The previous Jupiter radius was 8, so its visual diameter was roughly 16
+      scene units. A target diameter of 8 makes the GLB about half that size.
+      The previous Y was 15; 12.75 is 15% lower.
+    */
+    assetPath: "assets/moon.glb",
+    targetDiameter: 8,
+    position: [0, 12.75, -20],
+    fallbackColor: 0x7a7979,
   },
 
   audio: {
     // Browsers often block autoplay until the user interacts with the page.
     // The play() call below catches that gracefully so the console stays clean.
-    backgroundPath: "assets/background.mp3",
+    backgroundPath: "assets/ambient.ogg",
     loop: true,
     autoplay: true,
   },
@@ -600,37 +604,100 @@ ghostSpheres.forEach((sphere) => scene.add(sphere.group));
 
 //-------------------------------------------------------------
 //-------------------------------------------------------------
-// JUPITER / SKY FOCAL POINT
+// MOON / SKY FOCAL POINT
 /*
-  This is the big planet you added.
+  This replaces the old procedural Jupiter sphere with your moon.glb.
 
-  It is intentionally not part of collision. It is a sky/world object: a visual
-  anchor that sits above the exploration area. If you want to move, resize, or
-  swap it, start with SOLO_TWEAKS.jupiter near the top of this file.
+  Compatibility note:
+    The variable is still named jupiter because older encounter and G53 code
+    already passes a "jupiter" scene reference around. Keeping that handle means
+    the sky-object plumbing stays stable while the visible object becomes the
+    moon.
 */
-const loader = new THREE.TextureLoader();
-const jupiterTexture = loader.load(
-  SOLO_TWEAKS.jupiter.texturePath,
-  () => console.log("Jupiter texture loaded successfully."),
-  undefined,
-  (error) => console.error("Error loading Jupiter texture:", error),
-);
-const jupiter = new THREE.Mesh(
-  new THREE.SphereGeometry(
-    SOLO_TWEAKS.jupiter.radius,
-    SOLO_TWEAKS.jupiter.widthSegments,
-    SOLO_TWEAKS.jupiter.heightSegments,
-  ),
-  new THREE.MeshBasicMaterial({
-    // MeshBasicMaterial is unlit, so Jupiter remains visible without needing
-    // scene lights or emissive material settings.
-    map: jupiterTexture,
-    color: SOLO_TWEAKS.jupiter.color,
-  }),
-);
-jupiter.name = "sky-jupiter";
+const jupiter = createSkyMoon();
 scene.add(jupiter);
-jupiter.position.set(...SOLO_TWEAKS.jupiter.position);
+
+function createSkyMoon() {
+  /*
+    Builds a stable sky-object group immediately, then loads moon.glb into it.
+
+    The fallback sphere keeps a visible sky focal point if the GLB is still
+    loading or if the asset path ever breaks. Once moon.glb arrives, the
+    fallback hides and the normalized GLB takes over.
+  */
+  const group = new THREE.Group();
+  const fallback = new THREE.Mesh(
+    new THREE.SphereGeometry(
+      SOLO_TWEAKS.skyMoon.targetDiameter * 0.5,
+      24,
+      14,
+    ),
+    new THREE.MeshBasicMaterial({
+      color: SOLO_TWEAKS.skyMoon.fallbackColor,
+    }),
+  );
+
+  group.name = "sky-moon";
+  group.userData.g53VisibilityRole = "sky";
+  group.userData.fallback = fallback;
+  group.position.set(...SOLO_TWEAKS.skyMoon.position);
+  group.add(fallback);
+
+  const moonLoader = new GLTFLoader();
+  moonLoader.load(
+    SOLO_TWEAKS.skyMoon.assetPath,
+    (gltf) => {
+      const moon = gltf.scene;
+
+      moon.name = "sky-moon-model";
+      normalizeSkyMoonModel(moon);
+      fallback.visible = false;
+      group.add(moon);
+      console.info("[sky] moon loaded", SOLO_TWEAKS.skyMoon.assetPath);
+    },
+    undefined,
+    (error) => {
+      console.warn("[sky] failed to load moon.glb; using fallback sphere", error);
+    },
+  );
+
+  return group;
+}
+
+function normalizeSkyMoonModel(model) {
+  /*
+    Fits moon.glb to the requested sky size.
+
+    Formula:
+      scale = targetDiameter / max(measuredWidth, measuredHeight, measuredDepth)
+
+    The model is then centered on the sky group origin. The sky group's position
+    handles the final world placement.
+  */
+  model.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const maxAxis = Math.max(size.x, size.y, size.z);
+
+  if (maxAxis <= 0.0001) {
+    return;
+  }
+
+  model.scale.multiplyScalar(SOLO_TWEAKS.skyMoon.targetDiameter / maxAxis);
+  model.updateMatrixWorld(true);
+
+  const fittedBox = new THREE.Box3().setFromObject(model);
+  const center = fittedBox.getCenter(new THREE.Vector3());
+
+  model.position.sub(center);
+  model.traverse((child) => {
+    child.userData.g53VisibilityRole = "sky";
+
+    if (child.isMesh) {
+      child.frustumCulled = false;
+    }
+  });
+}
 
 const rigHeightDisk = buildRigHeightDisk();
 scene.add(rigHeightDisk);
@@ -1844,7 +1911,10 @@ function createDebugView(skeleton, options = {}) {
   const boneLines = [];
   const selectableMarkers = [];
   let skeletonOpacity = THREE.MathUtils.clamp(options.opacity ?? 1, 0, 1);
-  const applyObjectOpacity = (object, baseOpacity = object.userData.debugBaseOpacity ?? 1) => {
+  const applyObjectOpacity = (
+    object,
+    baseOpacity = object.userData.debugBaseOpacity ?? 1,
+  ) => {
     /*
       Skeleton opacity is a multiplier, not a replacement.
 
@@ -2572,10 +2642,7 @@ function getG53WorldOpacityForRole(role) {
   return null;
 }
 
-function rememberG53ObjectVisibility(
-  object,
-  capturedMaterials = new Set(),
-) {
+function rememberG53ObjectVisibility(object, capturedMaterials = new Set()) {
   /*
     Stores the exact values we change so exitG53VisibilityFixture() can restore
     them without guessing. This includes object.visible and per-material opacity.
@@ -2842,12 +2909,12 @@ function enterG53RiggingMode() {
     controlState.isWalking = false;
     controlState.waveUntil = 0;
     controlState.wasWaving = false;
-  controlState.leftArm = "down";
-  controlState.rightArm = "down";
-  controlState.combatStance = COMBAT_STANCE_NAMES.NONE;
-  resetCombatBalanceEstimate();
-  controlState.swordSwingStart = 0;
-  controlState.swordSwingUntil = 0;
+    controlState.leftArm = "down";
+    controlState.rightArm = "down";
+    controlState.combatStance = COMBAT_STANCE_NAMES.NONE;
+    resetCombatBalanceEstimate();
+    controlState.swordSwingStart = 0;
+    controlState.swordSwingUntil = 0;
     resetWalkArmSwingState();
     Object.assign(controlState.jump, {
       phase: "grounded",
@@ -2881,14 +2948,19 @@ function enterG53RiggingMode() {
     applyG53VisibilityFixture();
     updateGuiDisplays();
     updateG53RiggingStatus("ACTIVE - HOME X0 Z0 YAW0 - WORLD FADED");
-    console.info("[G53] rigging mode active: home position and mouse point edit enabled");
+    console.info(
+      "[G53] rigging mode active: home position and mouse point edit enabled",
+    );
   } catch (error) {
     /*
       If any setup step fails, G53 must not remain half-entered. A partial enter
       is worse than a clean refusal because active=true freezes movement and the
       pose loop, but the visibility fixture/status may not be applied.
     */
-    console.error("[G53] failed to enter rigging mode; restoring saved state", error);
+    console.error(
+      "[G53] failed to enter rigging mode; restoring saved state",
+      error,
+    );
     state.g53RiggingMode.active = false;
     state.g53RiggingMode.saved = null;
     restoreG53VisibilityFixture();
@@ -3083,14 +3155,14 @@ function buildGui() {
     "A pose": "aPose",
     "T pose": "tPose",
   }).name("start pose");
-  meshFolder
-    .add({ fn: applyRigMeshStartPose }, "fn")
-    .name("apply start pose");
+  meshFolder.add({ fn: applyRigMeshStartPose }, "fn").name("apply start pose");
   meshFolder
     .add({ fn: restoreRuntimeArmBindRotations }, "fn")
     .name("restore gameplay arms");
   meshFolder.add({ fn: renderDefaultImportedMesh }, "fn").name("1  preview");
-  meshFolder.add({ fn: rigCurrentImportedMeshAndExitG53 }, "fn").name("2  rig mesh");
+  meshFolder
+    .add({ fn: rigCurrentImportedMeshAndExitG53 }, "fn")
+    .name("2  rig mesh");
   meshFolder.add({ fn: loadDefaultImportedMesh }, "fn").name("quick rig");
   meshFolder.add({ fn: rerigImportedMesh }, "fn").name("re-rig");
   meshFolder.add({ fn: clearImportedMesh }, "fn").name("clear mesh");
@@ -3132,13 +3204,34 @@ function buildGui() {
   )
     .name("scale")
     .onFinishChange(refreshImportedMeshReference);
-  addGuiController(transformFolder, rigTuning, "importedMeshOffsetX", -4, 4, 0.01)
+  addGuiController(
+    transformFolder,
+    rigTuning,
+    "importedMeshOffsetX",
+    -4,
+    4,
+    0.01,
+  )
     .name("offset X")
     .onFinishChange(refreshImportedMeshReference);
-  addGuiController(transformFolder, rigTuning, "importedMeshOffsetY", -4, 4, 0.01)
+  addGuiController(
+    transformFolder,
+    rigTuning,
+    "importedMeshOffsetY",
+    -4,
+    4,
+    0.01,
+  )
     .name("offset Y")
     .onFinishChange(refreshImportedMeshReference);
-  addGuiController(transformFolder, rigTuning, "importedMeshOffsetZ", -4, 4, 0.01)
+  addGuiController(
+    transformFolder,
+    rigTuning,
+    "importedMeshOffsetZ",
+    -4,
+    4,
+    0.01,
+  )
     .name("offset Z")
     .onFinishChange(refreshImportedMeshReference);
   addGuiController(
@@ -3228,19 +3321,41 @@ function buildGui() {
   addGuiController(motionFolder, rigTuning, "motionSpeed", 0.1, 2.2, 0.01).name(
     "speed",
   );
-  addGuiController(motionFolder, rigTuning, "breathingAmplitude", 0, 0.09, 0.001).name(
-    "breathing",
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "breathingAmplitude",
+    0,
+    0.09,
+    0.001,
+  ).name("breathing");
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "headDriftAmplitude",
+    0,
+    0.28,
+    0.001,
+  ).name("head drift");
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "torsoSwayAmplitude",
+    0,
+    0.16,
+    0.001,
+  ).name("torso sway");
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "armTrailAmplitude",
+    0,
+    0.36,
+    0.001,
+  ).name("arm trail");
+  addGuiController(motionFolder, rigTuning, "damping", 1.2, 10, 0.01).name(
+    "damping",
   );
-  addGuiController(motionFolder, rigTuning, "headDriftAmplitude", 0, 0.28, 0.001).name(
-    "head drift",
-  );
-  addGuiController(motionFolder, rigTuning, "torsoSwayAmplitude", 0, 0.16, 0.001).name(
-    "torso sway",
-  );
-  addGuiController(motionFolder, rigTuning, "armTrailAmplitude", 0, 0.36, 0.001).name(
-    "arm trail",
-  );
-  addGuiController(motionFolder, rigTuning, "damping", 1.2, 10, 0.01).name("damping");
   addGuiController(motionFolder, rigTuning, "walkAmplitude", 0, 1.4, 0.01).name(
     "walk amplitude",
   );
@@ -3274,22 +3389,42 @@ function buildGui() {
   addGuiController(motionFolder, rigTuning, "jumpHeight", 0.05, 2.5, 0.01).name(
     "jump height",
   );
-  addGuiController(motionFolder, rigTuning, "jumpDuration", 0.28, 1.8, 0.01).name(
-    "jump duration",
-  );
-  addGuiController(motionFolder, rigTuning, "jumpGravityScale", 0.35, 2.4, 0.01).name(
-    "gravity feel",
-  );
-  addGuiController(motionFolder, rigTuning, "jumpCrouchDepth", 0, 0.45, 0.005).name(
-    "jump crouch",
-  );
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "jumpDuration",
+    0.28,
+    1.8,
+    0.01,
+  ).name("jump duration");
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "jumpGravityScale",
+    0.35,
+    2.4,
+    0.01,
+  ).name("gravity feel");
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "jumpCrouchDepth",
+    0,
+    0.45,
+    0.005,
+  ).name("jump crouch");
   addGuiController(motionFolder, rigTuning, "colliderRadius", 0.08, 1.4, 0.01)
     .name("collider radius")
     .onChange(updateRigColliderVisual);
   motionFolder.add({ fn: startJump }, "fn").name("test jump");
-  addGuiController(motionFolder, rigTuning, "phaseOffset", -Math.PI, Math.PI, 0.01).name(
-    "phase offset",
-  );
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "phaseOffset",
+    -Math.PI,
+    Math.PI,
+    0.01,
+  ).name("phase offset");
   motionFolder.close();
 
   // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3352,7 +3487,12 @@ function buildGui() {
   addGuiController(alignmentFolder, rigTuning, "labelScale", 0.35, 2.2, 0.01)
     .name("label scale")
     .onChange(applyVisibility);
-  addGuiController(alignmentFolder, rigTuning, "axisMarkerJoint", AXIS_MARKER_JOINTS)
+  addGuiController(
+    alignmentFolder,
+    rigTuning,
+    "axisMarkerJoint",
+    AXIS_MARKER_JOINTS,
+  )
     .name("axis joint")
     .onChange(updateAxisMarkerAttachment);
   addGuiController(
@@ -3370,7 +3510,12 @@ function buildGui() {
     .onChange(() => {
       selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
     });
-  addGuiController(alignmentFolder, rigTuning, "mouseJointEditJoint", MOUSE_EDIT_JOINTS)
+  addGuiController(
+    alignmentFolder,
+    rigTuning,
+    "mouseJointEditJoint",
+    MOUSE_EDIT_JOINTS,
+  )
     .name("selected point")
     .onChange(selectMouseJointEditJoint);
   alignmentFolder.close();
@@ -3434,8 +3579,14 @@ function buildGui() {
   )
     .name("local Z")
     .onChange(applyDevProbePosition);
-  addGuiController(devProbeFolder, rigTuning, "devProbeStep", 0.001, 0.25, 0.001)
-    .name("key step");
+  addGuiController(
+    devProbeFolder,
+    rigTuning,
+    "devProbeStep",
+    0.001,
+    0.25,
+    0.001,
+  ).name("key step");
   state.devProbe.readoutControllers.push(
     devProbeFolder.add(state.devProbe.readout, "world").name("world"),
     devProbeFolder.add(state.devProbe.readout, "rigLocal").name("rig local"),
@@ -3453,7 +3604,9 @@ function buildGui() {
   saveFolder.add({ fn: saveRigTuningToBrowser }, "fn").name("save tuning");
   saveFolder.add({ fn: loadRigTuningFromBrowser }, "fn").name("load saved");
   saveFolder.add({ fn: resetRigTuningToDefaults }, "fn").name("reset defaults");
-  saveFolder.add({ fn: exportRigTuningToConsole }, "fn").name("copy / log JSON");
+  saveFolder
+    .add({ fn: exportRigTuningToConsole }, "fn")
+    .name("copy / log JSON");
   saveFolder.add({ fn: clearSavedRigTuning }, "fn").name("clear saved");
   saveFolder.close();
 
@@ -3536,13 +3689,27 @@ function buildGui() {
   addGuiController(swordFolder, rigTuning, "swordOffsetZ", -1, 1, 0.005)
     .name("pos Z")
     .onChange(syncSwordAttachment);
-  addGuiController(swordFolder, rigTuning, "swordPitch", -Math.PI, Math.PI, 0.005)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordPitch",
+    -Math.PI,
+    Math.PI,
+    0.005,
+  )
     .name("pitch X")
     .onChange(syncSwordAttachment);
   addGuiController(swordFolder, rigTuning, "swordYaw", -Math.PI, Math.PI, 0.005)
     .name("yaw Y")
     .onChange(syncSwordAttachment);
-  addGuiController(swordFolder, rigTuning, "swordRoll", -Math.PI, Math.PI, 0.005)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordRoll",
+    -Math.PI,
+    Math.PI,
+    0.005,
+  )
     .name("roll Z")
     .onChange(syncSwordAttachment);
   swordFolder.add({ fn: reloadSwordAsset }, "fn").name("reload sword");
@@ -3815,7 +3982,11 @@ function animate(currentTime) {
         controlState.position.z + rigTuning.rootOffsetZ,
       ),
       state.worldDebugView,
-      { audio: myAudio, jupiter, defaultJupiterColor: SOLO_TWEAKS.jupiter.color },
+      {
+        audio: myAudio,
+        jupiter,
+        defaultJupiterColor: SOLO_TWEAKS.skyMoon.fallbackColor,
+      },
     );
   }
   // Combat encounter tick: state machine handles trigger/start/roll/active/hiding/end.
@@ -4550,7 +4721,10 @@ function polishSwordMeshForVisibility(mesh) {
 
     if (material.emissive) {
       material.emissive.set("#1f1f1f");
-      material.emissiveIntensity = Math.max(material.emissiveIntensity || 0, 0.12);
+      material.emissiveIntensity = Math.max(
+        material.emissiveIntensity || 0,
+        0.12,
+      );
     }
 
     if ("envMapIntensity" in material) {
@@ -4584,7 +4758,9 @@ function normalizeSwordModel(swordRoot) {
   const sourceBox = getSwordLocalBoundingBox(swordRoot);
 
   if (!sourceBox) {
-    console.warn("[sword] could not find sword mesh bounds; leaving scale unchanged");
+    console.warn(
+      "[sword] could not find sword mesh bounds; leaving scale unchanged",
+    );
     return;
   }
 
@@ -4592,11 +4768,17 @@ function normalizeSwordModel(swordRoot) {
   const longestSide = Math.max(sourceSize.x, sourceSize.y, sourceSize.z);
 
   if (!Number.isFinite(longestSide) || longestSide <= 0.0001) {
-    console.warn("[sword] could not measure sword asset; leaving scale unchanged");
+    console.warn(
+      "[sword] could not measure sword asset; leaving scale unchanged",
+    );
     return;
   }
 
-  const targetLength = THREE.MathUtils.clamp(rigTuning.swordTargetLength, 0.05, 4);
+  const targetLength = THREE.MathUtils.clamp(
+    rigTuning.swordTargetLength,
+    0.05,
+    4,
+  );
   const gripFromLowerEnd = THREE.MathUtils.clamp(
     rigTuning.swordGripFromLowerEnd,
     0,
@@ -4973,7 +5155,10 @@ async function copyDevProbeRigLocal() {
   try {
     await navigator.clipboard?.writeText(text);
   } catch (error) {
-    console.warn("[devProbe] clipboard write blocked; value logged instead", error);
+    console.warn(
+      "[devProbe] clipboard write blocked; value logged instead",
+      error,
+    );
   }
 }
 

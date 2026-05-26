@@ -4,7 +4,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.40-alpha`
+- Empyrean build: `0.1.41-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -16,7 +16,7 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - full puppet skeleton
 - joint markers and labels
 - local axis marker
-- low-poly tree colliders outside
+- GLB tree and dead-tree props with existing tree colliders outside
 - floating ghostly wireframe spheres
 - wide proportion sliders
 - per-joint X/Y/Z point offsets
@@ -55,6 +55,7 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - pure combat balance math module and Low Guard stance on sword draw
 - neutral body/knee facing correction so anatomical right/left and foot direction read correctly while the related Y bind-rotation sliders read zero
 - Empyrean room aesthetic pass with stone floor/wall textures, 80% room walls, dim torch props, and warm torch light sources
+- moon.glb sky focal point replacing the old Jupiter sphere
 
 ---
 
@@ -170,6 +171,7 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 
 ## Change Notes
 
+- `0.1.41-alpha`: Replaced the outside primitive trees with alternating `tree.glb` and `deadTree.glb` props while keeping the existing circular tree colliders, and replaced the old Jupiter sphere with `moon.glb` at about half the previous visual size and 15% lower on Y.
 - `0.1.40-alpha`: Applied `stoneFloorDiff.jpg`/`stoneFloorDisp.png` to room floors, `stoneWallDiff.jpg`/`StoneWallDisp.png` to room walls and ceilings, shifted room surfaces to dull gray, raised room wall opacity to 80%, added two `torch.glb` props per inside wall, and made each torch a dim warm point-light source.
 - `0.1.39-alpha`: Applied the same fixture-zero facing correction to `leftKnee` and `rightKnee`, giving each knee a neutral `-PI` base yaw so the shin/ankle/foot chains face correctly while their GUI Y bind-rotation sliders remain `0`; old near-PI knee Y fixes migrate back to zero.
 - `0.1.38-alpha`: Baked the 180-degree body-facing correction into the body joint's base bind pose so anatomical right/left matches the feet while the GUI bind-pose body Y value reads `0`; old saved `body Y ~= +/-PI` facing fixes now migrate back to zero.
@@ -1119,3 +1121,14 @@ This build gives the rooms their first dedicated Empyrean stone pass.
 - Added a dim warm point light and small glow marker to every torch mount.
 - Reduced the global room lighting so the torches carry more of the interior mood.
 - Kept the outside enclosure materials untouched.
+
+## V0.1.41 Alpha Dev Build
+
+This build makes the outside and sky match the darker room mood.
+
+- Replaced the visible primitive outside trees with alternating `assets/tree.glb` and `assets/deadTree.glb` props.
+- Kept the existing circular tree colliders so movement behavior does not change.
+- Normalized both tree GLBs to predictable world heights before cloning them into the old tree positions.
+- Replaced the old procedural Jupiter sphere with `assets/moon.glb`.
+- Set the moon to about half the old Jupiter visual diameter and 15% lower on the Y axis.
+- Kept the old internal `jupiter` scene-reference name so existing G53 and encounter plumbing still works.

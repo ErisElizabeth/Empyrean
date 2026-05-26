@@ -82,6 +82,10 @@ const WORLD_TWEAKS = {
   },
   trees: {
     colliderRadius: 1.15,
+    liveAssetPath: "assets/tree.glb",
+    deadAssetPath: "assets/deadTree.glb",
+    targetHeight: 5.2,
+    deadTargetHeight: 5.0,
   },
 };
 
@@ -116,6 +120,18 @@ const gltfLoader = new GLTFLoader();
 let torchPrototype = null;
 let torchIsLoading = false;
 const pendingTorchMounts = [];
+const treeAssetState = {
+  /*
+    GLB tree cache.
+
+    The outside forest still uses the same simple circular colliders as before,
+    but the visible meshes now come from tree.glb and deadTree.glb. Each asset
+    is loaded once, normalized to a predictable height, then cloned into the
+    individual tree placeholders.
+  */
+  live: { prototype: null, loading: false, pending: [] },
+  dead: { prototype: null, loading: false, pending: [] },
+};
 
 function loadRepeatedTexture(path, repeatX, repeatY, colorSpace = null) {
   /*
@@ -710,30 +726,142 @@ function buildLowPolyTrees(parent) {
   ];
 
   treePositions.forEach(([x, z], index) => {
-    const tree = createLowPolyTree(index);
+    const tree = createTreeProp(index);
+
     tree.position.set(x, 0, z);
     parent.add(tree);
     addSolidCircle(x, z, treeColliderRadius);
   });
 }
 
-function createLowPolyTree(index) {
-  // 7-segment cone gives a deliberate low-poly tabletop look.
-  const group  = new THREE.Group();
-  const trunk  = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.28, 1.35, 7), treeTrunkMaterial);
-  const leaves = new THREE.Mesh(new THREE.ConeGeometry(1.15, 3.2, 7),            treeLeafMaterial);
+function createTreeProp(index) {
+  /*
+    Creates one outside tree placeholder, then fills it with a GLB clone.
 
-  group.name = `low-poly-tree-${index + 1}`;
+    Half the old primitive trees become live tree.glb, half become deadTree.glb.
+    Alternating them keeps the outside silhouette varied without moving the
+    collision circles or hand-placed positions.
+  */
+  const group = new THREE.Group();
+  const kind = index % 2 === 0 ? "live" : "dead";
+
+  group.name = `${kind}-glb-tree-${index + 1}`;
   group.userData.g53VisibilityRole = "tree";
-  trunk.name = `${group.name}-trunk`;
-  leaves.name = `${group.name}-leaves`;
-  trunk.userData.g53VisibilityRole = "tree";
-  leaves.userData.g53VisibilityRole = "tree";
-  trunk.position.y  = 0.675;
-  leaves.position.y = 2.45;
-  leaves.rotation.y = index * 0.37;
-  group.add(trunk, leaves);
+  group.rotation.y = index * 0.37;
+  attachTreeModelWhenReady(group, kind);
   return group;
+}
+
+function getTreeAssetConfig(kind) {
+  if (kind === "dead") {
+    return {
+      path: WORLD_TWEAKS.trees.deadAssetPath,
+      targetHeight: WORLD_TWEAKS.trees.deadTargetHeight,
+      state: treeAssetState.dead,
+    };
+  }
+
+  return {
+    path: WORLD_TWEAKS.trees.liveAssetPath,
+    targetHeight: WORLD_TWEAKS.trees.targetHeight,
+    state: treeAssetState.live,
+  };
+}
+
+function attachTreeModelWhenReady(mount, kind) {
+  /*
+    Same pattern as torches:
+      1. Create all placeholders immediately.
+      2. Load each GLB once.
+      3. Clone the normalized prototype into every waiting placeholder.
+
+    The tree placeholders are what G53 hides and what the world owns. The model
+    clone is only the visible art inside that stable placeholder.
+  */
+  const config = getTreeAssetConfig(kind);
+
+  if (config.state.prototype) {
+    mount.add(cloneTreeModel(config.state.prototype, mount.name));
+    return;
+  }
+
+  config.state.pending.push(mount);
+
+  if (config.state.loading) {
+    return;
+  }
+
+  config.state.loading = true;
+  gltfLoader.load(
+    config.path,
+    (gltf) => {
+      const prototype = gltf.scene;
+
+      prototype.name = `${kind}-tree-prototype`;
+      normalizeTreePrototype(prototype, config.targetHeight);
+      config.state.prototype = prototype;
+      config.state.pending.splice(0).forEach((pendingMount) => {
+        pendingMount.add(cloneTreeModel(prototype, pendingMount.name));
+      });
+      config.state.loading = false;
+    },
+    undefined,
+    (error) => {
+      console.warn(`[world] failed to load ${config.path}`, error);
+      config.state.loading = false;
+    },
+  );
+}
+
+function normalizeTreePrototype(model, targetHeight) {
+  /*
+    Fits the imported tree to a predictable outside-world height.
+
+    Formula:
+      scale = targetHeight / measuredHeight
+
+    Then the model is shifted so:
+      - its X/Z center sits on the placeholder origin
+      - its bottom sits on local Y = 0
+
+    That lets the old tree position list continue to mean "tree trunk sits here
+    on the ground", just with better art.
+  */
+  model.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+
+  if (size.y <= 0.0001) {
+    return;
+  }
+
+  model.scale.multiplyScalar(targetHeight / size.y);
+  model.updateMatrixWorld(true);
+
+  const fittedBox = new THREE.Box3().setFromObject(model);
+  const center = fittedBox.getCenter(new THREE.Vector3());
+
+  model.position.x -= center.x;
+  model.position.z -= center.z;
+  model.position.y -= fittedBox.min.y;
+  model.traverse((child) => {
+    child.userData.g53VisibilityRole = "tree";
+
+    if (child.isMesh) {
+      child.castShadow = false;
+      child.receiveShadow = true;
+    }
+  });
+}
+
+function cloneTreeModel(prototype, namePrefix) {
+  const clone = prototype.clone(true);
+
+  clone.name = `${namePrefix}-model`;
+  clone.traverse((child) => {
+    child.userData.g53VisibilityRole = "tree";
+  });
+  return clone;
 }
 
 // =============================================================
@@ -1212,7 +1340,7 @@ function applyEncounterAction(action, encounter, phase, sceneRefs) {
       applyEncounterAudioAction(action, sceneRefs.audio);
       break;
     case "jupiterColor":
-      sceneRefs.jupiter.material.color.set(action.color || sceneRefs.defaultJupiterColor);
+      applySkyObjectColor(sceneRefs.jupiter, action.color || sceneRefs.defaultJupiterColor);
       break;
     case "jupiterScale":
       sceneRefs.jupiter.scale.setScalar(Number.isFinite(action.scale) ? action.scale : 1);
@@ -1220,6 +1348,42 @@ function applyEncounterAction(action, encounter, phase, sceneRefs) {
     default:
       console.warn("Unknown encounter action.", { encounter, action });
       break;
+  }
+}
+
+function applySkyObjectColor(skyObject, color) {
+  /*
+    Encounter compatibility helper.
+
+    Older builds used one Mesh named "jupiter", so encounter color actions could
+    call jupiter.material.color directly. The sky object is now a moon.glb group,
+    which may contain several meshes. This helper applies the same tint to every
+    material under the group, while still supporting the old single-mesh path.
+  */
+  if (!skyObject) {
+    return;
+  }
+
+  const nextColor = new THREE.Color(color);
+
+  skyObject.traverse?.((child) => {
+    const materials = Array.isArray(child.material)
+      ? child.material
+      : child.material
+        ? [child.material]
+        : [];
+
+    materials.forEach((material) => {
+      if (material.color) {
+        material.color.copy(nextColor);
+        material.needsUpdate = true;
+      }
+    });
+  });
+
+  if (skyObject.material?.color) {
+    skyObject.material.color.copy(nextColor);
+    skyObject.material.needsUpdate = true;
   }
 }
 

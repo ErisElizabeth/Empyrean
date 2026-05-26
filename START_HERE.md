@@ -22,14 +22,14 @@ If those three things work, the project is in a sane state.
 
 ## Current Build
 
-Current build: `0.1.40-alpha`
+Current build: `0.1.41-alpha`
 
 The project currently has:
 
 - a Three.js exploration world
 - three connected rooms
 - an outside enclosure
-- Jupiter in the sky
+- moon.glb in the sky
 - background audio
 - loader overlay
 - puppet skeleton
@@ -59,6 +59,7 @@ The project currently has:
 - Low Guard stance on sword draw
 - neutral body/knee facing correction so `rightPalm` reads as anatomical right and lower legs/feet face correctly
 - stone room textures and dim torch lighting for the interior rooms
+- alternating tree.glb/deadTree.glb props outside
 - solo workflow docs
 - checkpoint and verify scripts
 
@@ -133,7 +134,7 @@ Recommended flow:
 
 ## Good 15-Minute Tasks
 
-- Move Jupiter with `SOLO_TWEAKS.jupiter.position`.
+- Move the moon with `SOLO_TWEAKS.skyMoon.position`.
 - Add one tree position in `buildLowPolyTrees`.
 - Add one encounter in `encounters.js`.
 - Tune camera distance in `SOLO_TWEAKS.camera`.
