@@ -24,7 +24,9 @@ import {
   getJumpLaunchVelocityValue,
   getJumpPoseWeightValues,
   getLegStrideValues as getPhysicsLegStrideValues,
+  getPelvisRunValues as getPhysicsPelvisRunValues,
   getPelvisWalkValues as getPhysicsPelvisWalkValues,
+  getRunStrideValues as getPhysicsRunStrideValues,
   smoothstep as physicsSmoothstep,
   updateJumpState,
 } from "./physics.js";
@@ -34,6 +36,18 @@ import {
   RIG_DIMENSION_CONTROLS,
   getRigStats,
 } from "./rig.js";
+import {
+  createPuppetRigPackage,
+  deletePuppetRigPackageFromLibrary,
+  extractRigTuningFromPackage,
+  getPuppetRigLibraryNames,
+  loadPuppetRigPackageFromLibrary,
+  normalizePuppetRigName,
+  parsePuppetRigPackageText,
+  savePuppetRigPackageToLibrary,
+  serializePuppetRigPackage,
+  summarizePuppetRigPackage,
+} from "./puppetShop.js";
 import {
   GUIDE_COLOR,
   buildExplorationWorld,
@@ -70,7 +84,7 @@ import {
   syncImportedSkinToPuppet,
 } from "./skin.js";
 
-const APP_VERSION = "0.1.41-alpha";
+const APP_VERSION = "0.1.45-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -103,8 +117,17 @@ const SOLO_TWEAKS = {
     // moveSpeed is forward/back keyboard speed in scene units per second.
     moveSpeed: 1.55,
 
+    // runSpeed is used while holding Shift and moving forward.
+    // It is paired with runPhaseSpeed below so the feet cycle faster when the
+    // player crosses the room faster.
+    runSpeed: 2.7,
+
     // walkPhaseSpeed is how quickly the leg cycle advances while walking.
     walkPhaseSpeed: 6.4,
+
+    // runPhaseSpeed is how quickly the leg cycle advances while running.
+    // Higher values mean faster turnover: more steps per second.
+    runPhaseSpeed: 9.8,
   },
 
   camera: {
@@ -132,8 +155,8 @@ const SOLO_TWEAKS = {
       The previous Y was 15; 12.75 is 15% lower.
     */
     assetPath: "assets/moon.glb",
-    targetDiameter: 8,
-    position: [0, 12.75, -20],
+    targetDiameter: 20,
+    position: [0, 5.75, -80],
     fallbackColor: 0x7a7979,
   },
 
@@ -292,30 +315,60 @@ const FACING_MIGRATION_EPSILON = 0.01;
 //=============================================================
 
 const loaderOverlay = document.getElementById("loader-overlay");
+const TITLE_CARD_MIN_VISIBLE_MS = 1600;
+const TITLE_CARD_SETTLE_FRAMES = 18;
+const titleCardStartedAt = performance.now();
 
 function revealWorkshop() {
+  /*
+    The title card is the curtain.
+
+    It should stay up long enough that the viewer can tell the app is loading,
+    and long enough that first-frame rig corrections happen behind it. The
+    minimum time gives the EMPYREAN gradient animation room to breathe. The
+    settle-frame countdown below gives Three.js several rendered frames to apply
+    matrix updates, bind pose corrections, debug bone refresh, and any damped
+    startup alignment before the scene is revealed.
+  */
+  const elapsed = performance.now() - titleCardStartedAt;
+  const remaining = Math.max(0, TITLE_CARD_MIN_VISIBLE_MS - elapsed);
+
   setTimeout(() => {
+    loaderOverlay?.setAttribute("aria-busy", "false");
     loaderOverlay?.classList.add("loader-hidden");
-  }, 500);
+  }, remaining);
+}
+
+function waitForTitleCardSettleFrames(framesRemaining) {
+  if (framesRemaining <= 0) {
+    revealWorkshop();
+    return;
+  }
+
+  requestAnimationFrame(() => {
+    waitForTitleCardSettleFrames(framesRemaining - 1);
+  });
 }
 
 function initWorkshopLoader() {
   try {
-    // Main Three.js setup already happens elsewhere:
-    // buildExplorationWorld(), buildSkeletonWorkshop(), buildGui(), animate(), etc.
-    // This loader simply gives the scene a moment to draw before revealing it.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        revealWorkshop();
-      });
-    });
+    /*
+      Important:
+        This function is called at the END of startup, after the world, skeleton,
+        GUI, event listeners, and first animation request have been created.
+
+      Earlier versions called it near the top of main.js. That made the overlay
+      disappear before the first bind-pose leg corrections were visually done,
+      so the user saw the lower legs rotate after the title card ended. Now the
+      title card waits for a short stack of animation frames before fading.
+    */
+    loaderOverlay?.setAttribute("aria-busy", "true");
+    waitForTitleCardSettleFrames(TITLE_CARD_SETTLE_FRAMES);
   } catch (err) {
     console.error("Workshop initialization failed", err);
     revealWorkshop();
   }
 }
-
-initWorkshopLoader();
 
 //=============================================================
 // LOADER OVERLAY LOGIC END
@@ -531,6 +584,8 @@ const RIG_TUNING_KEYS = [
   "swordPitch",
   "swordYaw",
   "swordRoll",
+  "puppetRigName",
+  "puppetRigNotes",
   "devProbeVisible",
   "devProbeX",
   "devProbeY",
@@ -564,6 +619,14 @@ const RIG_TUNING_KEYS = [
   "walkHipBob",
   "walkHipTilt",
   "walkHipTwist",
+  "runAmplitude",
+  "runStrideLength",
+  "runFootLift",
+  "runBounce",
+  "runForwardLean",
+  "runArmPump",
+  "runHipTwist",
+  "runShoulderTwist",
   "jumpHeight",
   "jumpDuration",
   "jumpGravityScale",
@@ -627,11 +690,7 @@ function createSkyMoon() {
   */
   const group = new THREE.Group();
   const fallback = new THREE.Mesh(
-    new THREE.SphereGeometry(
-      SOLO_TWEAKS.skyMoon.targetDiameter * 0.5,
-      24,
-      14,
-    ),
+    new THREE.SphereGeometry(SOLO_TWEAKS.skyMoon.targetDiameter * 0.5, 24, 14),
     new THREE.MeshBasicMaterial({
       color: SOLO_TWEAKS.skyMoon.fallbackColor,
     }),
@@ -657,7 +716,10 @@ function createSkyMoon() {
     },
     undefined,
     (error) => {
-      console.warn("[sky] failed to load moon.glb; using fallback sphere", error);
+      console.warn(
+        "[sky] failed to load moon.glb; using fallback sphere",
+        error,
+      );
     },
   );
 
@@ -811,6 +873,19 @@ const state = {
     },
     readoutControllers: [],
   },
+  puppetShop: {
+    /*
+      Puppet Shop is the rig/library side of the project.
+
+      Gameplay asks "where is the player and what are they doing?"
+      Puppet Shop asks "what reusable skeleton/mesh/motion setup is this?"
+
+      status is GUI-facing text only. The actual saved rig packages live in
+      browser localStorage through puppetShop.js.
+    */
+    status: "ready",
+    readoutControllers: [],
+  },
   importedPreview: null,
   importedSkin: null,
   importedMeshStatus: "no mesh loaded",
@@ -903,6 +978,8 @@ const controlState = {
   yaw: 0,
   position: new THREE.Vector3(0, 0, 0),
   walkPhase: 0,
+  isWalking: false,
+  isRunning: false,
   cameraYaw: 0,
   cameraDistance: SOLO_TWEAKS.camera.startDistance,
   cameraHeight: SOLO_TWEAKS.camera.startHeight,
@@ -1021,6 +1098,8 @@ function makeDefaultRigTuning() {
     swordPitch: SWORD_TWEAKS.localRotation[0],
     swordYaw: SWORD_TWEAKS.localRotation[1],
     swordRoll: SWORD_TWEAKS.localRotation[2],
+    puppetRigName: "Sigewynn player rig",
+    puppetRigNotes: "Reusable player/NPC skeleton package.",
     devProbeVisible: false,
     devProbeX: 0.25,
     devProbeY: 1.1,
@@ -1054,6 +1133,14 @@ function makeDefaultRigTuning() {
     walkHipBob: 0.026,
     walkHipTilt: 0.055,
     walkHipTwist: 0.045,
+    runAmplitude: 1,
+    runStrideLength: 0.58,
+    runFootLift: 0.18,
+    runBounce: 0.085,
+    runForwardLean: 0.12,
+    runArmPump: 0.72,
+    runHipTwist: 0.14,
+    runShoulderTwist: 0.18,
     jumpHeight: 0.85,
     jumpDuration: 0.9,
     jumpGravityScale: 1,
@@ -1179,6 +1266,14 @@ function sanitizeRigTuning(candidate) {
   ].forEach((key) => {
     clean[key] = Number.isFinite(clean[key]) ? clean[key] : defaults[key];
   });
+  clean.puppetRigName = normalizePuppetRigName(
+    clean.puppetRigName,
+    defaults.puppetRigName,
+  );
+  clean.puppetRigNotes =
+    typeof clean.puppetRigNotes === "string"
+      ? clean.puppetRigNotes
+      : defaults.puppetRigNotes;
 
   if (
     Math.abs(clean.swordPitch - Math.PI * 0.5) < 0.000001 &&
@@ -1365,6 +1460,7 @@ function resetRigTuningToDefaults() {
   assignRigTuningValues(makeDefaultRigTuning());
   state.runtimeArmBindRotationBackup = null;
   state.walkPhase = 0;
+  state.walkArmSwing = { left: 0, right: 0 };
   rebuildSkeletonWorkshop();
   updateGuiDisplays();
 }
@@ -1519,7 +1615,9 @@ function createJoint(name, position = [0, 0, 0]) {
 
       bindLocalEuler:
         The Euler-angle version of the bind rotation offset. Stored separately
-        because dampJointRotation() adds animation deltas in Euler space.
+        for GUI/debug readability. Runtime animation now layers deltas onto
+        bindLocalQuaternion so invisible fixture-zero corrections like the knee
+        -PI yaw cannot be accidentally erased by pose solvers.
 
       bindLocalScale:
         Neutral scale (1,1,1). Kept in userData so resetSkeletonToBindPose()
@@ -1791,30 +1889,17 @@ function updateRigColliderVisual() {
 
 function exportRigPackageToConsole() {
   /*
-    Exports the current workshop state as JSON.
+    Exports the current workshop state as a complete puppet rig package.
 
     This is not a file download. It logs the object to the console and attempts
     to copy the JSON to the clipboard for easy saving elsewhere.
   */
-  const payload = {
-    version: APP_VERSION,
-    exportedAt: new Date().toISOString(),
-    rigTuning: getSavableRigTuning(),
-    importedMesh: {
-      path: rigTuning.importedMeshPath,
-      status: state.importedMeshStatus,
-      stage: state.importedSkin
-        ? "rigged"
-        : state.importedPreview
-          ? "rendered reference"
-          : "not loaded",
-      bindMode: state.importedSkin ? "generated position weights" : "unbound",
-    },
-  };
-  const text = JSON.stringify(payload, null, 2);
+  const payload = makeCurrentPuppetRigPackage();
+  const text = serializePuppetRigPackage(payload);
 
   console.info("Empyrean rig package export:", payload);
   navigator.clipboard?.writeText?.(text).catch(() => null);
+  updatePuppetShopStatus(`copied ${summarizePuppetRigPackage(payload)}`);
 }
 
 function importRigPackageFromPrompt() {
@@ -1833,22 +1918,151 @@ function importRigPackageFromPrompt() {
   }
 
   try {
-    const payload = JSON.parse(text);
-    const values = payload.rigTuning || payload.values || payload;
+    const payload = parsePuppetRigPackageText(text);
 
-    assignRigTuningValues(sanitizeRigTuning({ ...rigTuning, ...values }));
-    state.walkPhase = 0;
-    rebuildSkeletonWorkshop();
-
-    if (rigTuning.importedMeshPath) {
-      loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
-    }
-
-    updateGuiDisplays();
+    applyPuppetRigPackage(payload);
     console.info("Imported Empyrean rig package.", payload);
   } catch (error) {
     console.error("Could not import Empyrean rig package JSON.", error);
+    updatePuppetShopStatus("import failed - see console");
   }
+}
+
+function getImportedMeshPackageSnapshot() {
+  /*
+    Captures the mesh-binding side of the puppet package.
+
+    The actual GLB bytes are not stored. A reusable package stores:
+      path      = where the GLB should be loaded from
+      stage     = whether the current scene has it previewed or rigged
+      bindMode  = how the mesh was bound to the skeleton
+
+    This keeps packages lightweight and portable while still telling future
+    NPC/enemy builders what mesh this rig was designed around.
+  */
+  return {
+    path: rigTuning.importedMeshPath,
+    status: state.importedMeshStatus,
+    stage: state.importedSkin
+      ? "rigged"
+      : state.importedPreview
+        ? "rendered reference"
+        : "not loaded",
+    bindMode: state.importedSkin ? "generated position weights" : "unbound",
+  };
+}
+
+function makeCurrentPuppetRigPackage() {
+  /*
+    Creates the reusable puppet package for the current workshop state.
+
+    This is the one approved packaging path. Save-to-library, copy-to-clipboard,
+    and old Mesh > export rig package all call this so they cannot drift apart.
+  */
+  return createPuppetRigPackage({
+    appVersion: APP_VERSION,
+    rigName: rigTuning.puppetRigName,
+    notes: rigTuning.puppetRigNotes,
+    rigTuning: getSavableRigTuning(),
+    importedMesh: getImportedMeshPackageSnapshot(),
+  });
+}
+
+function applyPuppetRigPackage(payload) {
+  /*
+    Applies a complete puppet rig package to the live workshop.
+
+    Separation rule:
+      puppetShop.js understands package shape and storage.
+      main.js understands how to apply sanitized rigTuning to live Three.js
+      joints, GUI sliders, imported mesh preview, sword attachment, and skin.
+
+    Import sequence:
+      1. Extract the rig tuning from new/old package shapes.
+      2. Sanitize against the current supported rig keys.
+      3. Assign values in place so lil-gui controllers remain valid.
+      4. Rebuild the skeleton.
+      5. Reload the referenced mesh preview if there is a path.
+  */
+  const values = extractRigTuningFromPackage(payload);
+  const packageName = normalizePuppetRigName(
+    payload?.metadata?.name || values?.puppetRigName,
+    rigTuning.puppetRigName,
+  );
+
+  assignRigTuningValues(
+    sanitizeRigTuning({
+      ...rigTuning,
+      ...values,
+      puppetRigName: packageName,
+    }),
+  );
+  state.runtimeArmBindRotationBackup = null;
+  state.walkPhase = 0;
+  state.walkArmSwing = { left: 0, right: 0 };
+  rebuildSkeletonWorkshop();
+
+  if (rigTuning.importedMeshPath) {
+    loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
+  }
+
+  updatePuppetShopStatus(`loaded ${summarizePuppetRigPackage(payload)}`);
+  updateGuiDisplays();
+}
+
+function updatePuppetShopStatus(message) {
+  state.puppetShop.status = message;
+  state.puppetShop.readoutControllers.forEach((controller) =>
+    controller.updateDisplay(),
+  );
+}
+
+function saveCurrentPuppetRigToLibrary() {
+  /*
+    Saves the current setup as a named reusable rig.
+
+    This is the payoff path for NPCs/enemies:
+      tune one skeleton carefully,
+      save it by name,
+      load it later as a base for another actor.
+  */
+  const payload = makeCurrentPuppetRigPackage();
+  const saved = savePuppetRigPackageToLibrary(window.localStorage, payload);
+
+  updatePuppetShopStatus(`saved ${summarizePuppetRigPackage(saved)}`);
+  console.info("[puppetShop] saved rig package", saved);
+}
+
+function loadNamedPuppetRigFromLibrary() {
+  const name = normalizePuppetRigName(rigTuning.puppetRigName);
+  const payload = loadPuppetRigPackageFromLibrary(window.localStorage, name);
+
+  if (!payload) {
+    updatePuppetShopStatus(`no saved rig named ${name}`);
+    console.warn("[puppetShop] no rig found in library", name);
+    return;
+  }
+
+  applyPuppetRigPackage(payload);
+  console.info("[puppetShop] loaded rig package", payload);
+}
+
+function deleteNamedPuppetRigFromLibrary() {
+  const name = normalizePuppetRigName(rigTuning.puppetRigName);
+  const deleted = deletePuppetRigPackageFromLibrary(window.localStorage, name);
+
+  updatePuppetShopStatus(
+    deleted ? `deleted ${name}` : `no saved rig named ${name}`,
+  );
+}
+
+function listPuppetRigLibrary() {
+  const names = getPuppetRigLibraryNames(window.localStorage);
+
+  updatePuppetShopStatus(
+    names.length ? `library: ${names.join(", ")}` : "library is empty",
+  );
+  console.info("[puppetShop] saved rig names", names);
 }
 
 function makeJointMarker(joint, markerRadius, material) {
@@ -2806,6 +3020,7 @@ function makeG53RiggingSnapshot() {
       yaw: controlState.yaw,
       walkPhase: controlState.walkPhase,
       isWalking: Boolean(controlState.isWalking),
+      isRunning: Boolean(controlState.isRunning),
       cameraYaw: controlState.cameraYaw,
       cameraDistance: controlState.cameraDistance,
       cameraHeight: controlState.cameraHeight,
@@ -2852,6 +3067,7 @@ function restoreG53RiggingSnapshot(saved) {
   controlState.yaw = saved.control.yaw;
   controlState.walkPhase = saved.control.walkPhase;
   controlState.isWalking = saved.control.isWalking;
+  controlState.isRunning = Boolean(saved.control.isRunning);
   controlState.cameraYaw = saved.control.cameraYaw;
   controlState.cameraDistance = saved.control.cameraDistance;
   controlState.cameraHeight = saved.control.cameraHeight;
@@ -2907,6 +3123,7 @@ function enterG53RiggingMode() {
     controlState.yaw = G53_RIGGING_HOME.yaw;
     controlState.walkPhase = 0;
     controlState.isWalking = false;
+    controlState.isRunning = false;
     controlState.waveUntil = 0;
     controlState.wasWaving = false;
     controlState.leftArm = "down";
@@ -3052,6 +3269,7 @@ function buildGui() {
     GUI panel structure (top to bottom):
 
       Mesh              â€” file browser, workflow steps, appearance, transform
+      Puppet Shop       â€” named reusable rig packages and local rig library
       Rig Dimensions    â€” body proportions (sliders)
       Pivot Offsets     â€” per-joint XYZ position nudges
       Bind Pose         â€” per-joint rest-pose rotations for mesh alignment
@@ -3275,6 +3493,47 @@ function buildGui() {
     .add({ fn: importRigPackageFromPrompt }, "fn")
     .name("import rig package");
 
+  // =============================================================
+  // PUPPET SHOP
+  // Rig identity and reusable complete rig packages.
+  // =============================================================
+  const puppetShopFolder = state.gui.addFolder("Puppet Shop");
+  state.guiFolders.puppetShop = puppetShopFolder;
+  /*
+    The Mesh folder is still the workbench for the currently visible GLB.
+    Puppet Shop is the library shelf:
+      - give the rig a name
+      - save it as a reusable skeleton package
+      - load it later for an NPC, enemy, or alternate player body
+
+    The saved package includes the same complete rigTuning object the live
+    puppet uses, plus readable metadata for future gameplay systems.
+  */
+  addGuiController(puppetShopFolder, rigTuning, "puppetRigName").name(
+    "rig name",
+  );
+  addGuiController(puppetShopFolder, rigTuning, "puppetRigNotes").name("notes");
+  state.puppetShop.readoutControllers.push(
+    puppetShopFolder.add(state.puppetShop, "status").name("status"),
+  );
+  puppetShopFolder
+    .add({ fn: saveCurrentPuppetRigToLibrary }, "fn")
+    .name("save named rig");
+  puppetShopFolder
+    .add({ fn: loadNamedPuppetRigFromLibrary }, "fn")
+    .name("load named rig");
+  puppetShopFolder
+    .add({ fn: deleteNamedPuppetRigFromLibrary }, "fn")
+    .name("delete named rig");
+  puppetShopFolder.add({ fn: listPuppetRigLibrary }, "fn").name("list rigs");
+  puppetShopFolder
+    .add({ fn: exportRigPackageToConsole }, "fn")
+    .name("copy complete rig");
+  puppetShopFolder
+    .add({ fn: importRigPackageFromPrompt }, "fn")
+    .name("paste complete rig");
+  puppetShopFolder.close();
+
   // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // RIG DIMENSIONS
   // Changes here rebuild the skeleton hierarchy from scratch. Drag slowly â€”
@@ -3386,6 +3645,50 @@ function buildGui() {
     0.16,
     0.001,
   ).name("hip twist");
+  addGuiController(motionFolder, rigTuning, "runAmplitude", 0, 1.5, 0.01).name(
+    "run amplitude",
+  );
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "runStrideLength",
+    0.18,
+    1.1,
+    0.005,
+  ).name("run stride");
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "runFootLift",
+    0.04,
+    0.5,
+    0.005,
+  ).name("run foot lift");
+  addGuiController(motionFolder, rigTuning, "runBounce", 0, 0.22, 0.001).name(
+    "run bounce",
+  );
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "runForwardLean",
+    0,
+    0.26,
+    0.001,
+  ).name("run lean");
+  addGuiController(motionFolder, rigTuning, "runArmPump", 0, 1.2, 0.005).name(
+    "run arm pump",
+  );
+  addGuiController(motionFolder, rigTuning, "runHipTwist", 0, 0.32, 0.001).name(
+    "run hip twist",
+  );
+  addGuiController(
+    motionFolder,
+    rigTuning,
+    "runShoulderTwist",
+    0,
+    0.38,
+    0.001,
+  ).name("run shoulder twist");
   addGuiController(motionFolder, rigTuning, "jumpHeight", 0.05, 2.5, 0.01).name(
     "jump height",
   );
@@ -4012,6 +4315,7 @@ function updateKeyboardMotion(delta, currentTime) {
     Movement controls:
       W/S = forward/back along the avatar's facing direction
       A/D = turn avatar left/right
+      Shift + W = run forward
 
     Camera controls:
       Left/Right arrows = orbit camera around avatar
@@ -4035,6 +4339,16 @@ function updateKeyboardMotion(delta, currentTime) {
     (keys.has("ArrowUp") ? -1 : 0) + (keys.has("ArrowDown") ? 1 : 0);
   const heightInput =
     (keys.has("PageUp") ? 1 : 0) + (keys.has("PageDown") ? -1 : 0);
+  const wantsRun =
+    !machineHomeActive &&
+    moveInput > 0 &&
+    (keys.has("ShiftLeft") || keys.has("ShiftRight"));
+  const movementSpeed = wantsRun
+    ? SOLO_TWEAKS.player.runSpeed
+    : SOLO_TWEAKS.player.moveSpeed;
+  const phaseSpeed = wantsRun
+    ? SOLO_TWEAKS.player.runPhaseSpeed
+    : SOLO_TWEAKS.player.walkPhaseSpeed;
 
   controlState.yaw += turnInput * delta * 2.2;
   controlState.cameraYaw +=
@@ -4069,7 +4383,7 @@ function updateKeyboardMotion(delta, currentTime) {
       moveRigWithCollision(
         controlState.position,
         direction,
-        moveInput * delta * SOLO_TWEAKS.player.moveSpeed,
+        moveInput * delta * movementSpeed,
         {
           radius: rigTuning.colliderRadius + rigCollisionMargin,
           rootOffsetX: rigTuning.rootOffsetX,
@@ -4077,10 +4391,19 @@ function updateKeyboardMotion(delta, currentTime) {
         },
       ),
     );
-    controlState.walkPhase += delta * SOLO_TWEAKS.player.walkPhaseSpeed;
+    /*
+      phaseSpeed is the animation equivalent of spindle RPM:
+        walking uses walkPhaseSpeed
+        running uses runPhaseSpeed
+
+      Keeping movementSpeed and phaseSpeed paired is what prevents the feet
+      from looking like they are sliding independently of body travel.
+    */
+    controlState.walkPhase += delta * phaseSpeed;
   }
 
   controlState.isWalking = Math.abs(moveInput) > 0;
+  controlState.isRunning = controlState.isWalking && wantsRun;
   if (machineHomeActive) {
     /*
       G53 rigging mode keeps the rig at machine home. Camera controls above
@@ -4088,6 +4411,7 @@ function updateKeyboardMotion(delta, currentTime) {
     */
     controlState.position.copy(G53_RIGGING_HOME.position);
     controlState.yaw = G53_RIGGING_HOME.yaw;
+    controlState.isRunning = false;
   }
   state.skeleton.root.rotation.y = controlState.yaw;
 
@@ -4131,6 +4455,7 @@ function updateSkeleton(delta, elapsed, currentTime) {
   if (rigTuning.walkPreview || controlState.isWalking) {
     updateWalkMotion(delta, elapsed, {
       phase: controlState.isWalking ? controlState.walkPhase : undefined,
+      mode: controlState.isRunning ? "run" : "walk",
     });
   } else {
     relaxLegs(delta);
@@ -4193,6 +4518,7 @@ function freezeG53RiggingPose() {
     animation layers from adding motion on top of those rigging edits.
   */
   controlState.isWalking = false;
+  controlState.isRunning = false;
   controlState.waveUntil = 0;
   controlState.wasWaving = false;
   controlState.swordSwingStart = 0;
@@ -4243,9 +4569,35 @@ function dampJointRotation(
     Smoothly rotates one joint toward a target pose.
 
     The targetEuler passed to this function is an animation delta. The function
-    adds it on top of the joint's bind rotation:
+    adds it on top of the joint's bind rotation.
 
-      final target = bindLocalEuler + targetEuler
+    IMPORTANT:
+      Do not build the final target from bindLocalEuler alone.
+
+      body, leftKnee, and rightKnee have invisible "fixture zero" corrections:
+        body base yaw = -PI
+        knee base yaw = -PI
+        GUI bind-rotation slider = 0
+
+      bindLocalEuler stores only the visible GUI offset. It intentionally stays
+      at 0 for those fixture corrections. If animation targets were calculated
+      as:
+
+        finalEuler = bindLocalEuler + targetEuler
+
+      then any pose solver would erase the baked knee/body base quaternion and
+      ease the lower legs back toward the old orientation. That is the source of
+      the "legs revert after rigging / after title card" creature moment.
+
+    Correct formula:
+      targetQuaternion = bindLocalQuaternion * deltaQuaternion
+
+    where:
+      bindLocalQuaternion = base fixture correction + GUI bind-pose offset
+      deltaQuaternion     = active animation delta from targetEuler
+
+    This keeps the neutral-zero correction alive while still allowing walk, run,
+    idle, jump, and combat poses to layer on top of the rigged rest pose.
 
     Damping formula:
       t = 1 - 0.001^(delta * damping / 8)
@@ -4260,14 +4612,12 @@ function dampJointRotation(
   }
 
   const t = 1 - Math.pow(0.001, delta * (damping / 8));
-  const bindEuler = joint.userData.bindLocalEuler || new THREE.Euler(0, 0, 0);
-  const targetX = bindEuler.x + targetEuler.x;
-  const targetY = bindEuler.y + targetEuler.y;
-  const targetZ = bindEuler.z + targetEuler.z;
+  const bindQuaternion =
+    joint.userData.bindLocalQuaternion || new THREE.Quaternion();
+  const deltaQuaternion = new THREE.Quaternion().setFromEuler(targetEuler);
+  const targetQuaternion = bindQuaternion.clone().multiply(deltaQuaternion);
 
-  joint.rotation.x = THREE.MathUtils.lerp(joint.rotation.x, targetX, t);
-  joint.rotation.y = THREE.MathUtils.lerp(joint.rotation.y, targetY, t);
-  joint.rotation.z = THREE.MathUtils.lerp(joint.rotation.z, targetZ, t);
+  joint.quaternion.slerp(targetQuaternion, t);
 }
 function dampJointPositionFromBind(
   joint,
@@ -5174,13 +5524,25 @@ function getLegStrideValues(phase) {
   return getPhysicsLegStrideValues(phase);
 }
 
+function getRunStrideValues(phase) {
+  return getPhysicsRunStrideValues(phase);
+}
+
 function getPelvisWalkValues(phase, options) {
   return getPhysicsPelvisWalkValues(phase, options);
+}
+
+function getPelvisRunValues(phase, options) {
+  return getPhysicsPelvisRunValues(phase, options);
 }
 
 function updateWalkMotion(delta, elapsed, options = {}) {
   /*
     Applies whole-body and leg motion for walking.
+
+    If options.mode === "run", this delegates to updateRunMotion(). Keeping the
+    old function name avoids rewriting every call site while letting the running
+    gait use its own formulas and comments.
 
     There are two phase sources:
       - controlState.walkPhase when the user is actually moving
@@ -5189,6 +5551,11 @@ function updateWalkMotion(delta, elapsed, options = {}) {
     The left and right legs are offset by PI radians, meaning when one leg is in
     swing, the other is in stance.
   */
+  if (options.mode === "run") {
+    updateRunMotion(delta, elapsed, options);
+    return;
+  }
+
   const joints = state.skeleton.joints;
   const usesExternalPhase = Number.isFinite(options.phase);
 
@@ -5316,6 +5683,159 @@ function updateWalkMotion(delta, elapsed, options = {}) {
   updateLegWalk("right", 1, phase + Math.PI, delta, amplitude);
 }
 
+function updateRunMotion(delta, elapsed, options = {}) {
+  /*
+    Applies the first full running cycle.
+
+    The walk cycle is a grounded gait:
+      at least one foot is meant to be in contact.
+
+    The run cycle is a flight gait:
+      the body gets a stronger vertical pulse, the torso leans forward, and the
+      arms pump with bent elbows. The formulas come from runCycle.md and the
+      pure math lives in physics.js.
+
+    Coordinate convention used here:
+      - Z offsets move feet forward/back relative to the puppet.
+      - X offsets move joints left/right.
+      - Y offsets lift joints upward.
+      - negative X rotation on torso/chest reads as forward lean in the current
+        rig pose convention.
+  */
+  const joints = state.skeleton.joints;
+  const usesExternalPhase = Number.isFinite(options.phase);
+
+  if (!usesExternalPhase) {
+    state.walkPhase +=
+      delta * SOLO_TWEAKS.player.runPhaseSpeed * rigTuning.motionSpeed;
+  }
+
+  const sourcePhase = usesExternalPhase ? options.phase : state.walkPhase;
+  const phase = sourcePhase + rigTuning.phaseOffset;
+  const amplitude = rigTuning.runAmplitude * (options.blend ?? 1);
+  /*
+    speedRatio is v / vMax for the lean formula. Right now the only active run
+    speed is SOLO_TWEAKS.player.runSpeed, so this normally resolves to 1. The
+    Math.max form keeps the formula ready for future jog/sprint tiers without
+    changing getPelvisRunValues().
+  */
+  const speedRatio = THREE.MathUtils.clamp(
+    SOLO_TWEAKS.player.runSpeed /
+      Math.max(SOLO_TWEAKS.player.runSpeed, SOLO_TWEAKS.player.moveSpeed),
+    0,
+    1,
+  );
+  const pelvisRun = getPelvisRunValues(phase, {
+    amplitude,
+    /*
+      Running is narrower side-to-side than walking but twists more. The walk
+      hip sliders remain useful as broad "how much body sway" controls, while
+      the run-specific sliders below control the spring and twist.
+    */
+    swayAmount: rigTuning.walkHipSway * 0.58,
+    bounceAmount: rigTuning.runBounce,
+    tiltAmount: rigTuning.walkHipTilt * 1.08,
+    hipTwistAmount: rigTuning.runHipTwist,
+    shoulderTwistAmount: rigTuning.runShoulderTwist,
+    leanAmount: rigTuning.runForwardLean,
+    speedRatio,
+  });
+
+  /*
+    Body lift:
+      pelvisRun.bobY is the main run-cycle bounce. The body gets most of it;
+      the pelvis gets the full value. That split keeps the whole rig rising
+      without making the head bob like a metronome.
+  */
+  const bodyBob = pelvisRun.bobY * 0.62;
+  const headCounterY = -pelvisRun.bobY * 0.24;
+  const runLean = pelvisRun.leanX;
+
+  dampJointPositionFromBind(
+    joints.body,
+    {
+      x: pelvisRun.swayX * 0.14,
+      y: bodyBob,
+      z: -pelvisRun.flightSignal * 0.018 * amplitude,
+    },
+    delta,
+    rigTuning.damping * 0.95,
+  );
+  dampJointPositionFromBind(
+    joints.pelvis,
+    {
+      x: pelvisRun.swayX,
+      y: pelvisRun.bobY,
+      z: 0,
+    },
+    delta,
+    rigTuning.damping * 0.82,
+  );
+  dampJointPositionFromBind(
+    joints.head,
+    {
+      x: -pelvisRun.swayX * 0.18,
+      y: headCounterY,
+      z: pelvisRun.flightSignal * 0.012 * amplitude,
+    },
+    delta,
+    rigTuning.damping * 0.62,
+  );
+
+  /*
+    Forward lean and counter-twist:
+      theta = theta_base + (v / v_max) * theta_lean
+
+    theta_base is the bind pose, so runLean is only the added lean. The hips and
+    shoulders twist opposite each other so the run feels athletic instead of
+    like a rigid board sliding forward.
+  */
+  dampJointRotation(
+    joints.pelvis,
+    new THREE.Euler(runLean * 0.24, pelvisRun.hipTwistY, pelvisRun.tiltZ),
+    delta,
+    rigTuning.damping * 0.86,
+  );
+  dampJointRotation(
+    joints.chest,
+    new THREE.Euler(runLean, pelvisRun.shoulderTwistY, -pelvisRun.tiltZ * 0.36),
+    delta,
+    rigTuning.damping * 0.9,
+  );
+  dampJointRotation(
+    joints.head,
+    new THREE.Euler(
+      -runLean * 0.12,
+      -pelvisRun.shoulderTwistY * 0.24,
+      pelvisRun.tiltZ * 0.16,
+    ),
+    delta,
+    rigTuning.damping * 0.72,
+  );
+
+  /*
+    Running arm pump:
+      theta_shoulder(t) = A_shoulder * sin(phase + phi)
+
+    Empyrean stores these shoulder values in state.walkArmSwing for historical
+    reasons: updateControlledArm() already reads that object when the arms are
+    in the default "down" pose. The run branch in getControlledArmPoseTargets()
+    changes the elbow/wrist shapes while reusing the same data pipe.
+
+      left arm  = -sin(leftLegPhase)  * runArmPump
+      right arm = -sin(rightLegPhase) * runArmPump
+
+    The negative sign makes each arm oppose the same-side leg.
+  */
+  const walkArmSwing = ensureWalkArmSwingState();
+  walkArmSwing.left = -Math.sin(phase) * rigTuning.runArmPump * amplitude;
+  walkArmSwing.right =
+    -Math.sin(phase + Math.PI) * rigTuning.runArmPump * amplitude;
+
+  updateLegRun("left", -1, phase, delta, amplitude);
+  updateLegRun("right", 1, phase + Math.PI, delta, amplitude);
+}
+
 function updateLegWalk(sideName, side, phase, delta, amplitude) {
   /*
     Animates one leg.
@@ -5433,6 +5953,121 @@ function updateLegWalk(sideName, side, phase, delta, amplitude) {
       -side * 0.025 * amplitude,
     ),
     delta,
+  );
+}
+
+function updateLegRun(sideName, side, phase, delta, amplitude) {
+  /*
+    Animates one leg for running.
+
+    sideName = "left" or "right"
+    side     = -1 for left, +1 for right
+    phase    = this leg's phase; the right leg is called with phase + PI
+
+    Formula anchor from runCycle.md:
+      x_foot(t) = v * t - strideLength * cos(2 * PI * f * t)
+
+    In this rig:
+      phase = 2 * PI * f * t
+      footZ = -cos(phase) * runStrideLength * 0.5 * amplitude
+
+    where:
+      runStrideLength = full visual front-to-back stride span in scene units
+      0.5             = converts -1..1 signal into half-span displacement
+
+    The positions are still "puppet readable" rather than perfect IK. They move
+    knee/ankle/foot markers enough that the skeleton and attached mesh show the
+    intended run without solving a full inverse-kinematics chain yet.
+  */
+  const stride = getRunStrideValues(phase);
+  const joints = state.skeleton.joints;
+  const hip = joints[`${sideName}Hip`];
+  const knee = joints[`${sideName}Knee`];
+  const ankle = joints[`${sideName}Ankle`];
+  const foot = joints[`${sideName}Foot`];
+  const strideHalfSpan = rigTuning.runStrideLength * 0.5;
+  const footTravel = stride.footZ * strideHalfSpan * amplitude;
+  const footLift = stride.footLift * rigTuning.runFootLift * amplitude;
+  const kneeDrive = stride.kneeDrive;
+  const toePush = stride.pushOff;
+  const plant = stride.plant;
+  const backPush = stride.backPush;
+
+  dampJointPositionFromBind(
+    knee,
+    {
+      x: side * (footLift * 0.38 + stride.strideSwing * 0.012),
+      y: footLift * 0.58,
+      z: footTravel * 0.5,
+    },
+    delta,
+    rigTuning.damping * 0.92,
+  );
+
+  dampJointPositionFromBind(
+    ankle,
+    {
+      x: -side * (footLift * 0.18 + stride.strideSwing * 0.012),
+      y: footLift * 0.96 - plant * 0.008,
+      z: footTravel * 0.92,
+    },
+    delta,
+    rigTuning.damping * 0.94,
+  );
+
+  dampJointPositionFromBind(
+    foot,
+    {
+      x: -side * footLift * 0.06,
+      y: footLift * 0.62 + toePush * 0.026 - plant * 0.006,
+      z: footTravel + toePush * 0.065,
+    },
+    delta,
+    rigTuning.damping * 0.96,
+  );
+
+  dampJointRotation(
+    hip,
+    new THREE.Euler(
+      stride.strideSwing * 0.52 * amplitude - backPush * 0.08,
+      side * 0.04 * amplitude,
+      side * 0.08 * amplitude,
+    ),
+    delta,
+    rigTuning.damping * 0.9,
+  );
+
+  dampJointRotation(
+    knee,
+    new THREE.Euler(
+      0.08 + kneeDrive * 0.86 + backPush * 0.12,
+      0,
+      side * stride.footLift * 0.08,
+    ),
+    delta,
+    rigTuning.damping * 0.92,
+  );
+
+  dampJointRotation(
+    ankle,
+    new THREE.Euler(
+      -stride.strideSwing * 0.18 * amplitude + toePush * 0.42 - plant * 0.08,
+      side * 0.02 * amplitude,
+      0,
+    ),
+    delta,
+    rigTuning.damping * 0.94,
+  );
+
+  dampJointRotation(
+    foot,
+    new THREE.Euler(
+      toePush * 0.5 - plant * 0.1 - stride.footLift * 0.045,
+      0,
+      -side * 0.03 * amplitude,
+    ),
+    delta,
+    rigTuning.damping * 0.96,
   );
 }
 
@@ -6055,7 +6690,52 @@ function getControlledArmPoseTargets(sideName, side, pose, currentTime) {
   let wrist = new THREE.Euler(handFloat * 0.08, 0, -side * handFloat * 0.26);
   let palm = new THREE.Euler(0, 0, side * 0.04);
 
-  if (pose === "up") {
+  if (pose === "down" && controlState.isRunning) {
+    /*
+      Running "down" arm pose:
+        The arm is still in the default controllable pose, but the shape changes
+        from relaxed hanging to bent-elbow pumping.
+
+      Shoulder formula from runCycle.md:
+        theta_shoulder(t) = A_shoulder * sin(2 * PI * f * t + phi)
+
+      updateRunMotion() already calculates that as walkSwing for this side.
+
+      Elbow formula from runCycle.md:
+        theta_elbow(t) = theta_base - A_elbow * sin(phase + phi)
+
+      In this rig:
+        theta_base is approximately 90 degrees, or PI/2 radians.
+        forwardPump is max(0, -walkSwing / A), so the elbow bends more when the
+        hand pumps forward toward the chest.
+
+      Hand inward twist:
+        theta_inward = A_inward * max(0, sin(phase + phi))
+
+      That becomes inwardTwist below. It is intentionally subtle; too much hand
+      twist makes the wrists look broken before we have full IK.
+    */
+    const pumpScale = Math.max(0.001, rigTuning.runArmPump);
+    const forwardPump = physicsClamp01(-walkSwing / pumpScale);
+    const inwardTwist = forwardPump * 0.14;
+
+    shoulder = new THREE.Euler(
+      trail * 0.04 + walkSwing,
+      -side * inwardTwist * 0.35,
+      side * (0.34 + forwardPump * 0.08),
+    );
+    elbow = new THREE.Euler(
+      Math.PI * 0.5 + forwardPump * 0.34,
+      0,
+      side * (0.18 + forwardPump * 0.08),
+    );
+    wrist = new THREE.Euler(
+      handFloat * 0.025 + forwardPump * 0.06,
+      side * inwardTwist,
+      -side * (0.11 + inwardTwist),
+    );
+    palm = new THREE.Euler(0.02, side * inwardTwist * 0.55, side * 0.08);
+  } else if (pose === "up") {
     shoulder = new THREE.Euler(-0.2, 0, side * 2.2);
     elbow = new THREE.Euler(0.16, 0, side * 0.22);
   } else if (pose === "half") {
@@ -7036,6 +7716,41 @@ function resizeRendererToContainer() {
   camera.updateProjectionMatrix();
   renderer.setSize(width, height, false);
 }
+
+function settleStartupPoseBehindTitleCard() {
+  /*
+    Forces the initial skeleton pose into its final bind/setup position before
+    the title card fades out.
+
+    Why this exists:
+      The body and knee facing corrections are stored as base bind rotations.
+      They are mathematically correct immediately, but the debug skeleton,
+      camera, and imported-skin mirror can still need one startup pass to sync
+      their world matrices and guide lines.
+
+    Formula:
+      visibleStartPose = bindPose + rootPosition + rootYaw
+
+    where:
+      bindPose     = saved joint point offsets + saved bind rotations
+      rootPosition = player/control position
+      rootYaw      = current player facing
+
+    Running this before requestAnimationFrame(animate) means the first visible
+    gameplay frame already has the corrected leg orientation.
+  */
+  if (!state.skeleton?.root) {
+    return;
+  }
+
+  resetSkeletonToBindPose();
+  syncSkeletonRoot();
+  state.skeleton.root.rotation.y = controlState.yaw;
+  state.skeleton.root.updateMatrixWorld(true);
+  state.debugView?.refreshBones?.();
+  syncImportedSkinToPuppet();
+}
+
 console.info(
   `Empyrean ${APP_VERSION} running on Three.js ${THREE_VERSION_PIN}.`,
 );
@@ -7048,6 +7763,7 @@ initSkin({ state, rigTuning, updateGuiDisplays });
 buildSkeletonWorkshop();
 buildGui();
 resizeRendererToContainer();
+settleStartupPoseBehindTitleCard();
 
 window.addEventListener("keydown", handleG53HotkeyCapture, { capture: true });
 window.addEventListener("keydown", handleKeyDown);
@@ -7064,3 +7780,4 @@ sceneContainer.addEventListener("pointerup", handleJointEditPointerUp);
 sceneContainer.addEventListener("pointercancel", handleJointEditPointerUp);
 
 requestAnimationFrame(animate);
+initWorkshopLoader();

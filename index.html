@@ -4,7 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Empyrean Puppet Workshop</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Caesar+Dressing&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css?v=0.1.45-alpha" />
     <script type="importmap">
       {
         "imports": {
@@ -17,11 +23,14 @@
   </head>
   <body>
     <!-- Loader Overlay start of this section-->
-    <div id="loader-overlay">
-      <div class="spinner"></div>
-      <p style="color: white; font-family: monospace; margin-top: 15px">
-        INITIALIZING RIG...
-      </p>
+    <div
+      id="loader-overlay"
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      aria-label="Loading Empyrean"
+    >
+      <h1 class="stone-engraved">EMPYREAN</h1>
     </div>
 
     <!-- Puppet Lab UI follows -->
@@ -31,6 +40,6 @@
     </div>
     <!-- 3D Scene Container end of this section -->
     <main id="scene-container" aria-label="Empyrean Puppet Lab"></main>
-    <script type="module" src="./main.js?v=0.1.41-alpha"></script>
+    <script type="module" src="./main.js?v=0.1.45-alpha"></script>
   </body>
 </html>
