@@ -33,6 +33,7 @@ $RequiredFiles = @(
   "main.js",
   "physics.js",
   "rig.js",
+  "puppetShop.js",
   "world.js",
   "skin.js",
   "combatPhysics.js",
@@ -60,6 +61,7 @@ Write-Host "Checking JavaScript syntax..."
 node --check main.js
 node --check physics.js
 node --check rig.js
+node --check puppetShop.js
 node --check world.js
 node --check skin.js
 node --check combatPhysics.js

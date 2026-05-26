@@ -4,7 +4,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.41-alpha`
+- Empyrean build: `0.1.45-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -22,10 +22,12 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - per-joint X/Y/Z point offsets
 - per-joint bind-pose rotation controls
 - idle and walk preview motion
+- Shift+W running cycle with flight, lean, hip/shoulder counter-twist, and bent-elbow arm pump
 - jump physics and crouch/landing pose response
 - simple rig footprint collision against the room walls
 - GLB import with generated skin weights for the Empyrean puppet skeleton
 - separate render, adjust, rig workflow for imported meshes
+- Puppet Shop module and GUI for named reusable complete rig packages
 - keyboard movement and arm pose controls
 - mouse wheel camera zoom
 - browser save/load/export for tuning
@@ -56,6 +58,7 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - neutral body/knee facing correction so anatomical right/left and foot direction read correctly while the related Y bind-rotation sliders read zero
 - Empyrean room aesthetic pass with stone floor/wall textures, 80% room walls, dim torch props, and warm torch light sources
 - moon.glb sky focal point replacing the old Jupiter sphere
+- EMPYREAN stone-engraved title card with animated gradient and delayed reveal
 
 ---
 
@@ -99,9 +102,15 @@ combatPhysics.js    <- the combat math station
 
 physics.js          ← the math reference binder
                       pure formulas only — jump gravity, launch velocity,
-                      jump state machine, pose weights, walk phase shaping,
+                      jump state machine, pose weights, walk/run phase shaping,
                       smoothstep, clamp. No scene objects, no GUI, just math.
                       main.js calls these like looking up a formula in a book.
+
+puppetShop.js       <- the rig package shelf
+                      pure browser/data code for complete rig packages,
+                      reusable rig identity, local rig-library storage,
+                      package summaries, JSON import/export compatibility.
+                      No Three.js scene objects and no gameplay state.
 
 rig.js              ← the blueprint dimension sheet
                       stores the default body measurements and the slider
@@ -125,7 +134,8 @@ index.html
 main.js
     ├── imports from world.js   (build world, collision, encounters, debug)
     ├── imports from skin.js    (mesh import pipeline)
-    ├── imports from physics.js (jump + walk math)
+    ├── imports from physics.js (jump + walk/run math)
+    ├── imports from puppetShop.js (complete rig packages + rig library)
     ├── imports from rig.js     (body dimensions)
     └── imports from encounters.js (trigger zone definitions)
 
@@ -138,6 +148,9 @@ skin.js
 
 physics.js
     └── no imports (pure math)
+
+puppetShop.js
+    └── no imports (pure package/library data)
 
 rig.js
     └── no imports (pure data)
@@ -160,17 +173,23 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 | Arm stances and sword swing rotations | `getControlledArmPoseTargets()` in `main.js` |
 | Combat balance formulas or Low Guard body/leg stance | `combatPhysics.js` |
 | Neutral anatomical facing correction | `RIG_BASE_BODY_YAW` near the top of `main.js` |
+| Complete rig package shape or local rig-library behavior | `puppetShop.js` |
 | Room size, wall colors, ghost sphere count | `WORLD_TWEAKS` near the top of `world.js` |
 | Default body proportions | `DEFAULT_RIG_DIMENSIONS` in `rig.js` |
 | Trigger zones (enter/exit events) | `encounters.js` |
 | Enemy combat prototype | `combat_updated.js` |
 | Jump feel (gravity, height, duration) | `rigTuning` values in the GUI, or `getJumpGravityValue` in `physics.js` |
 | Walk cycle timing | `walkPhaseSpeed` in `SOLO_TWEAKS`, walk amplitude sliders in GUI |
+| Run cycle timing/feel | `runSpeed` / `runPhaseSpeed` in `SOLO_TWEAKS`, run sliders in `Motion` |
 
 ---
 
 ## Change Notes
 
+- `0.1.45-alpha`: Fixed lower-leg orientation reverting after rigging or startup by changing `dampJointRotation()` to layer animation deltas onto the full `bindLocalQuaternion` instead of only the visible bind Euler sliders, preserving the neutral-zero knee/body fixture rotations through walk, idle, rigging exit, and title-card reveal.
+- `0.1.44-alpha`: Replaced the startup spinner with an EMPYREAN Caesar Dressing stone-engraved title card, added subtle animated text/background gradients, moved loader reveal to the end of startup, and added a startup pose settle pass so leg realignment happens behind the title card.
+- `0.1.43-alpha`: Added the first Puppet Shop architecture boundary with new `puppetShop.js`, named complete rig packages, local rig-library save/load/delete/list controls, package copy/paste compatibility, and docs for separating reusable puppet rigs from gameplay.
+- `0.1.42-alpha`: Added a first running cycle from `runCycle.md`: hold `Shift + W` to run with faster travel/turnover, run-specific stride/foot-lift/bounce/lean sliders, pelvis flight bounce, hip/shoulder counter-twist, and bent-elbow arm pumping while preserving the existing walk cycle.
 - `0.1.41-alpha`: Replaced the outside primitive trees with alternating `tree.glb` and `deadTree.glb` props while keeping the existing circular tree colliders, and replaced the old Jupiter sphere with `moon.glb` at about half the previous visual size and 15% lower on Y.
 - `0.1.40-alpha`: Applied `stoneFloorDiff.jpg`/`stoneFloorDisp.png` to room floors, `stoneWallDiff.jpg`/`StoneWallDisp.png` to room walls and ceilings, shifted room surfaces to dull gray, raised room wall opacity to 80%, added two `torch.glb` props per inside wall, and made each torch a dim warm point-light source.
 - `0.1.39-alpha`: Applied the same fixture-zero facing correction to `leftKnee` and `rightKnee`, giving each knee a neutral `-PI` base yaw so the shin/ankle/foot chains face correctly while their GUI Y bind-rotation sliders remain `0`; old near-PI knee Y fixes migrate back to zero.
@@ -220,6 +239,7 @@ Open this folder with VS Code Live Server and launch `index.html`.
 ## Keyboard
 
 - `W` / `S`: move forward/back.
+- `Shift` + `W`: run forward.
 - `A` / `D`: turn.
 - `Arrow Left` / `Arrow Right`: orbit camera.
 - `Arrow Up` / `Arrow Down`: zoom camera.
@@ -399,7 +419,7 @@ encounters.js
 
 Encounters are non-blocking. They do not stop movement. They can run actions when the avatar enters or exits a circle or rectangle, such as changing audio volume/playback rate, logging a message, or changing Jupiter's tint/scale.
 
-The loading overlay remains in `index.html` and is still revealed by the loader logic in `main.js`.
+The title-card overlay remains in `index.html` and is revealed/hidden by the loader logic in `main.js`.
 
 ## Rig Mesh Mode
 
@@ -555,6 +575,38 @@ The visible hip carrier uses `getPelvisWalkValues()` in `physics.js`. That funct
 
 Arms swing in the opposite direction to the leg on the same side. When the left leg moves forward, the left arm moves backward. This is stored in `state.walkArmSwing.left` / `.right` by `updateWalkMotion()` and blended into the shoulder target inside `updateControlledArm()` only when the arm is in the default "down" pose. Raised arm poses (up, half, wave) are not affected.
 
+**Running cycle** (added in v0.1.42):
+
+Hold `Shift + W` to run. Normal `W` still uses the walking cycle.
+
+The run pass uses the math from `runCycle.md` but keeps the live joint edits inside `main.js`:
+
+| Variable | Formula | Effect |
+|----------|---------|--------|
+| `phase` | `2 * PI * f_run * t` | One full left/right running cycle |
+| `footZ` | `-cos(phase)` | Normalized forward/back foot travel |
+| `footTravel` | `footZ * runStrideLength * 0.5 * runAmplitude` | Visible stride span in scene units |
+| `footLift` | `max(0, sin(phase)) ^ 0.72 * runFootLift` | Higher recovery lift while the leg swings forward |
+| `flightSignal` | soft window at `0.35..0.5` and `0.85..1.0` | Brief airborne lift twice per cycle |
+| `bobY` | `springSignal * runBounce * 0.38 + flightSignal * runBounce` | Vertical body bounce without sinking below the floor |
+| `leanX` | `-(v / vMax) * runForwardLean` | Forward lean from the ankles/torso direction |
+| `hipTwistY` | `sin(phase) * runHipTwist` | Hip yaw |
+| `shoulderTwistY` | `-sin(phase) * runShoulderTwist` | Opposite shoulder yaw for balance |
+| `armPump` | `-sin(legPhase) * runArmPump` | Same-side arm swings opposite the same-side leg |
+
+The pure formulas live in `physics.js` as `getRunStrideValues()` and `getPelvisRunValues()`. The live puppet application lives in `main.js` as `updateRunMotion()` and `updateLegRun()`. The bent-elbow pumping shape lives in `getControlledArmPoseTargets()` under the `pose === "down" && controlState.isRunning` branch.
+
+Run tuning is in the `Motion` GUI folder:
+
+- `run amplitude`: overall run animation strength.
+- `run stride`: front/back distance of the feet.
+- `run foot lift`: how high the recovery foot rises.
+- `run bounce`: vertical spring/flight amount.
+- `run lean`: maximum forward lean.
+- `run arm pump`: shoulder pump size.
+- `run hip twist`: pelvis yaw during the run.
+- `run shoulder twist`: counter-yaw of the chest/shoulders.
+
 ---
 
 ## Mouse Joint Point Editing
@@ -575,7 +627,7 @@ This is intentionally a simple camera-facing drag plane, not a full transform gi
 
 Empyrean is currently built as one browser app with a few clear layers.
 
-The page shell is `index.html`. It loads Three.js and lil-gui through the import map, keeps your loading overlay in place, and starts `main.js` as a JavaScript module. The overlay is hidden by the loader helper near the top of `main.js` after the browser has had a moment to draw the scene.
+The page shell is `index.html`. It loads Three.js and lil-gui through the import map, keeps your loading overlay in place, loads the Caesar Dressing title font, and starts `main.js` as a JavaScript module. The overlay is now an EMPYREAN stone-engraved title card. It is hidden by the loader helper at the end of startup after the skeleton has been built, the startup pose has been settled, and several animation frames have passed behind the title card.
 
 Collision is separate from visible geometry. Wall and door blocking shapes are stored as top-down rectangles in `worldCollision.solidRects`. Trees are stored as circles in `worldCollision.solidCircles`. The avatar has a circular floor footprint. Movement tries the intended step, resolves it against rectangles/circles, then falls back to X-only and Z-only movement for simple wall sliding.
 
@@ -586,6 +638,8 @@ Rig tuning is saved in `rigTuning`. The important idea is that sliders, mouse po
 Imported meshes use a generated skin. The GLB is loaded, centered, scaled, optionally rotated, and then given generated `skinIndex` and `skinWeight` attributes. Empyrean creates real `THREE.Bone` objects that mirror the visible puppet joints. Every frame, the generated bones copy the puppet joint transforms, which is how the imported mesh follows the workshop skeleton.
 
 Rig Mesh Mode is a GUI organization layer. It does not replace the rigging functions. It groups the render, start-pose, rig, rerig, clear, export, and import actions into one focused folder and hides duplicate manual folders while active.
+
+Puppet Shop is the reusable rig layer. It does not move the player, run combat, or solve collisions. It packages the current rig as an actor-ready setup: full `rigTuning`, joint point offsets, bind rotations, mesh transform, motion sliders, sword/dev attachment offsets, name, and notes. The `Puppet Shop` GUI folder can save that complete package into browser localStorage by name, load it later, delete it, list saved rigs, or copy/paste the JSON package. This is the first step toward using the same rigging skeleton for player bodies, NPCs, enemies, and deliberately "almost human" variants.
 
 World Debug is also visual only. It draws the invisible collision and encounter shapes so you can place things by sight. Turning it on does not change movement or collision.
 
@@ -601,7 +655,9 @@ The safest solo rhythm is:
 
 ## Physics And Rig Modules
 
-`physics.js` is the body-mechanics subroutine file. It currently owns pure formulas for jump gravity, jump launch velocity, jump state updates, jump pose weights, walk-cycle phase shaping, `smoothstep`, `cycle01`, and `clamp01`.
+`physics.js` is the body-mechanics subroutine file. It currently owns pure formulas for jump gravity, jump launch velocity, jump state updates, jump pose weights, walk-cycle phase shaping, run-cycle stride/flight/lean shaping, `smoothstep`, `cycle01`, and `clamp01`.
+
+`puppetShop.js` is the puppet-rig package subroutine file. It currently owns pure data helpers for complete rig packages, package summaries, package JSON parsing/serialization, and the named browser rig library. It does not import Three.js and it does not know about combat, camera, movement, or the live scene. `main.js` still applies packages to the actual skeleton because applying a rig changes live joints, GUI sliders, mesh preview state, and skinning.
 
 `main.js` still owns the live Three.js animation functions because those functions directly touch joints, meshes, GUI state, imported skins, and camera state. This is intentional for the first module split. The safe next pass would be moving larger animation routines only after this pure math split proves stable.
 
@@ -1132,3 +1188,49 @@ This build makes the outside and sky match the darker room mood.
 - Replaced the old procedural Jupiter sphere with `assets/moon.glb`.
 - Set the moon to about half the old Jupiter visual diameter and 15% lower on the Y axis.
 - Kept the old internal `jupiter` scene-reference name so existing G53 and encounter plumbing still works.
+
+## V0.1.42 Alpha Dev Build
+
+This build adds the first usable running cycle from `runCycle.md`.
+
+- Added `Shift + W` running while leaving normal `W` walking unchanged.
+- Added `runSpeed` and `runPhaseSpeed` to `SOLO_TWEAKS.player`.
+- Added pure run formulas in `physics.js`: `getRunStrideValues()` and `getPelvisRunValues()`.
+- Added `updateRunMotion()` and `updateLegRun()` in `main.js`.
+- Added run-specific Motion sliders for amplitude, stride, foot lift, bounce, lean, arm pump, hip twist, and shoulder twist.
+- Added a bent-elbow running arm pump branch in `getControlledArmPoseTargets()`.
+- Kept the old walk cycle and walk sliders intact so the two gaits can be tuned separately.
+
+## V0.1.43 Alpha Dev Build
+
+This build starts separating the Puppet Shop from gameplay.
+
+- Added `puppetShop.js` as a pure package/library module with no Three.js imports.
+- Added a `Puppet Shop` GUI folder for rig name, notes, status, save, load, delete, list, copy, and paste.
+- Changed rig package export/import to use complete puppet rig packages from `puppetShop.js`.
+- Added named local rig-library storage so a tuned skeleton can be reused later for player, NPC, or enemy bodies.
+- Package payloads now include the full `rigTuning` source of truth plus readable skeleton, motion profile, attachment, and imported-mesh snapshots.
+- Kept gameplay ownership in `main.js` for now: movement, camera, world collision, combat, and live skeleton application still stay there.
+
+## V0.1.44 Alpha Dev Build
+
+This build gives startup a proper Empyrean title card.
+
+- Replaced the old loading spinner and `INITIALIZING RIG...` text with a centered `EMPYREAN` title.
+- Loaded the Caesar Dressing font from Google Fonts with a serif fallback.
+- Added the `.stone-engraved` CSS style: dark stone text, lighter stone surface, and engraved highlight/cut shadows.
+- Added a slow shifting gradient inside the title letters so the title card reads as alive instead of frozen.
+- Added a subtle stone-gray background gradient and low-contrast CSS grain.
+- Moved the loader reveal call from early module startup to the end of setup.
+- Added `settleStartupPoseBehindTitleCard()` so bind-pose leg corrections and guide-line refresh happen before the title fades.
+- Increased the title-card reveal delay by frame count and minimum visible time so startup alignment happens behind the card.
+
+## V0.1.45 Alpha Dev Build
+
+This build fixes the lower-leg orientation regression after rigging.
+
+- Changed `dampJointRotation()` from Euler-axis lerping to quaternion slerping.
+- Animation deltas now layer onto `bindLocalQuaternion`, not just `bindLocalEuler`.
+- Preserved the hidden neutral-zero corrections for `body`, `leftKnee`, and `rightKnee`.
+- Fixed the lower legs/feet reverting toward the old first orientation after exiting G53 or after the title card fades.
+- Kept the GUI bind-rotation sliders readable: knee/body Y can still show `0` while the base fixture correction remains active.

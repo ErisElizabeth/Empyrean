@@ -11,6 +11,7 @@
     - jump pose weights
     - walk-cycle phase shaping
     - pelvis carrier sway/bob/twist values
+    - run-cycle stride/flight/lean values
     - smooth interpolation helpers
 
   Pure formula means:
@@ -342,5 +343,185 @@ export function getPelvisWalkValues(
     bobY: stepSignal * bobAmount * scaledAmplitude,
     tiltZ: sideSignal * tiltAmount * scaledAmplitude,
     twistY: sideSignal * twistAmount * scaledAmplitude,
+  };
+}
+
+function plateauWindow01(value, start, end, feather = 0.04) {
+  /*
+    Builds a soft-edged on/off window inside a normalized 0..1 cycle.
+
+    Formula:
+      rise = smoothstep(start, start + feather, value)
+      fall = 1 - smoothstep(end - feather, end, value)
+      window = rise * fall
+
+    where:
+      value   = current phase position from cycle01(), 0..1
+      start   = phase where the window begins
+      end     = phase where the window ends
+      feather = width of the eased edge
+
+    Why this exists:
+      runCycle.md marks flight windows as phase ranges. A hard if/else at those
+      ranges would pop the body upward. This gives the same range a soft takeoff
+      and landing.
+  */
+  const safeFeather = Math.max(0.0001, feather);
+  const riseEnd = Math.min(end, start + safeFeather);
+  const fallStart = Math.max(start, end - safeFeather);
+
+  return clamp01(
+    smoothstep(start, riseEnd, value) *
+      (1 - smoothstep(fallStart, end, value)),
+  );
+}
+
+export function getRunStrideValues(phase) {
+  /*
+    Builds a running foot path for ONE leg.
+
+    The walking stride above is grounded:
+      one foot plants while the other recovers.
+
+    The running stride is springier:
+      the leg reaches, drives backward, pushes off, then recovers with more knee
+      lift. The caller runs this once for the left leg and once for the right
+      leg with a PI phase offset.
+
+    Main formula from runCycle.md:
+      x_foot(t) = v * t - strideLength * cos(2 * PI * f * t)
+
+    In animation code:
+      phase = 2 * PI * f * t
+      normalizedFootZ = -cos(phase)
+
+    where:
+      normalizedFootZ = -1..1 forward/back foot travel signal
+      caller stride   = normalizedFootZ * runStrideLength * 0.5
+
+    The actual scene stride length stays in main.js/rigTuning because it is a
+    visual tuning control, but the normalized phase math lives here.
+  */
+  const t = cycle01(phase);
+  const swingWave = Math.sin(phase);
+  const swingSignal = Math.max(0, swingWave);
+  const stanceSignal = Math.max(0, -swingWave);
+  const normalizedFootZ = -Math.cos(phase);
+
+  /*
+    footLift:
+      Running needs a stronger recovery than walking. Raising swingSignal to a
+      fractional power keeps the lift broad and readable through the middle of
+      the recovery instead of creating a tiny spike.
+
+    pushOff:
+      The last part of stance is where the toe drives the body forward. This is
+      a narrow window near the end of the stance half of the local leg cycle.
+
+    plant:
+      Contact is strongest early in stance and near the next wrap point. It
+      helps the caller damp the foot down when it should look grounded.
+  */
+  const footLift = Math.pow(swingSignal, 0.72);
+  const kneeDrive = Math.pow(swingSignal, 0.52);
+  const backPush = Math.pow(stanceSignal, 0.9);
+  const pushOff = plateauWindow01(t, 0.36, 0.5, 0.055);
+  const plant =
+    t < 0.5
+      ? 1 - smoothstep(0.02, 0.22, t)
+      : smoothstep(0.84, 1, t);
+  const flight = plateauWindow01(t, 0.35, 0.5, 0.045);
+
+  return {
+    t,
+    footZ: normalizedFootZ,
+    strideSwing: normalizedFootZ,
+    footLift,
+    kneeDrive,
+    backPush,
+    pushOff,
+    plant,
+    flight,
+  };
+}
+
+export function getPelvisRunValues(
+  phase,
+  {
+    amplitude = 1,
+    swayAmount = 0.045,
+    bounceAmount = 0.085,
+    tiltAmount = 0.075,
+    hipTwistAmount = 0.14,
+    shoulderTwistAmount = 0.18,
+    leanAmount = 0.12,
+    speedRatio = 1,
+  } = {},
+) {
+  /*
+    Calculates the body carrier motion for running.
+
+    runCycle.md formulas translated into Empyrean terms:
+
+      y(t) = y_base + A_run * sin(2 * PI * f_run * t)
+
+    Empyrean uses phase instead of raw time:
+
+      phase = 2 * PI * f_run * t
+
+    A raw sine wave goes negative half the time. Since this skeleton should not
+    sink through the floor, the animation uses the sine as a spring signal and
+    reinforces it during explicit flight windows:
+
+      springSignal = max(0, sin(2 * phase))
+      bobY = (springSignal * A_run * 0.38) + (flightSignal * A_run)
+
+    The phase*2 term gives two vertical pulses per full left+right cycle.
+
+    Forward lean from runCycle.md:
+
+      theta = theta_base + (v / v_max) * theta_lean
+
+    Empyrean stores theta_base as the bind pose, so this returns only:
+
+      leanX = -speedRatio * leanAmount
+
+    where:
+      speedRatio  = v / v_max, clamped by the caller to 0..1
+      leanAmount  = maximum lean angle in radians
+      negative X  = forward lean for the current puppet pose convention
+
+    Hip/shoulder twist:
+
+      hipYaw      =  A_hip      * sin(phase)
+      shoulderYaw = -A_shoulder * sin(phase)
+
+    The opposite signs keep the torso balanced instead of moving like one rigid
+    block.
+  */
+  const scaledAmplitude = Math.max(0, amplitude);
+  const cycle = cycle01(phase);
+  const sideSignal = -Math.sin(phase);
+  const twistSignal = Math.sin(phase);
+  const leftFlight = plateauWindow01(cycle, 0.35, 0.5, 0.045);
+  const rightFlight = plateauWindow01(cycle, 0.85, 1, 0.045);
+  const flightSignal = Math.max(leftFlight, rightFlight);
+  const springSignal = Math.max(0, Math.sin(phase * 2));
+  const safeSpeedRatio = clamp01(speedRatio);
+
+  return {
+    cycle,
+    sideSignal,
+    twistSignal,
+    flightSignal,
+    springSignal,
+    swayX: sideSignal * swayAmount * scaledAmplitude,
+    bobY:
+      (springSignal * bounceAmount * 0.38 + flightSignal * bounceAmount) *
+      scaledAmplitude,
+    tiltZ: sideSignal * tiltAmount * scaledAmplitude,
+    hipTwistY: twistSignal * hipTwistAmount * scaledAmplitude,
+    shoulderTwistY: -twistSignal * shoulderTwistAmount * scaledAmplitude,
+    leanX: -leanAmount * safeSpeedRatio * scaledAmplitude,
   };
 }

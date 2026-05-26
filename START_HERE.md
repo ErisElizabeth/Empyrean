@@ -22,7 +22,7 @@ If those three things work, the project is in a sane state.
 
 ## Current Build
 
-Current build: `0.1.41-alpha`
+Current build: `0.1.45-alpha`
 
 The project currently has:
 
@@ -31,10 +31,11 @@ The project currently has:
 - an outside enclosure
 - moon.glb in the sky
 - background audio
-- loader overlay
+- EMPYREAN stone title card loader
 - puppet skeleton
 - mesh import and generated rigging
 - Rig Mesh Mode
+- Puppet Shop named reusable rig packages
 - World Debug collision overlays
 - encounter trigger zones
 - sword combat prototype
@@ -57,6 +58,7 @@ The project currently has:
 - Sword Offsets GUI for tuning/reloading the weapon prop without code edits
 - combatPhysics.js math module for center of mass, base of support, stability margin, and tipping angle
 - Low Guard stance on sword draw
+- Shift+W running cycle with tunable stride, bounce, lean, and arm pump
 - neutral body/knee facing correction so `rightPalm` reads as anatomical right and lower legs/feet face correctly
 - stone room textures and dim torch lighting for the interior rooms
 - alternating tree.glb/deadTree.glb props outside
@@ -81,6 +83,7 @@ Use these when editing code:
 main.js
 physics.js
 combatPhysics.js
+puppetShop.js
 rig.js
 encounters.js
 combat_updated.js
@@ -140,8 +143,10 @@ Recommended flow:
 - Tune camera distance in `SOLO_TWEAKS.camera`.
 - Turn on World Debug and screenshot the collision layout for yourself.
 - Export a rig package from the GUI after a good tuning pass.
+- Save a named rig in `Puppet Shop` after a good pivot/motion pass.
 - Open `Combat`, set difficulty, press `1`, and test whether the sword scale/hand angle feels right.
 - Press `1` while standing still and check whether Low Guard reads as grounded instead of stiff.
+- Hold `Shift + W` in a clear space and tune `Motion > run stride`, `run foot lift`, and `run bounce` by eye.
 - Use `Sword Offsets` to tune `plainSword.glb` position, length, grip point, pitch, yaw, and roll live.
 - Use `Mesh > restore gameplay arms` if a test pose or old saved arm command leaves the arms raised after rigging.
 - Press `Y`, move `devProbe`, and copy rig-local values for sword or hitbox experiments.
