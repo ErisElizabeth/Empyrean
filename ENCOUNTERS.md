@@ -27,8 +27,8 @@ Current action types:
 
 - `log`: write a message to the browser console.
 - `audio`: change background audio volume, playback rate, source, loop, play, or pause.
-- `jupiterColor`: change Jupiter's material tint.
-- `jupiterScale`: resize Jupiter visually.
+- `skyMoonColor`: change the moon/sky focal object's material tint.
+- `skyMoonScale`: resize the moon/sky focal object visually.
 
 This is intentionally small. It gives you a working pattern without building a giant event engine too early.
 
@@ -190,34 +190,38 @@ Browser note:
 
 Browsers often block audio until the user clicks or presses a key. That is normal. The project catches that case and logs it politely.
 
-## Jupiter Actions
+## Sky Moon Actions
 
-Change Jupiter tint:
+Change moon tint:
 
 ```js
 {
-  type: "jupiterColor",
+  type: "skyMoonColor",
   color: "#f7d894",
 }
 ```
 
-Change Jupiter scale:
+Change moon scale:
 
 ```js
 {
-  type: "jupiterScale",
+  type: "skyMoonScale",
   scale: 1.2,
 }
 ```
 
-Reset Jupiter scale on exit:
+Reset moon scale on exit:
 
 ```js
 {
-  type: "jupiterScale",
+  type: "skyMoonScale",
   scale: 1,
 }
 ```
+
+Compatibility note: older `jupiterColor` and `jupiterScale` action names still
+work, but new encounter definitions should use `skyMoonColor` and
+`skyMoonScale`.
 
 ## Safe Encounter Workflow
 
@@ -251,10 +255,10 @@ Reset Jupiter scale on exit:
 ## Good Solo Encounter Ideas
 
 - doorway changes music volume
-- Jupiter zone lowers pitch
+- sky-moon zone lowers pitch
 - tree grove changes ambience
 - room threshold logs which room you entered
-- campfire circle warms the color of Jupiter
+- campfire circle warms the color of the moon
 - outside boundary zone pauses background audio
 
 ## Things To Save For Later
@@ -269,4 +273,3 @@ These are good future upgrades, but not necessary yet:
 - DM-triggered encounters
 - dice-roll triggers
 - loading encounter definitions from JSON
-

@@ -22,7 +22,7 @@ If those three things work, the project is in a sane state.
 
 ## Current Build
 
-Current build: `0.1.45-alpha`
+Current build: `0.1.54-alpha`
 
 The project currently has:
 
@@ -39,6 +39,11 @@ The project currently has:
 - World Debug collision overlays
 - encounter trigger zones
 - sword combat prototype
+- actual rough-stone numbered 3D d20 for combat rolls
+- post-rig T/A reference arms visibly returning to relaxed gameplay rest without resetting rig calibration
+- G53 exit commits rig point calibration before applying relaxed visible arms
+- relaxed-arm backups reject polluted T/A shoulder data
+- startup explicitly applies visible relaxed/down arm pose
 - enemy health bar and difficulty setting
 - TEMP devProbe coordinate marker
 - Skeleton Lab guide opacity slider
@@ -52,9 +57,9 @@ The project currently has:
 - cold-start-safe G53 entry and recovery
 - bind-pose-aware generated skin side selection
 - Sigewynn default temp mesh and plainSword combat prop
-- post-rig gameplay arm restore after preview rigging
+- post-rig visible arm relaxation after preview rigging
 - named arm pose resolver for easier stance/swing edits
-- relaxed-arm snapshot restore for returning from T/A rigging poses
+- T/A reference compensation for returning visibly relaxed without losing calibration
 - Sword Offsets GUI for tuning/reloading the weapon prop without code edits
 - combatPhysics.js math module for center of mass, base of support, stability margin, and tipping angle
 - Low Guard stance on sword draw
@@ -132,12 +137,12 @@ Recommended flow:
 4. Tune pivots with `Joint Point Offsets`.
 5. Try `A pose` only if the mesh shoulders need it.
 6. Use `T pose` when the source mesh is modeled straight out from the shoulders.
-7. Click `2 rig mesh`; preview rigging now restores the captured relaxed gameplay arms after binding.
+7. Click `2 rig mesh`; preview rigging now commits your pivot setup and relaxes the visible arms after binding.
 8. Test walk, jump, arms, idle, `1` combat stance, and `Enter` sword swing.
 
 ## Good 15-Minute Tasks
 
-- Move the moon with `SOLO_TWEAKS.skyMoon.position`.
+- Move the moon with `WORLD_TWEAKS.skyMoon.position` in `world.js`.
 - Add one tree position in `buildLowPolyTrees`.
 - Add one encounter in `encounters.js`.
 - Tune camera distance in `SOLO_TWEAKS.camera`.
@@ -148,7 +153,7 @@ Recommended flow:
 - Press `1` while standing still and check whether Low Guard reads as grounded instead of stiff.
 - Hold `Shift + W` in a clear space and tune `Motion > run stride`, `run foot lift`, and `run bounce` by eye.
 - Use `Sword Offsets` to tune `plainSword.glb` position, length, grip point, pitch, yaw, and roll live.
-- Use `Mesh > restore gameplay arms` if a test pose or old saved arm command leaves the arms raised after rigging.
+- Use `Mesh > relax visible arms` if a test pose or old saved arm command leaves the arms raised after rigging.
 - Press `Y`, move `devProbe`, and copy rig-local values for sword or hitbox experiments.
 - Press `F2`, tune a pivot at machine home, then press `F2` again to confirm gameplay restores cleanly.
 

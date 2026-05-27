@@ -2,6 +2,7 @@
 import GUI from "lil-gui";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { ENCOUNTER_DEFINITIONS } from "./encounters.js";
+import { createEmpyreanAudioManager } from "./audioManager.js";
 // Combat encounter prototype: wires /empyrean_dice (d20 roll) and the
 // /enemyAI tiered-decision idea into the existing /Empyrean world.
 import {
@@ -53,11 +54,13 @@ import {
   buildExplorationWorld,
   buildGhostSpheres,
   buildLighting,
+  buildSkyMoon,
   createEncounterRuntime,
   createWorldDebugView,
   disposeObjectTree,
   getEncounterCenter,
   getEncounterRect,
+  getDefaultSkyMoonColor,
   isControlPositionValid,
   makeLabelSprite,
   moveRigWithCollision,
@@ -84,7 +87,7 @@ import {
   syncImportedSkinToPuppet,
 } from "./skin.js";
 
-const APP_VERSION = "0.1.45-alpha";
+const APP_VERSION = "0.1.54-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -144,20 +147,6 @@ const SOLO_TWEAKS = {
     // Wheel zoom has a slightly closer max than arrow-key zoom so trackpad
     // gestures stay easy to control while placing pivots.
     wheelMaxDistance: 18,
-  },
-
-  skyMoon: {
-    /*
-      Replaces the old procedural Jupiter sphere with your moon.glb.
-
-      The previous Jupiter radius was 8, so its visual diameter was roughly 16
-      scene units. A target diameter of 8 makes the GLB about half that size.
-      The previous Y was 15; 12.75 is 15% lower.
-    */
-    assetPath: "assets/moon.glb",
-    targetDiameter: 20,
-    position: [0, 5.75, -80],
-    fallbackColor: 0x7a7979,
   },
 
   audio: {
@@ -267,7 +256,7 @@ const G53_RIGGING_HOME = {
 
       Walls/ceilings become invisible enough that the mesh and pivots are easy
       to inspect. Floors stay barely visible as a reference plane. Trees, ghost
-      spheres, and Jupiter are hidden because they are useful for gameplay mood
+      spheres, and the sky moon are hidden because they are useful for gameplay mood
       but not for precision rig setup.
     */
     floorOpacity: 0.06,
@@ -275,7 +264,7 @@ const G53_RIGGING_HOME = {
     ceilingOpacity: 0,
     treeOpacity: 0,
     hideGhostSpheres: true,
-    hideJupiter: true,
+    hideSkyMoon: true,
   },
 };
 
@@ -376,23 +365,20 @@ function initWorkshopLoader() {
 //initLab();
 
 //=============================================================
-// BACKGROUND AUDIO
+// AUDIO MANAGER
 //=============================================================
 /*
-  This is intentionally tiny and easy to remove.
+  audioManager.js owns the actual browser Audio elements now.
 
-  Browser reality:
-    Most browsers block autoplay until the user clicks/presses a key. When that
-    happens, play() rejects its Promise. Catching the rejection prevents a scary
-    red console error during normal development.
+  main.js still decides the startup track path from SOLO_TWEAKS, but it no
+  longer directly creates or fades audio. Combat and encounter zones call the
+  manager through clean functions instead of mutating Audio elements.
 */
-const myAudio = new Audio(SOLO_TWEAKS.audio.backgroundPath);
-myAudio.loop = SOLO_TWEAKS.audio.loop;
-if (SOLO_TWEAKS.audio.autoplay) {
-  myAudio.play().catch((error) => {
-    console.info("Background audio is waiting for user interaction.", error);
-  });
-}
+const empyreanAudio = createEmpyreanAudioManager({
+  ambientPath: SOLO_TWEAKS.audio.backgroundPath,
+  ambientLoop: SOLO_TWEAKS.audio.loop,
+  autoplay: SOLO_TWEAKS.audio.autoplay,
+});
 
 /*
   EMPYREAN PUPPET LAB
@@ -535,13 +521,15 @@ const BIND_ROTATION_JOINTS = [...JOINT_ORDER];
 const ARM_RUNTIME_BIND_ROTATION_JOINTS = [
   /*
     Mesh rigging sometimes needs a modeling pose, such as a T-pose, so the
-    generated skin weights line up with the imported GLB. Gameplay needs a
-    different neutral pose: arms relaxed at the sides so "down", walk swing,
-    combat guard, and sword swing all start from a useful baseline.
+    generated skin weights line up with the imported GLB. These are the arm
+    joints whose bind/reference rotations may hold that modeling pose.
 
-    These are the bind-rotation sliders we are allowed to zero after the skin
-    has been bound. The generated SkinnedMesh keeps the T-pose bind matrices it
-    was created with, while the live puppet can return to gameplay arms.
+    Important ownership rule:
+      - Do not erase these automatically when rigging exits.
+      - Visible gameplay poses compensate for them when needed.
+
+    That lets the calibrated skeleton keep its T/A reference while the player
+    can still visibly drop into relaxed, guard, run, or swing poses.
   */
   "leftClavicle",
   "leftShoulder",
@@ -667,99 +655,9 @@ ghostSpheres.forEach((sphere) => scene.add(sphere.group));
 
 //-------------------------------------------------------------
 //-------------------------------------------------------------
-// MOON / SKY FOCAL POINT
-/*
-  This replaces the old procedural Jupiter sphere with your moon.glb.
-
-  Compatibility note:
-    The variable is still named jupiter because older encounter and G53 code
-    already passes a "jupiter" scene reference around. Keeping that handle means
-    the sky-object plumbing stays stable while the visible object becomes the
-    moon.
-*/
-const jupiter = createSkyMoon();
-scene.add(jupiter);
-
-function createSkyMoon() {
-  /*
-    Builds a stable sky-object group immediately, then loads moon.glb into it.
-
-    The fallback sphere keeps a visible sky focal point if the GLB is still
-    loading or if the asset path ever breaks. Once moon.glb arrives, the
-    fallback hides and the normalized GLB takes over.
-  */
-  const group = new THREE.Group();
-  const fallback = new THREE.Mesh(
-    new THREE.SphereGeometry(SOLO_TWEAKS.skyMoon.targetDiameter * 0.5, 24, 14),
-    new THREE.MeshBasicMaterial({
-      color: SOLO_TWEAKS.skyMoon.fallbackColor,
-    }),
-  );
-
-  group.name = "sky-moon";
-  group.userData.g53VisibilityRole = "sky";
-  group.userData.fallback = fallback;
-  group.position.set(...SOLO_TWEAKS.skyMoon.position);
-  group.add(fallback);
-
-  const moonLoader = new GLTFLoader();
-  moonLoader.load(
-    SOLO_TWEAKS.skyMoon.assetPath,
-    (gltf) => {
-      const moon = gltf.scene;
-
-      moon.name = "sky-moon-model";
-      normalizeSkyMoonModel(moon);
-      fallback.visible = false;
-      group.add(moon);
-      console.info("[sky] moon loaded", SOLO_TWEAKS.skyMoon.assetPath);
-    },
-    undefined,
-    (error) => {
-      console.warn(
-        "[sky] failed to load moon.glb; using fallback sphere",
-        error,
-      );
-    },
-  );
-
-  return group;
-}
-
-function normalizeSkyMoonModel(model) {
-  /*
-    Fits moon.glb to the requested sky size.
-
-    Formula:
-      scale = targetDiameter / max(measuredWidth, measuredHeight, measuredDepth)
-
-    The model is then centered on the sky group origin. The sky group's position
-    handles the final world placement.
-  */
-  model.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(model);
-  const size = box.getSize(new THREE.Vector3());
-  const maxAxis = Math.max(size.x, size.y, size.z);
-
-  if (maxAxis <= 0.0001) {
-    return;
-  }
-
-  model.scale.multiplyScalar(SOLO_TWEAKS.skyMoon.targetDiameter / maxAxis);
-  model.updateMatrixWorld(true);
-
-  const fittedBox = new THREE.Box3().setFromObject(model);
-  const center = fittedBox.getCenter(new THREE.Vector3());
-
-  model.position.sub(center);
-  model.traverse((child) => {
-    child.userData.g53VisibilityRole = "sky";
-
-    if (child.isMesh) {
-      child.frustumCulled = false;
-    }
-  });
-}
+// WORLD-OWNED SKY FOCAL POINT
+const skyMoon = buildSkyMoon();
+scene.add(skyMoon);
 
 const rigHeightDisk = buildRigHeightDisk();
 scene.add(rigHeightDisk);
@@ -953,15 +851,27 @@ const state = {
     criticalTipAngle: 0,
   },
   /*
-    Temporary arm-rest snapshot for rigging start poses.
+    Temporary arm-rest snapshot for older rigging start-pose workflows.
 
-    When a T/A-pose is applied for mesh fitting, the arm bind-rotation sliders
-    are changed so the skeleton matches the model's authored pose. Gameplay
-    still needs the pre-rig relaxed arm rest afterward. This snapshot stores
-    that relaxed arm rest until the mesh is bound and the puppet can return to
-    it.
+    v0.1.51 split two ideas that used to be tangled:
+      rig calibration = pivot points and bind/reference rotations
+      visible pose    = the live gameplay arm shape layered on top
+
+    We keep this snapshot for manual recovery tools, but normal G53 exit no
+    longer restores it automatically. A T/A bind reference can remain as part
+    of calibration while visible gameplay arms are relaxed by animation deltas.
   */
   runtimeArmBindRotationBackup: null,
+  /*
+    Set by the "2 rig mesh" workflow while G53 is active.
+
+    Some rigging paths are synchronous because a preview is already loaded; some
+    are asynchronous because GLTFLoader still has to fetch the mesh. Rather than
+    guessing which path we are on, skin.js now tells us when binding actually
+    finishes. This flag lets that completion callback know whether it should
+    leave G53 mode after committing calibration and relaxing the visible arms.
+  */
+  exitG53AfterImportedMeshRig: false,
 };
 
 const controlState = {
@@ -1062,7 +972,7 @@ initCombatEncounter({
   scene,
   controlState,
   rigTuning,
-  backgroundAudio: myAudio,
+  audioManager: empyreanAudio,
 });
 setCombatDifficulty(rigTuning.combatDifficulty);
 
@@ -2001,6 +1911,8 @@ function applyPuppetRigPackage(payload) {
   state.walkPhase = 0;
   state.walkArmSwing = { left: 0, right: 0 };
   rebuildSkeletonWorkshop();
+  commitRigCalibration();
+  applyRelaxedVisiblePose();
 
   if (rigTuning.importedMeshPath) {
     loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
@@ -2514,6 +2426,54 @@ function updateBindRotationPose() {
   syncImportedSkinToPuppet();
 }
 
+function commitRigCalibration() {
+  /*
+    Commits the current rig calibration without restoring defaults.
+
+    This is the explicit ownership boundary between "fitting the rig" and
+    "posing the puppet":
+
+      rig calibration data:
+        rigTuning.jointPointOffsets  = saved pivot/control-point adjustments
+        rigTuning.bindRotationOffsets = saved bind/reference orientation setup
+
+      visible pose data:
+        controlState.leftArm/rightArm and the animation pose targets
+
+    FORMULAS:
+      bindLocalPosition   = baseBindLocalPosition + jointPointOffset
+      bindLocalQuaternion = baseBindLocalQuaternion * bindRotationOffset
+      liveTransform       = current bind transform, ready for animation deltas
+
+    where:
+      baseBind...         = the authored skeleton from createSkeleton()
+      jointPointOffset    = the values you tuned with sliders or mouse drag
+      bindRotationOffset  = the T/A/current reference rotations for mesh fit
+
+    What this deliberately does NOT do:
+      - It does not call resetJointPointOffsets().
+      - It does not call resetBindRotationOffsets().
+      - It does not restore old/default joint positions.
+      - It does not decide whether arms look relaxed, raised, or in guard.
+
+    G53 exit calls this first so your adjusted pivot points remain the new
+    calibrated skeleton. Then applyRelaxedVisiblePose() handles only the visible
+    gameplay arm pose on top of that calibrated setup.
+  */
+  applyJointPointOffsets();
+  applyBindRotationOffsets();
+  resetSkeletonToBindPose();
+  syncSkeletonRoot();
+
+  if (state.skeleton?.root) {
+    state.skeleton.root.rotation.y = controlState.yaw;
+    state.skeleton.root.updateMatrixWorld(true);
+  }
+
+  syncImportedSkinToPuppet();
+  state.debugView?.refreshBones?.();
+}
+
 function rerigImportedMeshAfterBindPoseChange() {
   // Bind-pose changes alter the reference skeleton used for generated weights,
   // so the mesh should be rigged again after applying them.
@@ -2566,6 +2526,58 @@ function cloneArmBindRotationOffsets() {
   }, {});
 }
 
+function makeRelaxedArmBindRotationOffsets() {
+  /*
+    Canonical gameplay arm-bind rest.
+
+    Important distinction:
+      This is NOT the visible idle animation pose. It is the neutral arm bind
+      rotation table that the visible pose is layered on top of.
+
+    The actual relaxed visible arm shape lives in getControlledArmPoseTargets()
+    under pose === "down". These zero bind rotations mean:
+
+      bind/reference arm rotation = neutral authored arm chain
+      gameplay "down" delta       = slight shoulder drop/outward angle,
+                                    small elbow bend, relaxed wrist/palm
+
+    Returning fresh objects matters. We never hand callers shared nested objects,
+    so applying T-pose cannot mutate the canonical relaxed data by reference.
+  */
+  return ARM_RUNTIME_BIND_ROTATION_JOINTS.reduce((snapshot, jointName) => {
+    snapshot[jointName] = { x: 0, y: 0, z: 0 };
+    return snapshot;
+  }, {});
+}
+
+function armRotationTableLooksLikeRiggingReference(rotations) {
+  /*
+    Checks a rotation table, not the live rig.
+
+    Why:
+      The bug we are hunting can happen before values reach the visible skeleton:
+      a "relaxed" backup can accidentally contain the T/A shoulder rotations.
+      If that polluted backup is later restored, the code _looks_ like it is
+      restoring relaxed arms while actually restoring T-pose data.
+
+    Current built-in reference poses:
+      T-pose shoulder Z = +/-1.5708
+      A-pose shoulder Z = +/-1.08
+      relaxed bind Z    = 0
+
+    Threshold 0.65 catches the built-in T/A setup poses while leaving tiny hand
+    tuning alone.
+  */
+  const leftShoulder = rotations?.leftShoulder;
+  const rightShoulder = rotations?.rightShoulder;
+  const liftedThreshold = 0.65;
+
+  return (
+    Math.abs(leftShoulder?.z || 0) > liftedThreshold ||
+    Math.abs(rightShoulder?.z || 0) > liftedThreshold
+  );
+}
+
 function captureRuntimeArmBindRotations(reason) {
   /*
     Saves the current relaxed/gameplay arm rest before a mesh-fitting start pose
@@ -2580,23 +2592,120 @@ function captureRuntimeArmBindRotations(reason) {
     return;
   }
 
+  const capturedRotations = cloneArmBindRotationOffsets();
+  const capturedLooksLikeRiggingReference =
+    armRotationTableLooksLikeRiggingReference(capturedRotations);
+
   state.runtimeArmBindRotationBackup = {
     reason,
-    rotations: cloneArmBindRotationOffsets(),
+    rotations: capturedLooksLikeRiggingReference
+      ? makeRelaxedArmBindRotationOffsets()
+      : capturedRotations,
+    repairedFromRiggingReference: capturedLooksLikeRiggingReference,
   };
-  console.info(`[rig] captured relaxed arm bind rotations before ${reason}`);
+  console.info(
+    `[rig] captured relaxed arm bind rotations before ${reason}${
+      capturedLooksLikeRiggingReference
+        ? " (captured pose looked like T/A; using canonical relaxed arm bind)"
+        : ""
+    }`,
+  );
+}
+
+function armBindPoseLooksLikeRiggingReference() {
+  /*
+    Detects whether the current arm bind/reference table is a T/A-style mesh
+    fitting pose.
+
+    We keep this deliberately narrow by looking only at the shoulder Z bind
+    rotations. In the current rig, T-pose uses about +/-PI/2 at the shoulders
+    and A-pose uses roughly +/-1.08. Normal relaxed arms are near zero.
+
+    This is not a restore-defaults trigger anymore. It is only a safety check
+    for getVisibleArmPoseDelta(), which needs to know when a visible gameplay
+    target should compensate for a lifted bind/reference arm.
+  */
+  return armRotationTableLooksLikeRiggingReference(rigTuning.bindRotationOffsets);
+}
+
+function getVisibleArmPoseDelta(jointName, visibleTargetEuler) {
+  /*
+    Converts a visible gameplay arm target into the animation delta that should
+    be layered onto the current calibrated bind/reference pose.
+
+    This is the missing conceptual layer from the T-pose bug.
+
+    Before v0.1.51, the code assumed:
+
+      finalArm = bindArm * visibleTarget
+
+    That works only when bindArm is already the relaxed/down arm reference. It
+    fails when bindArm is a useful rigging reference, such as T-pose or A-pose,
+    because "down" gets added to raised arms and the player stays raised.
+
+    What we want when the bind reference is T/A:
+
+      finalArm = authoredBaseArm * visibleTarget
+
+    but dampJointRotation() always evaluates:
+
+      finalArm = authoredBaseArm * bindReference * returnedDelta
+
+    Solve for returnedDelta:
+
+      authoredBaseArm * bindReference * returnedDelta
+        = authoredBaseArm * visibleTarget
+
+      returnedDelta = inverse(bindReference) * visibleTarget
+
+    where:
+      bindReference = getBindRotationOffset(jointName) as a quaternion
+      visibleTarget = the named pose target from getControlledArmPoseTargets()
+
+    We only apply this correction when the arm bind table looks like one of the
+    deliberate rigging reference poses. Small hand/shoulder tuning values remain
+    part of the normal calibrated bind pose.
+  */
+  if (
+    !ARM_RUNTIME_BIND_ROTATION_JOINTS.includes(jointName) ||
+    !armBindPoseLooksLikeRiggingReference()
+  ) {
+    return visibleTargetEuler;
+  }
+
+  const bindOffset = getBindRotationOffset(jointName);
+
+  if (
+    Math.abs(bindOffset.x) < 0.000001 &&
+    Math.abs(bindOffset.y) < 0.000001 &&
+    Math.abs(bindOffset.z) < 0.000001
+  ) {
+    return visibleTargetEuler;
+  }
+
+  const bindReferenceQuaternion = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(bindOffset.x, bindOffset.y, bindOffset.z),
+  );
+  const visibleTargetQuaternion = new THREE.Quaternion().setFromEuler(
+    visibleTargetEuler,
+  );
+  const correctedDeltaQuaternion = bindReferenceQuaternion
+    .clone()
+    .invert()
+    .multiply(visibleTargetQuaternion);
+
+  return new THREE.Euler().setFromQuaternion(correctedDeltaQuaternion);
 }
 
 function clearArmControlStateForRelaxedPose() {
   /*
-    Restoring bind rotations alone is not enough if a gameplay arm command is
+    Applying a relaxed visible pose is not enough if a gameplay arm command is
     still active.
 
     Example:
-      If rightArm is "up", zeroing the bind sliders correctly returns the arm
-      rest to relaxed, but the next animation frame immediately adds the "up"
-      pose delta and the arm goes over the head. That made the old button feel
-      like it was causing the raise, even though the active command was doing it.
+      If rightArm is "up", the immediate relaxed pose lowers the arm for one
+      frame, but the next animation frame immediately adds the "up" pose delta
+      and the arm goes over the head.
 
     This helper explicitly returns arm controls to relaxed idle and hides the
     sword prop so the next frame does not re-raise the arms.
@@ -2615,8 +2724,109 @@ function clearArmControlStateForRelaxedPose() {
   }
 }
 
+function setJointRotationFromBindDelta(joint, targetEuler) {
+  /*
+    Immediate version of dampJointRotation().
+
+    dampJointRotation() eases toward a target over several frames. That is good
+    for ordinary animation, but bad for leaving rigging mode: the player should
+    not flash in T-pose for a few frames and then slowly discover her arms.
+
+    Formula is the same as dampJointRotation(), just without slerp:
+
+      finalQuaternion = bindLocalQuaternion * deltaQuaternion
+
+    where:
+      bindLocalQuaternion = current rest/bind orientation
+      deltaQuaternion     = visible gameplay pose offset, such as "down"
+  */
+  if (!joint) {
+    return;
+  }
+
+  const bindQuaternion =
+    joint.userData.bindLocalQuaternion || new THREE.Quaternion();
+  const deltaQuaternion = new THREE.Quaternion().setFromEuler(targetEuler);
+  joint.quaternion.copy(bindQuaternion.clone().multiply(deltaQuaternion));
+}
+
+function applyImmediateControlledArmPose(sideName, side, pose, currentTime) {
+  /*
+    Applies one named arm pose immediately using the same pose library as normal
+    animation. This keeps relaxed idle, walk/run, low guard, combat, and swing
+    using the same vocabulary instead of introducing a second arm-pose system.
+  */
+  const joints = state.skeleton.joints;
+  const shoulder = joints[`${sideName}Shoulder`];
+  const elbow = joints[`${sideName}Elbow`];
+  const wrist = joints[`${sideName}Wrist`];
+  const palm = joints[`${sideName}Palm`];
+  const targets = getControlledArmPoseTargets(
+    sideName,
+    side,
+    pose,
+    currentTime,
+  );
+
+  setJointRotationFromBindDelta(
+    shoulder,
+    getVisibleArmPoseDelta(`${sideName}Shoulder`, targets.shoulder),
+  );
+  setJointRotationFromBindDelta(
+    elbow,
+    getVisibleArmPoseDelta(`${sideName}Elbow`, targets.elbow),
+  );
+  setJointRotationFromBindDelta(
+    wrist,
+    getVisibleArmPoseDelta(`${sideName}Wrist`, targets.wrist),
+  );
+  setJointRotationFromBindDelta(
+    palm,
+    getVisibleArmPoseDelta(`${sideName}Palm`, targets.palm),
+  );
+}
+
+function applyRelaxedVisiblePose() {
+  /*
+    Visible gameplay rest pose.
+
+    This is the separation the project needs:
+
+      T/A pose = rigging/reference/bind setup for imported meshes
+      down     = normal visible player pose after rigging exits
+
+    Calling this does not delete the T/A rig calibration. It only returns the
+    live puppet controls and visible arm rotations to the ordinary relaxed
+    player state once rigging is complete.
+  */
+  clearArmControlStateForRelaxedPose();
+  resetWalkArmSwingState();
+
+  const now = performance.now();
+  applyImmediateControlledArmPose("left", -1, "down", now);
+  applyImmediateControlledArmPose("right", 1, "down", now);
+
+  syncImportedSkinToPuppet();
+  state.debugView?.refreshBones?.();
+}
+
+function applyRelaxedIdlePose() {
+  /*
+    Backward-compatible name for older notes/calls. The newer name is clearer:
+    "visible pose" means shoulder/elbow/wrist rotations only; it does not reset
+    the calibrated joint/control point positions.
+  */
+  applyRelaxedVisiblePose();
+}
+
 function restoreRuntimeArmBindRotations() {
   /*
+    Manual recovery tool for arm bind/reference rotations.
+
+    Normal rigging exit no longer calls this function. It intentionally changes
+    bindRotationOffsets, so it belongs in the calibration layer, not in the
+    ordinary "leave rigging and lower the visible arms" path.
+
     Returns only the arm bind-rotation sliders to the relaxed gameplay rest.
 
     This is intentionally narrower than resetBindRotationOffsets():
@@ -2638,36 +2848,91 @@ function restoreRuntimeArmBindRotations() {
 
     Restore source:
       1. If applyRigMeshTPosePreset() or applyFemaleMeshAPosePreset() captured
-         the pre-rig relaxed arms, restore that exact snapshot.
-      2. If there is no snapshot, fall back to zero arm bind rotations because
-         the fresh Empyrean skeleton's relaxed arm rest is zero.
+         a valid pre-rig relaxed-arm table, restore that exact snapshot.
+      2. If the snapshot itself looks like T/A rigging data, reject it and
+         reconstruct the relaxed arm bind table from canonical hardcoded zeros.
+      3. If there is no snapshot, fall back to that canonical relaxed arm table.
 
     Three.js already captured the generated skin's bind matrices when
     skinnedMesh.bind(skeleton) ran, so after binding we can safely return the
     live puppet arms to the relaxed gameplay rest and let the skin deform from
     its stored modeling-pose bind into the animated pose.
   */
-  const defaults = makeDefaultBindRotationOffsets();
   const backup = state.runtimeArmBindRotationBackup;
-  const restoreSource = backup?.rotations || defaults;
+  const backupLooksLikeRiggingReference =
+    backup?.rotations &&
+    armRotationTableLooksLikeRiggingReference(backup.rotations);
+  const relaxedArmBindRotations = makeRelaxedArmBindRotationOffsets();
+  const restoreSource =
+    backup?.rotations && !backupLooksLikeRiggingReference
+      ? backup.rotations
+      : relaxedArmBindRotations;
 
   ARM_RUNTIME_BIND_ROTATION_JOINTS.forEach((jointName) => {
     Object.assign(
       getBindRotationOffset(jointName),
-      restoreSource[jointName] || defaults[jointName],
+      restoreSource[jointName] || relaxedArmBindRotations[jointName],
     );
   });
 
   state.runtimeArmBindRotationBackup = null;
-  clearArmControlStateForRelaxedPose();
   updateBindRotationPose();
+  applyRelaxedVisiblePose();
   syncSwordAttachment();
   updateGuiDisplays();
   console.info(
     `[rig] restored arm bind rotations to relaxed gameplay rest${
-      backup ? ` from ${backup.reason} snapshot` : " from defaults"
+      backup && !backupLooksLikeRiggingReference
+        ? ` from ${backup.reason} snapshot`
+        : " from canonical relaxed defaults"
     }`,
   );
+}
+
+function handleImportedMeshRigged(details = {}) {
+  /*
+    Single completion hook for every successful mesh-rigging route.
+
+    The old restore lived only in the "2 rig mesh" GUI wrapper. That meant any
+    route that finished somewhere else, especially async quick-rig loading, could
+    bind the mesh in a T/A start pose and then leave the live puppet there. The
+    result was the classic "the mesh rigged, but gameplay arms are stuck in T"
+    failure.
+
+    New v0.1.51 rule:
+      1. skin.js rigs the mesh.
+      2. skin.js calls this hook.
+      3. If this rig was launched from G53, leave G53 through the same commit
+         path as F2.
+      4. Do not restore default pivots or erase T/A bind-reference rotations.
+      5. Apply relaxed visible arm rotations on top of the calibrated skeleton.
+
+    This keeps T/A available as calibration/reference data while preventing T/A
+    from becoming the visible default player pose after normal gameplay resumes.
+  */
+  const hadTemporaryArmPose = Boolean(state.runtimeArmBindRotationBackup);
+  const shouldExitG53 =
+    state.exitG53AfterImportedMeshRig && state.g53RiggingMode.active;
+  const shouldRelaxVisibleGameplayArms =
+    hadTemporaryArmPose ||
+    armBindPoseLooksLikeRiggingReference();
+
+  if (shouldExitG53) {
+    exitG53RiggingMode();
+  } else if (shouldRelaxVisibleGameplayArms) {
+    commitRigCalibration();
+    applyRelaxedVisiblePose();
+  }
+
+  state.runtimeArmBindRotationBackup = null;
+  state.exitG53AfterImportedMeshRig = false;
+
+  console.info("[rig] imported mesh rigging complete", {
+    path: details.path || getActiveMeshPath(),
+    meshes: details.meshes || state.importedSkin?.meshes?.length || 0,
+    relaxedVisibleGameplayArms: shouldRelaxVisibleGameplayArms,
+    preservedRigCalibration: true,
+  });
 }
 
 function applyFemaleMeshAPosePreset() {
@@ -2914,7 +3179,7 @@ function applyG53VisibilityFixture() {
     state on selected world visuals:
       - walls and ceilings go to opacity 0
       - floors stay faint as reference planes
-      - trees, ghost spheres, and Jupiter hide
+      - trees, ghost spheres, and the sky moon hide
 
     Because the original values are recorded first, exit restores the world to
     exactly the opacity/visibility it had before G53 mode entered.
@@ -2942,9 +3207,9 @@ function applyG53VisibilityFixture() {
     });
   }
 
-  if (G53_RIGGING_HOME.visibility.hideJupiter && jupiter) {
-    rememberG53ObjectVisibility(jupiter, capturedMaterials);
-    jupiter.visible = false;
+  if (G53_RIGGING_HOME.visibility.hideSkyMoon && skyMoon) {
+    rememberG53ObjectVisibility(skyMoon, capturedMaterials);
+    skyMoon.visible = false;
   }
 
   setCombatRiggingVisibilitySuppressed(true);
@@ -3200,8 +3465,17 @@ function exitG53RiggingMode() {
   /*
     TEMP / DEV PRECISION RIGGING MODE: leave machine-home fixture.
 
-    This restores gameplay/view state, but it does not undo pivot edits. If you
-    moved a joint point during rigging mode, that remains your new tuned value.
+    This restores gameplay/view state, but it does not undo pivot edits.
+
+    Exit ownership order:
+      1. restore the temporary game/camera fixture
+      2. commit the current rig calibration
+      3. apply the relaxed visible arm pose
+      4. resume normal animation updates
+
+    "Commit calibration" means the joint/control point locations and bind
+    reference rotations you tuned during rigging remain in rigTuning and in the
+    live bind transforms. It does not mean "restore defaults."
   */
   if (!state.g53RiggingMode.active) {
     return;
@@ -3214,19 +3488,18 @@ function exitG53RiggingMode() {
   restoreG53VisibilityFixture();
   restoreG53RiggingSnapshot(saved);
 
-  resetSkeletonToBindPose();
-  syncSkeletonRoot();
-  if (state.skeleton?.root) {
-    state.skeleton.root.rotation.y = controlState.yaw;
-    state.skeleton.root.updateMatrixWorld(true);
-  }
+  commitRigCalibration();
+  applyRelaxedVisiblePose();
+  state.runtimeArmBindRotationBackup = null;
 
   syncSwordAttachment();
   selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
   applyVisibility();
   updateGuiDisplays();
   updateG53RiggingStatus("OFF");
-  console.info("[G53] rigging mode restored gameplay/view state");
+  console.info(
+    "[G53] rigging mode committed calibration and restored visible gameplay pose",
+  );
 }
 
 function toggleG53RiggingMode() {
@@ -3244,23 +3517,16 @@ function rigCurrentImportedMeshAndExitG53() {
     In the G53 workflow, the usual sequence is:
       preview mesh -> F2 home rigging mode -> tune pivots -> 2 rig mesh -> return
 
-    If a preview is already loaded, rigging is synchronous and we can restore
-    gameplay immediately afterward. If no preview exists, skin.js starts an
-    asynchronous GLB load; in that fallback case G53 mode stays active and the
-    user can press F2 after the load/rig finishes.
+    skin.js now reports the exact moment the mesh is actually bound. That gives
+    us one clean finish point for both cases:
+      - preview already loaded: completion happens synchronously
+      - no preview: completion happens later in the GLTFLoader callback
   */
-  const canRestoreImmediately = Boolean(state.importedPreview?.gltf);
-
+  state.exitG53AfterImportedMeshRig = Boolean(state.g53RiggingMode.active);
   rigCurrentImportedMesh();
 
-  if (canRestoreImmediately) {
-    restoreRuntimeArmBindRotations();
-  }
-
-  if (state.g53RiggingMode.active && canRestoreImmediately) {
-    exitG53RiggingMode();
-  } else if (state.g53RiggingMode.active) {
-    updateG53RiggingStatus("ACTIVE - async mesh load; press F2 after rigging");
+  if (state.g53RiggingMode.active && state.exitG53AfterImportedMeshRig) {
+    updateG53RiggingStatus("ACTIVE - rigging mesh; will exit after bind");
   }
 }
 
@@ -3375,8 +3641,8 @@ function buildGui() {
   }).name("start pose");
   meshFolder.add({ fn: applyRigMeshStartPose }, "fn").name("apply start pose");
   meshFolder
-    .add({ fn: restoreRuntimeArmBindRotations }, "fn")
-    .name("restore gameplay arms");
+    .add({ fn: applyRelaxedVisiblePose }, "fn")
+    .name("relax visible arms");
   meshFolder.add({ fn: renderDefaultImportedMesh }, "fn").name("1  preview");
   meshFolder
     .add({ fn: rigCurrentImportedMeshAndExitG53 }, "fn")
@@ -4286,9 +4552,9 @@ function animate(currentTime) {
       ),
       state.worldDebugView,
       {
-        audio: myAudio,
-        jupiter,
-        defaultJupiterColor: SOLO_TWEAKS.skyMoon.fallbackColor,
+        audio: empyreanAudio,
+        skyMoon,
+        defaultSkyMoonColor: getDefaultSkyMoonColor(),
       },
     );
   }
@@ -4444,10 +4710,6 @@ function updateSkeleton(delta, elapsed, currentTime) {
     return;
   }
 
-  if (!rigTuning.labEnabled || !rigTuning.skeletonVisible) {
-    return;
-  }
-
   if (rigTuning.idleMotion) {
     updateIdleMotion(delta, elapsed);
   }
@@ -4477,7 +4739,9 @@ function updateSkeleton(delta, elapsed, currentTime) {
     knee/ankle/foot positions every frame, the copied vertex must be refreshed
     here or the femur/shin/foot lines will visually detach from their markers.
   */
-  state.debugView?.refreshBones?.();
+  if (rigTuning.labEnabled && rigTuning.skeletonVisible) {
+    state.debugView?.refreshBones?.();
+  }
 }
 
 function freezeG53RiggingPose() {
@@ -6577,7 +6841,10 @@ function updateJumpPose(delta) {
     );
     dampJointRotation(
       joints[`${sideName}Shoulder`],
-      new THREE.Euler(-0.08, 0, side * (0.18 + armFloat)),
+      getVisibleArmPoseDelta(
+        `${sideName}Shoulder`,
+        new THREE.Euler(-0.08, 0, side * (0.18 + armFloat)),
+      ),
       delta,
       rigTuning.damping * 0.7,
     );
@@ -6856,10 +7123,30 @@ function updateControlledArm(sideName, side, pose, delta, currentTime) {
     currentTime,
   );
 
-  dampJointRotation(shoulder, targets.shoulder, delta, rigTuning.damping);
-  dampJointRotation(elbow, targets.elbow, delta, rigTuning.damping);
-  dampJointRotation(wrist, targets.wrist, delta, rigTuning.damping);
-  dampJointRotation(palm, targets.palm, delta, rigTuning.damping);
+  dampJointRotation(
+    shoulder,
+    getVisibleArmPoseDelta(`${sideName}Shoulder`, targets.shoulder),
+    delta,
+    rigTuning.damping,
+  );
+  dampJointRotation(
+    elbow,
+    getVisibleArmPoseDelta(`${sideName}Elbow`, targets.elbow),
+    delta,
+    rigTuning.damping,
+  );
+  dampJointRotation(
+    wrist,
+    getVisibleArmPoseDelta(`${sideName}Wrist`, targets.wrist),
+    delta,
+    rigTuning.damping,
+  );
+  dampJointRotation(
+    palm,
+    getVisibleArmPoseDelta(`${sideName}Palm`, targets.palm),
+    delta,
+    rigTuning.damping,
+  );
 }
 
 function updateCamera(delta) {
@@ -7729,23 +8016,24 @@ function settleStartupPoseBehindTitleCard() {
       their world matrices and guide lines.
 
     Formula:
-      visibleStartPose = bindPose + rootPosition + rootYaw
+      visibleStartPose = bindPose + relaxedArmDelta + rootPosition + rootYaw
 
     where:
-      bindPose     = saved joint point offsets + saved bind rotations
-      rootPosition = player/control position
-      rootYaw      = current player facing
+      bindPose        = saved joint point offsets + saved bind rotations
+      relaxedArmDelta = getControlledArmPoseTargets(..., "down", ...)
+      rootPosition    = player/control position
+      rootYaw         = current player facing
 
     Running this before requestAnimationFrame(animate) means the first visible
-    gameplay frame already has the corrected leg orientation.
+    gameplay frame already has the corrected leg orientation AND the player is
+    not visually left in the rigging/reference arm pose.
   */
   if (!state.skeleton?.root) {
     return;
   }
 
-  resetSkeletonToBindPose();
-  syncSkeletonRoot();
-  state.skeleton.root.rotation.y = controlState.yaw;
+  commitRigCalibration();
+  applyRelaxedVisiblePose();
   state.skeleton.root.updateMatrixWorld(true);
   state.debugView?.refreshBones?.();
   syncImportedSkinToPuppet();
@@ -7759,7 +8047,12 @@ console.info(
 );
 
 buildLighting(scene);
-initSkin({ state, rigTuning, updateGuiDisplays });
+initSkin({
+  state,
+  rigTuning,
+  updateGuiDisplays,
+  onAfterImportedMeshRigged: handleImportedMeshRigged,
+});
 buildSkeletonWorkshop();
 buildGui();
 resizeRendererToContainer();

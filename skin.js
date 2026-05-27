@@ -10,9 +10,10 @@
     - Dispose helpers
 
   Context injection:
-    main.js calls initSkin({ state, rigTuning, updateGuiDisplays }) once before
-    any other skin function runs. All module functions then close over _ctx instead
-    of importing directly from main.js, which avoids circular imports.
+    main.js calls initSkin({ state, rigTuning, updateGuiDisplays, ... }) once
+    before any other skin function runs. All module functions then close over
+    _ctx instead of importing directly from main.js, which avoids circular
+    imports.
 
   Import rule:
     This module imports THREE, GLTFLoader, and disposeObjectTree from world.js.
@@ -30,8 +31,18 @@ const gltfLoader = new GLTFLoader();
 // _ctx is set by initSkin() before any other export is called.
 let _ctx = null;
 
-export function initSkin({ state, rigTuning, updateGuiDisplays }) {
-  _ctx = { state, rigTuning, updateGuiDisplays };
+export function initSkin({
+  state,
+  rigTuning,
+  updateGuiDisplays,
+  onAfterImportedMeshRigged,
+}) {
+  _ctx = {
+    state,
+    rigTuning,
+    updateGuiDisplays,
+    onAfterImportedMeshRigged,
+  };
 }
 
 // =============================================================
@@ -304,6 +315,29 @@ function rigImportedMeshFromGltfClone(gltf, path) {
   state.skeleton.root.add(state.importedSkin.group);
   syncImportedSkinToPuppet();
   applyImportedMeshPresentation();
+  notifyImportedMeshRigged(path);
+}
+
+function notifyImportedMeshRigged(path) {
+  /*
+    Reports the exact moment a mesh has finished binding to the generated
+    skeleton.
+
+    Why skin.js owns this call:
+      There are several rigging doorways now:
+        - "2 rig mesh" reuses an already-rendered preview synchronously.
+        - "quick rig" loads a GLB asynchronously, then rigs it.
+        - "re-rig" regenerates an existing skin.
+
+      main.js needs one reliable completion signal for all of those routes so it
+      can restore the temporary T/A-pose arm bind rotations back to gameplay
+      rest. Putting the callback here means every successful rig path gets the
+      same cleanup instead of relying on each GUI button to remember it.
+  */
+  _ctx.onAfterImportedMeshRigged?.({
+    path,
+    meshes: _ctx.state.importedSkin?.meshes?.length || 0,
+  });
 }
 
 function createPreviewMeshFromGltf(gltf, path) {

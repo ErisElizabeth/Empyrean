@@ -3,6 +3,7 @@
 
   Owns:
     - World geometry (rooms, trees, outside enclosure)
+    - Sky moon focal object
     - Ghost sphere setup and motion
     - Scene lighting
     - Collision data (worldCollision) and collision resolution
@@ -25,9 +26,23 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // =============================================================
 /*
   World-specific tuning that previously lived in main.js SOLO_TWEAKS.
-  Player speed, camera, Jupiter, and audio stay in main.js.
+  Player speed and camera stay in main.js. Audio is routed through
+  audioManager.js and passed in as a scene reference for encounter actions.
 */
 const WORLD_TWEAKS = {
+  skyMoon: {
+    /*
+      Replaces the old procedural planet sphere with moon.glb.
+
+      These values preserve the current visual behavior exactly. The sky object
+      is a world/environment prop now, so the config lives beside trees, torches,
+      rooms, and ghost spheres instead of in main.js.
+    */
+    assetPath: "assets/moon.glb",
+    targetDiameter: 20,
+    position: [0, 5.75, -80],
+    fallbackColor: 0x7a7979,
+  },
   world: {
     roomSize: 24,
     wallThickness: 0.1,
@@ -112,6 +127,10 @@ const GHOST_SPHERE_COLOR = WORLD_TWEAKS.ghostSpheres.color;
 
 export const GUIDE_COLOR = "#e0dcdc";
 
+export function getDefaultSkyMoonColor() {
+  return WORLD_TWEAKS.skyMoon.fallbackColor;
+}
+
 // ---------------------------------------------------------------------------
 // TEXTURE HELPERS
 // ---------------------------------------------------------------------------
@@ -132,6 +151,94 @@ const treeAssetState = {
   live: { prototype: null, loading: false, pending: [] },
   dead: { prototype: null, loading: false, pending: [] },
 };
+
+// =============================================================
+// SKY MOON
+// =============================================================
+
+export function buildSkyMoon() {
+  /*
+    Builds the moon/sky focal point as a world-owned object.
+
+    The group is available immediately with a fallback sphere so the scene has
+    the same visible sky focal point while moon.glb is loading. Once moon.glb
+    arrives, the fallback hides and the normalized GLB takes over.
+  */
+  const group = new THREE.Group();
+  const fallback = new THREE.Mesh(
+    new THREE.SphereGeometry(
+      WORLD_TWEAKS.skyMoon.targetDiameter * 0.5,
+      24,
+      14,
+    ),
+    new THREE.MeshBasicMaterial({
+      color: WORLD_TWEAKS.skyMoon.fallbackColor,
+    }),
+  );
+
+  group.name = "sky-moon";
+  group.userData.g53VisibilityRole = "sky";
+  group.userData.fallback = fallback;
+  group.position.set(...WORLD_TWEAKS.skyMoon.position);
+  group.add(fallback);
+
+  gltfLoader.load(
+    WORLD_TWEAKS.skyMoon.assetPath,
+    (gltf) => {
+      const moon = gltf.scene;
+
+      moon.name = "sky-moon-model";
+      normalizeSkyMoonModel(moon);
+      fallback.visible = false;
+      group.add(moon);
+      console.info("[sky] moon loaded", WORLD_TWEAKS.skyMoon.assetPath);
+    },
+    undefined,
+    (error) => {
+      console.warn(
+        "[sky] failed to load moon.glb; using fallback sphere",
+        error,
+      );
+    },
+  );
+
+  return group;
+}
+
+function normalizeSkyMoonModel(model) {
+  /*
+    Fits moon.glb to the requested sky size.
+
+    Formula:
+      scale = targetDiameter / max(measuredWidth, measuredHeight, measuredDepth)
+
+    The model is then centered on the sky group origin. The sky group's position
+    handles the final world placement.
+  */
+  model.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const maxAxis = Math.max(size.x, size.y, size.z);
+
+  if (maxAxis <= 0.0001) {
+    return;
+  }
+
+  model.scale.multiplyScalar(WORLD_TWEAKS.skyMoon.targetDiameter / maxAxis);
+  model.updateMatrixWorld(true);
+
+  const fittedBox = new THREE.Box3().setFromObject(model);
+  const center = fittedBox.getCenter(new THREE.Vector3());
+
+  model.position.sub(center);
+  model.traverse((child) => {
+    child.userData.g53VisibilityRole = "sky";
+
+    if (child.isMesh) {
+      child.frustumCulled = false;
+    }
+  });
+}
 
 function loadRepeatedTexture(path, repeatX, repeatY, colorSpace = null) {
   /*
@@ -1005,7 +1112,7 @@ export function buildLighting(scene) {
       PointLight = small green character/world accent
       Room torches = warm local point lights created by addTorchLight()
 
-    MeshBasicMaterial objects (ghost spheres, Jupiter) ignore these lights.
+    MeshBasicMaterial objects (ghost spheres, sky moon) ignore these lights.
   */
   scene.add(new THREE.HemisphereLight("#91aa91", "#020202", 0.58));
 
@@ -1232,7 +1339,7 @@ export function tickEncounterSystem(runtime, footprint, worldDebugView, sceneRef
       outside -> inside = onEnter
       inside -> outside = onExit
 
-    sceneRefs = { audio, jupiter, defaultJupiterColor }
+    sceneRefs = { audio, skyMoon, defaultSkyMoonColor }
       Passed by main.js so encounter actions can affect scene objects without
       this module importing from main.js.
   */
@@ -1339,11 +1446,18 @@ function applyEncounterAction(action, encounter, phase, sceneRefs) {
     case "audio":
       applyEncounterAudioAction(action, sceneRefs.audio);
       break;
+    case "skyMoonColor":
     case "jupiterColor":
-      applySkyObjectColor(sceneRefs.jupiter, action.color || sceneRefs.defaultJupiterColor);
+      applySkyObjectColor(
+        sceneRefs.skyMoon || sceneRefs.jupiter,
+        action.color || sceneRefs.defaultSkyMoonColor || sceneRefs.defaultJupiterColor,
+      );
       break;
+    case "skyMoonScale":
     case "jupiterScale":
-      sceneRefs.jupiter.scale.setScalar(Number.isFinite(action.scale) ? action.scale : 1);
+      (sceneRefs.skyMoon || sceneRefs.jupiter)?.scale.setScalar(
+        Number.isFinite(action.scale) ? action.scale : 1,
+      );
       break;
     default:
       console.warn("Unknown encounter action.", { encounter, action });
@@ -1355,8 +1469,8 @@ function applySkyObjectColor(skyObject, color) {
   /*
     Encounter compatibility helper.
 
-    Older builds used one Mesh named "jupiter", so encounter color actions could
-    call jupiter.material.color directly. The sky object is now a moon.glb group,
+    Older builds used one single-mesh sky object, so encounter color actions
+    could call material.color directly. The sky object is now a moon.glb group,
     which may contain several meshes. This helper applies the same tint to every
     material under the group, while still supporting the old single-mesh path.
   */
@@ -1388,34 +1502,7 @@ function applySkyObjectColor(skyObject, color) {
 }
 
 function applyEncounterAudioAction(action, audio) {
-  if (action.src && !audio.src.endsWith(action.src)) {
-    audio.pause();
-    audio.src = action.src;
-    audio.load();
-  }
-
-  if (Number.isFinite(action.volume)) {
-    audio.volume = THREE.MathUtils.clamp(action.volume, 0, 1);
-  }
-
-  if (Number.isFinite(action.playbackRate)) {
-    audio.playbackRate = THREE.MathUtils.clamp(action.playbackRate, 0.5, 4);
-  }
-
-  if (typeof action.loop === "boolean") {
-    audio.loop = action.loop;
-  }
-
-  if (action.pause) {
-    audio.pause();
-    return;
-  }
-
-  if (action.play) {
-    audio.play().catch((error) => {
-      console.info("Encounter audio is waiting for user interaction.", error);
-    });
-  }
+  audio?.applyEncounterAudioAction?.(action);
 }
 
 // =============================================================

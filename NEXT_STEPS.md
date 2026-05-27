@@ -14,9 +14,9 @@ Pick one task per session. Run `.\checkpoint.ps1` first.
 
    Goal: understand what the invisible navigation map looks like.
 
-1. Tune Jupiter
+1. Tune the sky moon
 
-   Change `SOLO_TWEAKS.jupiter.position`, `radius`, and `color`.
+   Change `WORLD_TWEAKS.skyMoon.position`, `targetDiameter`, and `fallbackColor`.
 
    Goal: make the sky feel intentional from several camera angles.
 

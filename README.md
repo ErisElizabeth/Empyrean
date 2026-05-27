@@ -4,7 +4,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.45-alpha`
+- Empyrean build: `0.1.54-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -34,12 +34,15 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - solo-builder docs and checkpoint helper
 - world collision debug overlay
 - data-driven encounter trigger zones
+- combat d20 as a numbered rough-stone 3D object
+- separate `oracleD20.js` module for the physical d20/oracle object and roll state
 - focused rig mesh mode
 - start-here runbook and verification helper
 - mouse drag joint point editing
 - first physics and rig module split
 - 5% opacity default-height wireframe disk
 - combat encounter prototype with enemy GLB, battle audio, dice roll, hitbox, evasion, health bar, and right-hand sword attacks
+- separate `audioManager.js` module for ambient drone, combat music, fades, one-shots, pause/resume, and encounter audio actions
 - TEMP devProbe coordinate marker for measuring rig-relative attachment points
 - skeleton guide opacity control for viewing the rigged mesh more clearly
 - G53-style machine-home rigging mode shell for stable pivot tuning
@@ -51,13 +54,14 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - capture-phase F2 hotkey recovery after local mesh loading
 - cold-start-safe G53 entry and failed-enter recovery
 - bind-pose-aware generated skin side selection for rotated meshes
-- Sigewynn default temp mesh, plainSword combat prop, post-rig gameplay arm restore, and a named arm pose resolver for easier stance/swing work
-- relaxed-arm snapshot restore so T/A rigging poses do not become permanent gameplay poses
+- Sigewynn default temp mesh, plainSword combat prop, post-rig visible arm relaxation, and a named arm pose resolver for easier stance/swing work
+- rig calibration / visible pose split so T/A reference arms can be preserved without leaving gameplay arms raised
 - saved `Sword Offsets` GUI controls for sword path, length, grip, position, pitch, yaw, and roll
 - pure combat balance math module and Low Guard stance on sword draw
 - neutral body/knee facing correction so anatomical right/left and foot direction read correctly while the related Y bind-rotation sliders read zero
 - Empyrean room aesthetic pass with stone floor/wall textures, 80% room walls, dim torch props, and warm torch light sources
-- moon.glb sky focal point replacing the old Jupiter sphere
+- moon.glb sky focal point replacing the old planet sphere
+- world-owned sky moon setup in `world.js`
 - EMPYREAN stone-engraved title card with animated gradient and delayed reveal
 
 ---
@@ -79,9 +83,9 @@ main.js             ← the floor supervisor
 
 world.js            ← the fixtures and layout station
                       builds all the geometry (rooms, trees, outside walls,
-                      ghost spheres, lighting), owns the collision data,
-                      resolves wall/tree collisions, runs the encounter system,
-                      draws the debug overlay
+                      ghost spheres, sky moon, lighting), owns the collision
+                      data, resolves wall/tree collisions, runs the encounter
+                      system, draws the debug overlay
 
 skin.js             ← the mesh-fitting station
                       handles everything about the imported GLB mesh:
@@ -91,8 +95,20 @@ skin.js             ← the mesh-fitting station
 
 combat_updated.js   <- the encounter prototype station
                       owns the combat trigger, enemy.glb loader/fit, hitbox,
-                      battle.mp3 crossfade, d20 roll, simple evasion,
-                      health, hiding, and sword-hit validation
+                      simple evasion, health, hiding, sword-hit validation,
+                      and the decision to ask the oracle and audio manager for
+                      roll/music behavior
+
+oracleD20.js        <- the physical d20/oracle station
+                      owns the rough-stone numbered die, face/value mapping,
+                      roll quaternions, roll value, settled state, and rolling
+                      update. It does not decide enemy behavior or audio.
+
+audioManager.js     <- the sound station
+                      owns the ambient chapel drone, combat music, fades,
+                      one-shot sounds, pause/resume behavior, and encounter
+                      audio actions. Gameplay asks it for sound changes; it
+                      does not decide combat or world state.
 
 combatPhysics.js    <- the combat math station
                       pure formulas only: base of support, combined center of
@@ -161,17 +177,21 @@ encounters.js
 
 The rule: nothing imports from main.js. main.js is the only thing that pulls everything together. If world.js or skin.js needed something from main.js, that would be a circular dependency — like a parts station trying to call the floor supervisor to ask for a part the floor supervisor asked the parts station to make in the first place. Instead, main.js passes what each station needs as a parameter when it calls them.
 
-Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, calls `updateCombatEncounter(delta)` once per animation frame, and calls `attemptCombatSwordHit()` only when the player swings. `main.js` owns the sword model and arm pose. `combat_updated.js` owns trigger state, enemy GLB fitting, hitbox, d20, battle audio, evasion, health, hiding, and victory. `combatPhysics.js` owns the readable balance formulas and stance profiles, while `main.js` converts the live Three.js joint positions into the root-local numbers those formulas need.
+Combat has one extra internal helper now: `combat_updated.js` imports `oracleD20.js`. The encounter controller still decides when the roll starts, what the result means for enemy evasion, and when combat changes phase. `oracleD20.js` only owns the physical die and its roll state.
+
+Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, calls `updateCombatEncounter(delta)` once per animation frame, and calls `attemptCombatSwordHit()` only when the player swings. `main.js` owns the sword model and arm pose. `combat_updated.js` owns trigger state, enemy GLB fitting, hitbox, evasion, health, hiding, victory, and the decision to consume oracle/audio results. `oracleD20.js` owns the physical numbered d20 object and roll state. `audioManager.js` owns ambient and combat Audio elements, fades, one-shots, encounter audio actions, and pause/resume. `combatPhysics.js` owns the readable balance formulas and stance profiles, while `main.js` converts the live Three.js joint positions into the root-local numbers those formulas need.
 
 ### Where to Make Common Changes
 
 | You want to change... | Go to... |
 |---|---|
-| Movement speed, camera feel, colors, audio | `SOLO_TWEAKS` near the top of `main.js` |
+| Movement speed, camera feel, colors | `SOLO_TWEAKS` near the top of `main.js` |
+| Ambient/combat audio paths, fade behavior, one-shots, pause/resume | `audioManager.js` |
 | Sword asset path, scale, grip origin, hand offset, pitch/yaw/roll | `Sword Offsets` in the GUI |
 | Sword default values, swing timing, hit range | `SWORD_TWEAKS` near the top of `main.js` |
 | Arm stances and sword swing rotations | `getControlledArmPoseTargets()` in `main.js` |
 | Combat balance formulas or Low Guard body/leg stance | `combatPhysics.js` |
+| Physical d20 look, roll timing, face numbers, result-facing quaternion math | `oracleD20.js` |
 | Neutral anatomical facing correction | `RIG_BASE_BODY_YAW` near the top of `main.js` |
 | Complete rig package shape or local rig-library behavior | `puppetShop.js` |
 | Room size, wall colors, ghost sphere count | `WORLD_TWEAKS` near the top of `world.js` |
@@ -186,11 +206,20 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 
 ## Change Notes
 
+- `0.1.54-alpha`: Moved the moon/sky focal object into `world.js`, renamed the active runtime handle from the old `jupiter` name to `skyMoon`, moved current encounter data to `skyMoonColor`, and kept old `jupiterColor` / `jupiterScale` action names as compatibility aliases.
+- `0.1.53-alpha`: Extracted audio ownership into `audioManager.js`; main now creates one audio manager, combat delegates ambient/combat music fades to it, world encounter audio actions call it instead of mutating an Audio element, and verification now checks the audio module.
+- `0.1.52-alpha`: Extracted the physical d20/oracle mechanic into `oracleD20.js`; combat now delegates die config, mesh creation, face/value mapping, roll quaternions, roll value, settled state, and rolling updates to the oracle module while keeping enemy decisions, banners, and encounter phases in `combat_updated.js`.
+- `0.1.51-alpha`: Split rig calibration from visible gameplay pose: G53 now commits joint/control point offsets and bind/reference rotations, then applies relaxed/down visible arms using `inverse(bindReference) * visibleTarget` so T/A reference arms can remain calibrated without becoming the gameplay rest pose.
+- `0.1.50-alpha`: Applied the visible relaxed/down arm pose during startup settle and decoupled puppet animation from debug skeleton visibility so hiding the lab guides no longer bypasses `updateControlledArms()`.
+- `0.1.49-alpha`: Hardened relaxed-arm restoration against polluted T/A backups by adding canonical relaxed arm bind data, rejecting backup tables whose shoulder rotations still look like T/A rigging references, and reconstructing relaxed arm bind rotations from hardcoded zeros when needed.
+- `0.1.48-alpha`: Separated the T/A rigging reference pose from the visible relaxed gameplay pose: G53 exit and mesh-rig completion now detect lifted rigging shoulders, restore/default the arm bind rotations as needed, and snap the live arms to the normal down pose before gameplay resumes.
+- `0.1.47-alpha`: Restored the post-rig gameplay-arm handoff by adding a single mesh-rig completion hook in `skin.js`; T/A start poses now return to relaxed arms after synchronous preview rigging, async quick rigging, and re-rigging.
+- `0.1.46-alpha`: Rebuilt the combat d20 as a true rough-stone numbered 3D object: twenty face-mounted Caesar Dressing numbers, reused room stone textures, a slower mournful roll, and quaternion targeting so the generated d20 value dictates which physical face settles toward the player.
 - `0.1.45-alpha`: Fixed lower-leg orientation reverting after rigging or startup by changing `dampJointRotation()` to layer animation deltas onto the full `bindLocalQuaternion` instead of only the visible bind Euler sliders, preserving the neutral-zero knee/body fixture rotations through walk, idle, rigging exit, and title-card reveal.
 - `0.1.44-alpha`: Replaced the startup spinner with an EMPYREAN Caesar Dressing stone-engraved title card, added subtle animated text/background gradients, moved loader reveal to the end of startup, and added a startup pose settle pass so leg realignment happens behind the title card.
 - `0.1.43-alpha`: Added the first Puppet Shop architecture boundary with new `puppetShop.js`, named complete rig packages, local rig-library save/load/delete/list controls, package copy/paste compatibility, and docs for separating reusable puppet rigs from gameplay.
 - `0.1.42-alpha`: Added a first running cycle from `runCycle.md`: hold `Shift + W` to run with faster travel/turnover, run-specific stride/foot-lift/bounce/lean sliders, pelvis flight bounce, hip/shoulder counter-twist, and bent-elbow arm pumping while preserving the existing walk cycle.
-- `0.1.41-alpha`: Replaced the outside primitive trees with alternating `tree.glb` and `deadTree.glb` props while keeping the existing circular tree colliders, and replaced the old Jupiter sphere with `moon.glb` at about half the previous visual size and 15% lower on Y.
+- `0.1.41-alpha`: Replaced the outside primitive trees with alternating `tree.glb` and `deadTree.glb` props while keeping the existing circular tree colliders, and replaced the old planet sphere with `moon.glb` at about half the previous visual size and 15% lower on Y.
 - `0.1.40-alpha`: Applied `stoneFloorDiff.jpg`/`stoneFloorDisp.png` to room floors, `stoneWallDiff.jpg`/`StoneWallDisp.png` to room walls and ceilings, shifted room surfaces to dull gray, raised room wall opacity to 80%, added two `torch.glb` props per inside wall, and made each torch a dim warm point-light source.
 - `0.1.39-alpha`: Applied the same fixture-zero facing correction to `leftKnee` and `rightKnee`, giving each knee a neutral `-PI` base yaw so the shin/ankle/foot chains face correctly while their GUI Y bind-rotation sliders remain `0`; old near-PI knee Y fixes migrate back to zero.
 - `0.1.38-alpha`: Baked the 180-degree body-facing correction into the body joint's base bind pose so anatomical right/left matches the feet while the GUI bind-pose body Y value reads `0`; old saved `body Y ~= +/-PI` facing fixes now migrate back to zero.
@@ -206,7 +235,7 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 - `0.1.28-alpha`: Updated generated skin weighting so left/right arm and leg regions choose the nearest bind-pose skeleton side instead of assuming negative X is always left. This keeps side assignment stable when a 180-degree Y bind rotation flips the visible skeleton sides.
 - `0.1.27-alpha`: Added G53 X/Y/Z axis locks to mouse joint dragging so unchecked axes remain fixed at their drag-start local coordinate during precision pivot tuning.
 - `0.1.26-alpha`: Added combat visual suppression to G53 mode so the encounter trigger cylinder, enemy hitbox, enemy health bar, and d20 are hidden during precision rigging and restored afterward.
-- `0.1.25-alpha`: Added Pass 2 of G53 rigging mode: tagged world geometry for rigging visibility, hid walls/ceilings/trees/ghost spheres/Jupiter during G53 mode, kept floors as faint reference planes, and restored original visibility/material state on exit.
+- `0.1.25-alpha`: Added Pass 2 of G53 rigging mode: tagged world geometry for rigging visibility, hid walls/ceilings/trees/ghost spheres/the sky focal object during G53 mode, kept floors as faint reference planes, and restored original visibility/material state on exit.
 - `0.1.24-alpha`: Added Pass 1 of G53-style machine-home rigging mode: `F2` toggle, state save/restore, home position/yaw, frozen idle/walk drift, locked player movement during rigging, enabled mouse joint editing, and GUI status/buttons.
 - `0.1.23-alpha`: Added the TEMP `devProbe` coordinate marker with GUI sliders, mouse drag, Shift-key nudging, world/rig-local readouts, copy/log buttons, and a Skeleton Lab guide-opacity slider.
 - `0.1.22-alpha`: Added right-hand sword loading from `assets/sword.glb`, keyboard/GUI combat stance and swing controls, enemy health bar, Easy/Medium/Hard hit counts, and the hide/re-find loop after each non-lethal hit.
@@ -222,7 +251,7 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 - `0.1.12-alpha`: Added mouse joint point editing mode for dragging visible joint markers and writing the result back into the existing Joint Point Offset sliders.
 - `0.1.11-alpha`: Added `START_HERE.md` and `verify.ps1` so solo sessions have a quick return path and one-command structural checks.
 - `0.1.10-alpha`: Added `Rig Mesh Mode`, a focused GUI workflow that groups mesh render/pose/rig actions, adds start-pose choices for current, A-pose, T-pose, and reserved custom, and tucks away duplicate manual mesh/bind folders while active.
-- `0.1.9-alpha`: Added World Debug collision/trigger overlays and a data-driven `encounters.js` module for non-blocking trigger zones that can run actions such as audio changes, console messages, and Jupiter visual changes.
+- `0.1.9-alpha`: Added World Debug collision/trigger overlays and a data-driven `encounters.js` module for non-blocking trigger zones that can run actions such as audio changes, console messages, and sky-object visual changes.
 - `0.1.8-alpha`: Added the solo-builder kit: `SOLO_TWEAKS` in `main.js`, `SOLO_WORKFLOW.md`, `WORLD_COOKBOOK.md`, `NEXT_STEPS.md`, and `checkpoint.ps1`.
 - `0.1.7-alpha`: Added a heavy source-comment pass explaining the world builder, primitive geometry, collision map, skeleton hierarchy, saved tuning, GLB import workflow, generated skin weights, GUI controls, animation loop, walk cycle, jump routine, and camera controls.
 - `0.1.6-alpha`: Added a three-room layout, door openings between rooms, an outside enclosure, recycled floating ghost spheres, low-poly tree colliders, and obstacle-aware exploration collision.
@@ -297,7 +326,7 @@ Step-by-step:
 3. The rig moves to home position `X0 Z0` and `yaw 0`.
 4. Idle motion and walk preview turn off.
 5. Player movement/turning is locked, but camera orbit/zoom/height still works.
-6. Walls, ceilings, trees, ghost spheres, and Jupiter hide.
+6. Walls, ceilings, trees, ghost spheres, and the sky moon hide.
 7. Floors remain as faint reference planes.
 8. Combat trigger/hitbox/d20 visuals hide.
 9. Mouse joint point editing turns on.
@@ -361,15 +390,17 @@ If a GLB is facing backward, prefer `Mesh > Transform > rot Y` for the whole-mod
 
 Use `Mesh > start pose` plus `Mesh > apply start pose` before rigging when the source mesh is modeled in A-pose or T-pose. The bind-pose rotation sliders are in radians and are saved/exported with the rest of the rig tuning.
 
-After a preview rig, `Mesh > 2 rig mesh` automatically restores the arm bind rotations to the relaxed gameplay rest. Formula:
+After a preview rig, `Mesh > 2 rig mesh` commits the adjusted rig calibration and then relaxes only the visible arms. Formula:
 
 ```text
-relaxed arm rest    = arm bind rotations captured before A/T start pose
-generated skin bind = mesh modeling pose at skinnedMesh.bind(skeleton)
-live puppet arms    = relaxed arm rest + animation pose deltas
+rig calibration      = joint point offsets + bind/reference rotations
+generated skin bind  = mesh modeling pose at skinnedMesh.bind(skeleton)
+visible arm target   = "down", "lowGuard", "swing", etc.
+visible arm delta    = inverse(bindReference) * visible arm target
+live puppet arms     = rig calibration + visible arm delta
 ```
 
-That keeps a T-posed mesh bindable without leaving the gameplay arms stuck in T-pose. The manual `Mesh > restore gameplay arms` button runs the same arm-only restore if you need it after an experimental binding pass. It also clears active arm commands and stows the sword so an old `up`, `half`, `combat`, or `swing` state does not immediately raise the arms again.
+That keeps a T-posed mesh bindable without leaving the gameplay arms stuck in T-pose and without erasing the joint/control point work you just did. The manual `Mesh > relax visible arms` button runs the same visible-pose-only relax path if you need it after an experimental binding pass. It clears active arm commands and stows the sword so an old `up`, `half`, `combat`, or `swing` state does not immediately raise the arms again.
 
 New mesh workflow:
 
@@ -383,7 +414,7 @@ Use the mouse wheel over the scene to zoom the camera in and out while placing p
 
 - `SOLO_WORKFLOW.md`: safe solo development loop, recovery notes, where systems live, and how to work in small reversible steps.
 - `START_HERE.md`: shortest return-to-project map for the next session.
-- `WORLD_COOKBOOK.md`: copy/paste recipes for boxes, props, trees, colliders, sky objects, Jupiter changes, and room additions.
+- `WORLD_COOKBOOK.md`: copy/paste recipes for boxes, props, trees, colliders, sky objects, sky-moon changes, and room additions.
 - `ENCOUNTERS.md`: guide for placing trigger zones and attaching actions.
 - `NEXT_STEPS.md`: low-guidance next tasks that are useful without needing a full paired coding session.
 - `checkpoint.ps1`: PowerShell helper that copies the whole project to a timestamped Desktop checkpoint.
@@ -417,7 +448,7 @@ Encounter trigger definitions live in:
 encounters.js
 ```
 
-Encounters are non-blocking. They do not stop movement. They can run actions when the avatar enters or exits a circle or rectangle, such as changing audio volume/playback rate, logging a message, or changing Jupiter's tint/scale.
+Encounters are non-blocking. They do not stop movement. They can run actions when the avatar enters or exits a circle or rectangle, such as changing audio volume/playback rate, logging a message, or changing the sky moon's tint/scale.
 
 The title-card overlay remains in `index.html` and is revealed/hidden by the loader logic in `main.js`.
 
@@ -643,7 +674,7 @@ Puppet Shop is the reusable rig layer. It does not move the player, run combat, 
 
 World Debug is also visual only. It draws the invisible collision and encounter shapes so you can place things by sight. Turning it on does not change movement or collision.
 
-Encounters live in `encounters.js`. They are non-blocking trigger zones, either circles or rectangles. When the avatar footprint enters or exits one, `world.js` runs the listed actions, such as changing audio, logging a message, or changing Jupiter's tint/scale.
+Encounters live in `encounters.js`. They are non-blocking trigger zones, either circles or rectangles. When the avatar footprint enters or exits one, `world.js` runs the listed actions, such as changing audio, logging a message, or changing the sky moon's tint/scale.
 
 The safest solo rhythm is:
 
@@ -836,7 +867,7 @@ This build is the solo-builder kit.
 It is meant to make Empyrean easier to work on in small sessions without needing to remember where every system lives.
 
 - Added `SOLO_TWEAKS` near the top of `main.js`.
-- Wired common world, player, camera, ghost sphere, tree, Jupiter, and audio values through `SOLO_TWEAKS`.
+- Wired common world, player, camera, ghost sphere, tree, sky focal object, and audio values through `SOLO_TWEAKS`.
 - Added `SOLO_WORKFLOW.md`.
 - Added `WORLD_COOKBOOK.md`.
 - Added `NEXT_STEPS.md`.
@@ -855,7 +886,7 @@ This build adds collision vision and a first encounter system.
 - Added `encounters.js` as the editable encounter-definition module.
 - Added circle and rectangle encounter support.
 - Added encounter `onEnter` and `onExit` action hooks.
-- Added action support for console logs, background audio changes, Jupiter color changes, and Jupiter scale changes.
+- Added action support for console logs, background audio changes, sky-object color changes, and sky-object scale changes.
 - Added `ENCOUNTERS.md`.
 - Kept the loading overlay in place.
 
@@ -1016,7 +1047,7 @@ This build adds Pass 2 of G53-style machine-home rigging mode.
 - Tagged room floors, room walls, room ceilings, outside enclosure parts, and low-poly trees in `world.js` with `userData.g53VisibilityRole`.
 - Added a G53 visibility fixture in `main.js`.
 - Entering G53 mode now makes walls and ceilings opacity `0`.
-- Entering G53 mode hides trees, ghost spheres, and Jupiter.
+- Entering G53 mode hides trees, ghost spheres, and the sky focal object.
 - Floors remain visible at low opacity as setup reference planes.
 - Exiting G53 mode restores original object visibility, material opacity, transparency, and depth-write settings.
 - The restore logic records shared materials only once so room floors/walls return to their true original opacity.
@@ -1185,9 +1216,9 @@ This build makes the outside and sky match the darker room mood.
 - Replaced the visible primitive outside trees with alternating `assets/tree.glb` and `assets/deadTree.glb` props.
 - Kept the existing circular tree colliders so movement behavior does not change.
 - Normalized both tree GLBs to predictable world heights before cloning them into the old tree positions.
-- Replaced the old procedural Jupiter sphere with `assets/moon.glb`.
-- Set the moon to about half the old Jupiter visual diameter and 15% lower on the Y axis.
-- Kept the old internal `jupiter` scene-reference name so existing G53 and encounter plumbing still works.
+- Replaced the old procedural planet sphere with `assets/moon.glb`.
+- Set the moon to about half the old planet visual diameter and 15% lower on the Y axis.
+- At that point the sky object still used the older internal planet handle; `0.1.54-alpha` later moved the moon fully into `world.js` with the active `skyMoon` handle.
 
 ## V0.1.42 Alpha Dev Build
 
@@ -1234,3 +1265,69 @@ This build fixes the lower-leg orientation regression after rigging.
 - Preserved the hidden neutral-zero corrections for `body`, `leftKnee`, and `rightKnee`.
 - Fixed the lower legs/feet reverting toward the old first orientation after exiting G53 or after the title card fades.
 - Kept the GUI bind-rotation sliders readable: knee/body Y can still show `0` while the base fixture correction remains active.
+
+## V0.1.46 Alpha Dev Build
+
+This build makes the combat d20 feel like an enemy-worthy artifact.
+
+- Replaced the flat rolling number label with a true twenty-face d20 object.
+- Added one Caesar Dressing number texture to every physical face.
+- Reused the room stone diffuse/displacement textures for a dark, ancient, rough-hewn material.
+- Subdivided and gently rounded the d20 faces so the vertices read worn instead of razor sharp.
+- Moved the d20 to a prominent position in front of the player during the roll, independent of enemy placement.
+- Slowed the roll into a heavier, mournful settle.
+- Solved the final die orientation with quaternions so the random result controls which numbered face points toward the player.
+
+## V0.1.47 Alpha Dev Build
+
+This build fixes the post-rig arm restore regression.
+
+- Added a mesh-rig completion callback from `skin.js` back into `main.js`.
+- Moved the relaxed-arm restore to the actual moment a mesh finishes binding.
+- Covered synchronous preview rigging, async quick rigging, and re-rigging with the same cleanup path.
+- Kept custom manual arm bind rotations safe by restoring automatically only when an A/T start-pose snapshot exists.
+- Let the guided G53 `2 rig mesh` workflow exit after the bind completion instead of guessing whether the loader was sync or async.
+
+## V0.1.48 Alpha Dev Build
+
+This build separates the rigging reference pose from the visible player pose.
+
+- Kept T/A pose as a valid rigging/reference pose for imported meshes.
+- Added `armBindPoseLooksLikeRiggingReference()` so lifted T/A shoulders are recognized as a rigging pose, not a normal gameplay rest.
+- Added `applyRelaxedIdlePose()` to snap the visible player arms to the normal relaxed down pose after rigging.
+- Updated mesh-rig completion so G53 exits first, then relaxed gameplay arms are restored.
+- Updated G53 exit so canceling out of a T/A rigging pose does not leave the player visibly stuck in that pose.
+- Left low guard, sword draw, walk, and run pose math in the existing arm pose library.
+
+## V0.1.49 Alpha Dev Build
+
+This build audits and hardens the relaxed-arm data layer.
+
+- Confirmed the visible `"down"` gameplay pose is hardcoded in `getControlledArmPoseTargets()`.
+- Confirmed the mutable arm bind table lives in `rigTuning.bindRotationOffsets`.
+- Added `makeRelaxedArmBindRotationOffsets()` as the canonical relaxed arm bind data source.
+- Added `armRotationTableLooksLikeRiggingReference()` to detect polluted T/A shoulder data inside a saved backup table.
+- Updated `captureRuntimeArmBindRotations()` so it refuses to save T/A shoulder rotations as the relaxed backup.
+- Updated `restoreRuntimeArmBindRotations()` so a polluted backup is ignored and relaxed arm bind rotations are reconstructed from canonical zeros.
+
+## V0.1.50 Alpha Dev Build
+
+This build fixes the visible startup arm pose layer.
+
+- Updated `settleStartupPoseBehindTitleCard()` so startup applies `applyRelaxedIdlePose()` after the bind/root settle pass.
+- Changed the startup formula from `bindPose + root` to `bindPose + relaxedArmDelta + root`.
+- Confirmed the visible relaxed arm pose comes from `getControlledArmPoseTargets(..., "down", ...)`.
+- Removed the animation bypass caused by `labEnabled` / `skeletonVisible`; those settings now hide debug guides without stopping the player pose solver.
+- Kept the debug bone refresh conditional so hidden lab guides stay cheap.
+
+## V0.1.51 Alpha Dev Build
+
+This build separates rig calibration from visible gameplay pose ownership.
+
+- Added `commitRigCalibration()` as the G53 exit checkpoint for current joint/control point offsets and bind/reference rotations.
+- Added `applyRelaxedVisiblePose()` as the visible-pose-only arm relax path.
+- Updated G53 exit so it commits calibration first, leaves tuned rig points intact, then applies relaxed/down arm rotations.
+- Updated mesh-rig completion so T/A bind-reference rotations are preserved instead of being automatically zeroed as a fake "rest pose."
+- Added `getVisibleArmPoseDelta()` so visible arm poses compensate for T/A reference arms using `returnedDelta = inverse(bindReference) * visibleTarget`.
+- Changed the Mesh workflow button from `restore gameplay arms` to `relax visible arms` so it no longer implies a calibration reset.
+- Updated rig package loading to apply a relaxed visible arm pose after the saved calibration is loaded.

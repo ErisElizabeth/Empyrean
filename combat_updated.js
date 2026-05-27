@@ -7,7 +7,7 @@
   This file wires together three separate prototypes you built on the Desktop:
 
     1. /Empyrean         — the explorable world + walking rig
-    2. /empyrean_dice    — the d20 roll mechanic (animated icosahedron, nat 1/nat 20 banners)
+    2. /empyrean_dice    — the d20 roll mechanic (now a physical numbered stone die)
     3. /enemyAI          — the "evaluate then act" enemy decision pattern
 
   It is intentionally self-contained.
@@ -17,9 +17,9 @@
       combat controls in main.js.
     - main.js calls init once, update each frame, and the sword-hit doorway only
       when Enter starts a swing.
-    - All combat visuals (trigger cylinder, enemy mesh, health bar, d20, banner)
-      are created here and hidden/reset here so the rest of the project is not
-      polluted.
+    - Combat owns the encounter visuals (trigger cylinder, enemy mesh, health
+      bar, banner) and delegates the physical d20/oracle object to oracleD20.js.
+      That keeps the die reusable without letting it decide enemy or audio logic.
 
   ENCOUNTER FLOW (the state machine in this file)
   -----------------------------------------------
@@ -29,10 +29,10 @@
        starting   <-- audio crossfade BG -> battle, enemy fades in (0 -> 1 opacity)
          |  audio + enemy reach target opacity
          v
-       rolling    <-- d20 spins, label cycles random numbers, lands on final value,
-         |          nat 1 / nat 20 banner shown if applicable, enemy "evasion" tier
-         |          printed (this is the /enemyAI evaluate-then-act idea reduced to
-         |          a tiered lookup; we did not need a chess search for one die).
+       rolling    <-- d20 manifests in front of the player, tumbles slowly, and
+         |          settles with the rolled numbered face aimed back toward the
+         |          camera/player; nat 1 / nat 20 banner shown if applicable,
+         |          enemy "evasion" tier printed.
          v
        active     <-- d20 is gone, enemy + hitbox + health bar visible;
          |          Enter calls attemptCombatSwordHit(), which checks range/arc
@@ -72,6 +72,7 @@
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { createOracleD20 } from "./oracleD20.js";
 
 // ===============================================================
 // CONFIG (tweak these freely — they are the only "knobs" you need)
@@ -79,7 +80,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 /*
   Keeping every number you might want to tune in one place near the top of the
   file means you do not have to read the encounter logic to move the trigger or
-  slow down the dice roll. This matches the SOLO_TWEAKS pattern in main.js.
+  adjust encounter timing. The d20/oracle has its own config in oracleD20.js.
 */
 const COMBAT_CONFIG = {
   // Where the trigger cylinder lives in the world (X, Z).
@@ -162,30 +163,6 @@ const COMBAT_CONFIG = {
     hideSeconds: 1.15,
   },
 
-  // Audio crossfade durations in seconds.
-  // The longer values give a more cinematic shift; the shorter ones snap.
-  audio: {
-    battlePath: "assets/battle.mp3",
-    fadeInSeconds: 1.4,
-    fadeOutSeconds: 1.4,
-    battleTargetVolume: 0.8,
-    bgTargetVolume: 1.0,
-  },
-
-  // d20 roll visual timings.
-  // rollSeconds: how long the dice "tumbles" before showing the final number.
-  // postRollSeconds: how long we hold the number on screen before continuing.
-  dice: {
-    rollSeconds: 2.2,
-    postRollSeconds: 1.4,
-    // Vertical offset above the enemy where the d20 floats.
-    floatHeight: 2.4,
-    // Visual size of the d20 in world units (icosahedron radius).
-    size: 0.38,
-    color: 0xf7f0df,
-    edgeColor: 0x061013,
-  },
-
   // Fade durations for enemy + hitbox visuals.
   enemyFade: {
     inSeconds: 1.0,
@@ -210,8 +187,7 @@ const combat = {
   scene: null,
   controlState: null,
   rigTuning: null,
-  bgAudio: null, // existing background audio Element from main.js
-  battleAudio: null, // new audio Element created here
+  audioManager: null,
 
   // Three.js objects (kept so we can show/hide and dispose).
   triggerCylinder: null,
@@ -222,12 +198,7 @@ const combat = {
   enemyHealthFill: null,
   enemyHp: 0,
   enemyMaxHp: 0,
-  d20Group: null,
-  d20Mesh: null,
-  d20Label: null,
-  d20LabelTexture: null,
-  d20LabelCanvas: null,
-  d20LabelContext: null,
+  oracleD20: null,
 
   // DOM banner (created lazily; reused).
   banner: null,
@@ -239,9 +210,6 @@ const combat = {
   // State machine.
   phase: "idle", // see file header for the legal phases
   phaseElapsed: 0, // seconds since this phase began (driven by delta)
-  rollValue: 0, // the final d20 number we land on this encounter
-  rollDisplayValue: 1, // the number currently shown on the d20 label
-  rollNextTick: 0, // accumulator so the cycling label isn't every frame
 
   // The enemy "evasion" tier (requirement #10). We pre-compute it once the roll
   // lands so the rest of the file can read it as a label.
@@ -261,21 +229,14 @@ export function initCombatEncounter(opts) {
     means we don't pay for a fetch if the rig never walks into the trigger.
 
     Why pass refs by parameter instead of imports?
-      main.js owns the scene, the rig, the background audio.  Passing them in
-      makes this file easy to unit-test and easy to lift into another project.
+      main.js owns the scene and rig. audioManager.js owns music/fades. Passing
+      those refs in keeps this file easy to unit-test and easy to lift into
+      another project.
   */
   combat.scene = opts.scene;
   combat.controlState = opts.controlState;
   combat.rigTuning = opts.rigTuning;
-  combat.bgAudio = opts.backgroundAudio;
-
-  // Build the battle audio element.  It's a separate Audio() rather than swapping
-  // src on bgAudio so we can crossfade smoothly — both elements play during the
-  // overlap window, each with its own volume.
-  combat.battleAudio = new Audio(COMBAT_CONFIG.audio.battlePath);
-  combat.battleAudio.loop = true; // requirement #6: loops until ended
-  combat.battleAudio.volume = 0; // starts silent; the fade ramps it up
-  combat.battleAudio.preload = "auto";
+  combat.audioManager = opts.audioManager;
 
   // Build the trigger cylinder (requirement #3).
   combat.triggerCylinder = buildTriggerCylinder();
@@ -305,11 +266,15 @@ export function initCombatEncounter(opts) {
   combat.enemyHealthBar.visible = false;
   combat.enemyGroup.add(combat.enemyHealthBar);
 
-  // Build the floating d20 mesh.  It is parented to its own group so we can move
-  // and scale it without disturbing the icosahedron's own rotation.
-  combat.d20Group = buildD20Group();
-  combat.d20Group.visible = false;
-  combat.scene.add(combat.d20Group);
+  // Build the floating oracle d20. The new oracleD20.js module owns the die
+  // mesh, face/value map, roll quaternions, roll value, and rolling update.
+  // Combat only adds its public group to the scene and consumes the result.
+  combat.oracleD20 = createOracleD20({
+    controlState: combat.controlState,
+    rigTuning: combat.rigTuning,
+  });
+  combat.oracleD20.hide();
+  combat.scene.add(combat.oracleD20.group);
 
   // Banner: lazily created the first time we need to show a nat 1 / nat 20.
   // No DOM cost until then.
@@ -397,7 +362,7 @@ export function setCombatRiggingVisibilitySuppressed(suppressed = false) {
         enemyGroup: combat.enemyGroup?.visible ?? false,
         enemyHitbox: combat.enemyHitbox?.visible ?? false,
         enemyHealthBar: combat.enemyHealthBar?.visible ?? false,
-        d20Group: combat.d20Group?.visible ?? false,
+        oracleD20: combat.oracleD20?.group?.visible ?? false,
       };
     }
 
@@ -430,8 +395,8 @@ export function setCombatRiggingVisibilitySuppressed(suppressed = false) {
   if (combat.enemyHealthBar) {
     combat.enemyHealthBar.visible = snapshot.enemyHealthBar;
   }
-  if (combat.d20Group) {
-    combat.d20Group.visible = snapshot.d20Group;
+  if (combat.oracleD20) {
+    combat.oracleD20.group.visible = snapshot.oracleD20;
   }
 }
 
@@ -453,8 +418,8 @@ function applyCombatRiggingVisibilitySuppression() {
   if (combat.enemyHealthBar) {
     combat.enemyHealthBar.visible = false;
   }
-  if (combat.d20Group) {
-    combat.d20Group.visible = false;
+  if (combat.oracleD20) {
+    combat.oracleD20.hide();
   }
 }
 
@@ -626,17 +591,14 @@ function enterPhase_starting(rigX, rigZ) {
   combat.enemyHitbox.visible = true;
   combat.enemyHealthBar.visible = true;
 
-  // 3) Start the battle audio.  Browsers may have blocked autoplay until the
+  // 3) Start the battle audio fade.  Browsers may have blocked autoplay until the
   //    user pressed a key/clicked — but they just walked into the trigger using
   //    the keyboard, which counts as user interaction, so play() should succeed.
-  combat.battleAudio.currentTime = 0;
-  combat.battleAudio.volume = 0;
-  combat.battleAudio.play().catch((error) => {
-    console.info("[combat] battle audio waiting for user interaction.", error);
-  });
+  //    The audio manager owns the actual Audio element and play() handling.
+  combat.audioManager?.startCombatMusic();
 
   // 4) d20 stays hidden through this phase.
-  combat.d20Group.visible = false;
+  combat.oracleD20.hide();
 
   console.info("[combat] encounter started.");
 }
@@ -652,14 +614,11 @@ function tickStarting(delta) {
     All three finish at the same moment because they share `progress`.  This is
     the same "single clock" idea used by the dice prototype's rollState.
   */
-  const fade = Math.max(COMBAT_CONFIG.audio.fadeInSeconds, 0.01);
-  const progress = Math.min(combat.phaseElapsed / fade, 1);
+  const progress =
+    combat.audioManager?.updateCombatMusicFadeIn(delta) ??
+    Math.min(combat.phaseElapsed, 1);
 
   setEnemyOpacity(progress);
-  combat.battleAudio.volume = COMBAT_CONFIG.audio.battleTargetVolume * progress;
-  if (combat.bgAudio) {
-    combat.bgAudio.volume = COMBAT_CONFIG.audio.bgTargetVolume * (1 - progress);
-  }
 
   if (progress >= 1) {
     enterPhase_rolling();
@@ -670,94 +629,39 @@ function tickStarting(delta) {
 // PHASE: rolling
 // ===============================================================
 /*
-  Recreates the heart of the empyrean_dice prototype:
+  The roll value is still a plain d20:
 
-    - pick a random integer 1..20 (the same rollDie() formula they use)
-    - spin a small icosahedron above the enemy
-    - cycle the displayed number while the dice tumbles (so the player sees
-      anticipation, not a static face)
-    - settle to the final number and show a nat 1 / nat 20 banner if relevant
-    - compute the enemy's evasion tier from the value (the /enemyAI idea)
+    rollValue = floor(random() * 20) + 1
 
-  We did not need to port the full dice file — the value selection is one line,
-  and the visual feel is preserved with a spinning mesh + a canvas-texture label.
+  The difference is visual authority. Instead of drawing a changing number onto
+  a billboard, the value selects a real face on the physical d20. The animation
+  then tumbles toward the quaternion that points that face back at the player.
 */
 function enterPhase_rolling() {
   combat.phase = "rolling";
   combat.phaseElapsed = 0;
-  combat.rollNextTick = 0;
 
-  // The actual roll value is decided up-front, exactly like empyrean_dice does.
-  // We then animate _toward_ it — the cycling numbers during tumble are pure
-  // anticipation and have no gameplay effect.
-  combat.rollValue = Math.floor(Math.random() * 20) + 1;
-  combat.rollDisplayValue = 1;
+  const roll = combat.oracleD20.startRoll();
 
   // Map the roll to the "enemy evasion" tiers from requirement #10.
   // This is the /enemyAI evaluate-then-act pattern collapsed to its simplest
   // possible form: one input (the roll), one output (a tier label).
-  combat.evasionTier = computeEvasionTier(combat.rollValue);
-
-  // Position the d20 above the enemy, then make it visible.
-  combat.d20Group.position.copy(combat.enemyGroup.position);
-  combat.d20Group.position.y += COMBAT_CONFIG.dice.floatHeight;
-  combat.d20Group.visible = true;
-
-  // Reset the dice mesh rotation so each roll starts from a known pose.
-  combat.d20Mesh.rotation.set(0, 0, 0);
-
-  // Render "?" on the label until the random scrolling begins.
-  drawD20Label("?");
+  combat.evasionTier = computeEvasionTier(roll.rollValue);
 
   console.info(
-    `[combat] d20 rolled ${combat.rollValue} -> enemy evasion ${combat.evasionTier}`,
+    `[combat] d20 rolled ${roll.rollValue} -> enemy evasion ${combat.evasionTier}`,
   );
 }
 
 function tickRolling(delta) {
-  /*
-    Two clocks here:
+  const roll = combat.oracleD20.update(delta);
 
-      progress         — 0..1 across the roll duration. Drives spin speed +
-                         when we settle on the final number.
-
-      rollNextTick     — small accumulator (≈80 ms cadence). Drives the
-                         "cycling" number on the label so the player sees motion
-                         instead of a frozen face.
-  */
-  const total =
-    COMBAT_CONFIG.dice.rollSeconds + COMBAT_CONFIG.dice.postRollSeconds;
-  const rollProgress = Math.min(
-    combat.phaseElapsed / COMBAT_CONFIG.dice.rollSeconds,
-    1,
-  );
-
-  // Spin the icosahedron.  Spin slows down as rollProgress -> 1 so it looks like
-  // it loses momentum.  (1 - x)^2 is a cheap deceleration curve.
-  const spinFactor = (1 - rollProgress) * (1 - rollProgress);
-  const baseSpeed = 12.0;
-  combat.d20Mesh.rotation.x += delta * baseSpeed * (0.6 + spinFactor);
-  combat.d20Mesh.rotation.y += delta * baseSpeed * (0.8 + spinFactor);
-  combat.d20Mesh.rotation.z += delta * baseSpeed * (0.5 + spinFactor);
-
-  if (rollProgress < 0.78) {
-    // Cycle a random preview face every ~80 ms while tumbling.
-    combat.rollNextTick += delta;
-    if (combat.rollNextTick >= 0.08) {
-      combat.rollNextTick = 0;
-      combat.rollDisplayValue = Math.floor(Math.random() * 20) + 1;
-      drawD20Label(String(combat.rollDisplayValue));
-    }
-  } else if (combat.rollDisplayValue !== combat.rollValue) {
-    // Roll has finished tumbling: snap the label to the real value.
-    combat.rollDisplayValue = combat.rollValue;
-    drawD20Label(String(combat.rollValue));
-
+  if (roll.settledThisFrame) {
     // Show nat 1 / nat 20 banner (requirement #9).  These are the only
     // gameplay-visible messages from the dice itself.
-    if (combat.rollValue === 20) {
+    if (roll.rollValue === 20) {
       showBanner("CRIT!", "#43d7c4");
-    } else if (combat.rollValue === 1) {
+    } else if (roll.rollValue === 1) {
       showBanner("CRIT FAIL!", "#ff6b6b");
     } else {
       // For non-crits show the evasion tier instead so the player understands
@@ -767,7 +671,7 @@ function tickRolling(delta) {
     }
   }
 
-  if (combat.phaseElapsed >= total) {
+  if (roll.complete) {
     enterPhase_active();
   }
 }
@@ -800,7 +704,7 @@ function computeEvasionTier(rollValue) {
 function enterPhase_active() {
   combat.phase = "active";
   combat.phaseElapsed = 0;
-  combat.d20Group.visible = false;
+  combat.oracleD20.hide();
   combat.enemyGroup.visible = true;
   combat.enemyHitbox.visible = true;
   combat.enemyHealthBar.visible = true;
@@ -1084,33 +988,27 @@ function lerpAngle(current, target, t) {
 function enterPhase_ending() {
   combat.phase = "ending";
   combat.phaseElapsed = 0;
+  combat.audioManager?.stopCombatMusic();
   console.info("[combat] ending encounter.");
 }
 
 function tickEnding(delta) {
-  const fade = Math.max(COMBAT_CONFIG.audio.fadeOutSeconds, 0.01);
-  const progress = Math.min(combat.phaseElapsed / fade, 1);
+  const progress =
+    combat.audioManager?.updateCombatMusicFadeOut(delta) ??
+    Math.min(combat.phaseElapsed, 1);
   const inverse = 1 - progress;
 
   setEnemyOpacity(inverse);
-  combat.battleAudio.volume = COMBAT_CONFIG.audio.battleTargetVolume * inverse;
-  if (combat.bgAudio) {
-    combat.bgAudio.volume = COMBAT_CONFIG.audio.bgTargetVolume * progress;
-  }
 
   if (progress >= 1) {
     // Final cleanup: hide everything combat-specific and put the trigger back.
     // We do NOT dispose the GLB or geometries — keeping them in memory means the
     // next encounter starts instantly.  If you want truly aggressive cleanup you
     // could call disposeObjectTree() on the enemy group here.
-    combat.battleAudio.pause();
-    combat.battleAudio.currentTime = 0;
-    combat.battleAudio.volume = 0;
-
     combat.enemyGroup.visible = false;
     combat.enemyHitbox.visible = false;
     combat.enemyHealthBar.visible = false;
-    combat.d20Group.visible = false;
+    combat.oracleD20.hide();
 
     // Restore trigger cylinder so the encounter can fire again (requirement #14).
     combat.triggerCylinder.visible = true;
@@ -1266,107 +1164,6 @@ function updateHealthBar() {
   }
 }
 
-function buildD20Group() {
-  /*
-    Two children:
-      1. an Icosahedron (D20 is 20 triangular faces, which IcosahedronGeometry
-         models exactly)
-      2. a plane sprite with a CanvasTexture that we redraw with the current
-         "rolling" number — same trick the empyrean_dice prototype uses.
-
-    The group lets us float the whole pair as one object.
-  */
-  const group = new THREE.Group();
-  group.name = "combat-d20";
-
-  // Dice mesh
-  const dieGeom = new THREE.IcosahedronGeometry(COMBAT_CONFIG.dice.size, 0);
-  const dieMat = new THREE.MeshStandardMaterial({
-    color: COMBAT_CONFIG.dice.color,
-    roughness: 0.42,
-    metalness: 0.08,
-  });
-  const dieMesh = new THREE.Mesh(dieGeom, dieMat);
-
-  // Edges so the icosahedron reads clearly even without bright lighting.
-  const edges = new THREE.LineSegments(
-    new THREE.EdgesGeometry(dieGeom, 15),
-    new THREE.LineBasicMaterial({
-      color: COMBAT_CONFIG.dice.edgeColor,
-      transparent: true,
-      opacity: 0.35,
-    }),
-  );
-  dieMesh.add(edges);
-
-  // Label canvas (drawn into by drawD20Label()).
-  const labelCanvas = document.createElement("canvas");
-  labelCanvas.width = 256;
-  labelCanvas.height = 256;
-  const ctx = labelCanvas.getContext("2d");
-  const labelTexture = new THREE.CanvasTexture(labelCanvas);
-  labelTexture.colorSpace = THREE.SRGBColorSpace;
-
-  const labelMat = new THREE.MeshBasicMaterial({
-    map: labelTexture,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-  });
-  const labelPlane = new THREE.Mesh(
-    new THREE.PlaneGeometry(
-      COMBAT_CONFIG.dice.size * 1.6,
-      COMBAT_CONFIG.dice.size * 1.6,
-    ),
-    labelMat,
-  );
-  // Push the label slightly in front of the icosahedron so it always reads on top.
-  labelPlane.position.set(0, 0, COMBAT_CONFIG.dice.size * 1.05);
-  labelPlane.renderOrder = 6;
-
-  group.add(dieMesh);
-  group.add(labelPlane);
-
-  // Stash refs so we can rotate/redraw later.
-  combat.d20Mesh = dieMesh;
-  combat.d20Label = labelPlane;
-  combat.d20LabelCanvas = labelCanvas;
-  combat.d20LabelContext = ctx;
-  combat.d20LabelTexture = labelTexture;
-
-  drawD20Label("?");
-  return group;
-}
-
-function drawD20Label(text) {
-  /*
-    Redraws the 256x256 label canvas with the supplied text.  Updating
-    texture.needsUpdate is critical — without it, Three.js will keep showing
-    the previous canvas frame.
-  */
-  const ctx = combat.d20LabelContext;
-  const canvas = combat.d20LabelCanvas;
-
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.save();
-  ctx.translate(canvas.width / 2, canvas.height / 2);
-
-  // Soft rounded background tile so the number reads against the spinning mesh.
-  ctx.fillStyle = "rgba(247, 240, 223, 0.85)";
-  ctx.beginPath();
-  ctx.roundRect(-92, -68, 184, 136, 30);
-  ctx.fill();
-
-  ctx.fillStyle = "#061013";
-  ctx.font = "1000 132px Inter, Arial, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, 0, 6);
-
-  ctx.restore();
-  combat.d20LabelTexture.needsUpdate = true;
-}
-
 // ===============================================================
 // ENEMY GLB LOADER
 // ===============================================================
@@ -1478,13 +1275,18 @@ function getCurrentEnemyOpacity() {
     next fade frame. This avoids the "loaded invisible forever" edge case.
   */
   if (combat.phase === "starting") {
-    const fade = Math.max(COMBAT_CONFIG.audio.fadeInSeconds, 0.01);
-    return Math.min(combat.phaseElapsed / fade, 1);
+    return (
+      combat.audioManager?.getCombatFadeInProgress?.() ??
+      Math.min(combat.phaseElapsed, 1)
+    );
   }
 
   if (combat.phase === "ending") {
-    const fade = Math.max(COMBAT_CONFIG.audio.fadeOutSeconds, 0.01);
-    return 1 - Math.min(combat.phaseElapsed / fade, 1);
+    return (
+      1 -
+      (combat.audioManager?.getCombatFadeOutProgress?.() ??
+        Math.min(combat.phaseElapsed, 1))
+    );
   }
 
   if (combat.phase === "rolling" || combat.phase === "active") {

@@ -40,20 +40,20 @@
     4. Place the shape.
     5. Set enabled: true.
     6. Turn on World Debug > encounter zones in the GUI.
-    7. Walk into it and watch the console/audio/Jupiter changes.
+    7. Walk into it and watch the console/audio/sky-moon changes.
 */
 
 export const ENCOUNTER_DEFINITIONS = [
   {
     /*
       Example 1:
-        A soft Jupiter-themed audio zone outside.
+        A soft moon-themed audio zone outside.
 
       Why circle:
         Planet/moon/sky-focus zones usually feel natural as circles.
     */
-    id: "jupiter-audio-field",
-    label: "Jupiter audio field",
+    id: "sky-moon-audio-field",
+    label: "Sky moon audio field",
     enabled: true,
     debugColor: "#f0c36a",
     shape: {
@@ -64,7 +64,7 @@ export const ENCOUNTER_DEFINITIONS = [
     onEnter: [
       {
         type: "log",
-        message: "Entered Jupiter audio field.",
+        message: "Entered sky moon audio field.",
       },
       {
         /*
@@ -82,15 +82,15 @@ export const ENCOUNTER_DEFINITIONS = [
         play: true,
       },
       {
-        // "jupiterColor" changes the material tint on the Jupiter sphere.
-        type: "jupiterColor",
+        // "skyMoonColor" changes the material tint on the moon/sky focal object.
+        type: "skyMoonColor",
         color: "#f7d894",
       },
     ],
     onExit: [
       {
         type: "log",
-        message: "Exited Jupiter audio field.",
+        message: "Exited sky moon audio field.",
       },
       {
         type: "audio",
@@ -98,7 +98,7 @@ export const ENCOUNTER_DEFINITIONS = [
         playbackRate: 1,
       },
       {
-        type: "jupiterColor",
+        type: "skyMoonColor",
         color: "#7a7979",
       },
     ],

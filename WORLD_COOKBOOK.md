@@ -2,7 +2,7 @@
 
 Copy/paste recipes for adding simple world objects.
 
-These recipes assume you are editing `main.js`.
+These recipes assume you are editing `world.js`.
 
 Important rule:
 
@@ -15,7 +15,7 @@ Do not add collision until you can see the object in the scene.
 Good places:
 
 - Inside `buildExplorationWorld()` if the object is part of the explorable world.
-- Near the Jupiter section if the object is a sky object.
+- Near the sky-moon section if the object is a sky object.
 - In a new helper function if the object has several pieces.
 
 For repeated objects, use a helper function.
@@ -233,7 +233,7 @@ Then walk into the zone to test it.
 
 ## Add A Planet Or Moon
 
-Copy the Jupiter pattern.
+Copy the sky-object pattern.
 
 ```js
 const planetTexture = textureLoader.load("assets/MyPlanet.jpg");
@@ -252,9 +252,9 @@ scene.add(planet);
 
 Use `MeshBasicMaterial` for sky objects when you want them visible without caring about lights.
 
-## Move Jupiter
+## Move The Moon
 
-Open `main.js`, find `SOLO_TWEAKS.jupiter`, and edit:
+Open `world.js`, find `WORLD_TWEAKS.skyMoon`, and edit:
 
 ```js
 position: [0, 15, -20],

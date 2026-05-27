@@ -36,7 +36,9 @@ $RequiredFiles = @(
   "puppetShop.js",
   "world.js",
   "skin.js",
+  "audioManager.js",
   "combatPhysics.js",
+  "oracleD20.js",
   "combat_updated.js",
   "encounters.js",
   "styles.css",
@@ -64,7 +66,9 @@ node --check rig.js
 node --check puppetShop.js
 node --check world.js
 node --check skin.js
+node --check audioManager.js
 node --check combatPhysics.js
+node --check oracleD20.js
 node --check combat_updated.js
 node --check encounters.js
 Write-Host "  OK JavaScript syntax"

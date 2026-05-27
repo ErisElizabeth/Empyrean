@@ -104,8 +104,8 @@ Good solo edits there:
 - change wall colors
 - change floor color
 - change ghost sphere count
-- move Jupiter
-- resize Jupiter
+- move the sky moon
+- resize the sky moon
 - change camera starting distance
 - change movement speed
 - change the tree collider radius
@@ -129,7 +129,7 @@ Those areas are commented, but they are more connected. A tiny change there can 
 Empyrean currently has four layers:
 
 1. World geometry
-   - Rooms, outside enclosure, trees, Jupiter, ghost spheres.
+   - Rooms, outside enclosure, trees, sky moon, ghost spheres.
 
 2. Collision map
    - Invisible top-down rectangles and circles that block the rig.
@@ -190,7 +190,7 @@ Use this when you want an area to do something as the avatar enters or leaves.
 6. Turn on `World Debug > world debug`.
 7. Turn on `World Debug > encounter zones`.
 8. Walk into the zone and confirm it highlights.
-9. Add audio or Jupiter actions only after the shape feels right.
+9. Add audio or sky-moon actions only after the shape feels right.
 
 Encounters are triggers, not walls. If you want the avatar blocked, add a real collider in `main.js`.
 
@@ -259,7 +259,7 @@ Use one session for one goal:
 
 - "Tonight I am placing trees."
 - "Tonight I am tuning the walk."
-- "Tonight I am moving Jupiter and sky objects."
+- "Tonight I am moving the sky moon and sky objects."
 - "Tonight I am fitting the mesh shoulders."
 
 That keeps your checkpoints meaningful.
