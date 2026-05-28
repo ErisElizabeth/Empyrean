@@ -40,6 +40,7 @@ $RequiredFiles = @(
   "combatPhysics.js",
   "oracleD20.js",
   "combat_updated.js",
+  "enemy.js",
   "encounters.js",
   "styles.css",
   "README.md",
@@ -70,6 +71,7 @@ node --check audioManager.js
 node --check combatPhysics.js
 node --check oracleD20.js
 node --check combat_updated.js
+node --check enemy.js
 node --check encounters.js
 Write-Host "  OK JavaScript syntax"
 

@@ -43,6 +43,13 @@ export function initSkin({
     updateGuiDisplays,
     onAfterImportedMeshRigged,
   };
+
+  // Diagnostic-only: exposes a console function for inspecting skin weight
+  // assignment. Read-only; safe to remove later by deleting this assignment
+  // and the dumpSkinDiagnostic function at the bottom of this module.
+  if (typeof window !== "undefined") {
+    window.empyreanDumpSkin = dumpSkinDiagnostic;
+  }
 }
 
 // =============================================================
@@ -709,11 +716,23 @@ function chooseSkinInfluences(vertex, bindPositions) {
 
     Intentionally approximate — generated rigging, not hand-painted.
 
-    Decision tree:
-      - vertex at/above neck        -> head and neck
+    Decision tree (order matters):
       - vertex outside torso at arm height -> shoulder/elbow/wrist/palm
+      - vertex at/above neck               -> head and neck
       - vertex below pelvis, off-center    -> hip/knee/ankle/foot
-      - everything else             -> pelvis/spine/chest/neck
+      - everything else                    -> pelvis/spine/chest/neck
+
+    Why the arm branch runs first:
+      G53 drag-to-match-mesh can lift the shoulder joint above the neck joint
+      (Sigewynn-style tall-shoulder rigs). When that happens, some elbow mesh
+      vertices end up at y >= neckY. If the head/neck branch is checked first
+      with no X bound, those elbow vertices get bound to head/neck and never
+      follow the arm — the visible result is a stretching band between the
+      shoulder cap (correctly arm-bound) and the wrist (correctly arm-bound).
+      Putting the arm branch first means "clearly far out from centerline at
+      arm height" wins over "above neckY," which is the right call for an
+      anatomical rig. Typical head/hair/ear vertices stay close to centerline
+      so they fail outsideTorso and correctly fall through to head/neck.
 
     Chosen candidates are then weighted by inverse-square distance.
   */
@@ -735,10 +754,6 @@ function chooseSkinInfluences(vertex, bindPositions) {
   const inArmHeight  = vertex.y > wristY - 0.3 && vertex.y < shoulderY + 0.5;
   const inLegHeight  = vertex.y <= pelvisY + 0.16;
 
-  if (vertex.y >= neckY) {
-    return weightedNearestJoints(vertex, ["head", "neck"], bindPositions);
-  }
-
   if (outsideTorso && inArmHeight) {
     const sideName = chooseNearestBindSide(vertex, bindPositions, "Shoulder");
 
@@ -747,6 +762,10 @@ function chooseSkinInfluences(vertex, bindPositions) {
       [`${sideName}Shoulder`, `${sideName}Elbow`, `${sideName}Wrist`, `${sideName}Palm`],
       bindPositions,
     );
+  }
+
+  if (vertex.y >= neckY) {
+    return weightedNearestJoints(vertex, ["head", "neck"], bindPositions);
   }
 
   if (inLegHeight && absX > hipX * 0.35) {
@@ -903,4 +922,190 @@ export function applyImportedMeshPresentation() {
       });
     });
   });
+}
+
+// =============================================================
+// DIAGNOSTIC (console-only, read-only)
+// =============================================================
+
+function dumpSkinDiagnostic() {
+  /*
+    Read-only diagnostic for skin weight assignment debugging.
+
+    Call from the DevTools console as:
+      empyreanDumpSkin()
+
+    Sections printed:
+      1. bindRotationOffsets for arm-chain joints
+         - tells you whether T-preset (shoulder z = +/-1.57) is currently set
+      2. bindPositions (world space) for arm-chain joints
+         - tells you the layout the skin algorithm "sees" at rigging time
+      3. Per-mesh left-arm vertex weight samples bucketed by X position
+         - for each region from torso centerline out to the hand, shows the
+           single mesh vertex closest to that reference X (at shoulder height)
+           and its four skinning influences with weights
+         - a vertex whose dominant bone does NOT match the region label is
+           the smoking gun for "stays in T"
+
+    Does not mutate state. Safe to call anytime.
+  */
+  if (!_ctx) {
+    console.warn("[skin diagnostic] skin module not initialized yet");
+    return;
+  }
+
+  const { state, rigTuning } = _ctx;
+
+  console.group("%c[skin diagnostic]", "color:#7cf;font-weight:bold");
+
+  // ----- 1. bind rotation offsets -----
+  const armKeys = [
+    "leftClavicle", "leftShoulder", "leftElbow", "leftWrist", "leftPalm",
+    "rightClavicle", "rightShoulder", "rightElbow", "rightWrist", "rightPalm",
+  ];
+  const bindRot = armKeys.reduce((acc, key) => {
+    const r = rigTuning?.bindRotationOffsets?.[key];
+    if (r) acc[key] = { x: +r.x.toFixed(3), y: +r.y.toFixed(3), z: +r.z.toFixed(3) };
+    return acc;
+  }, {});
+  console.group("1. bindRotationOffsets (arm chain)");
+  console.table(bindRot);
+  console.log("   T-preset signature: shoulder z ~ +/-1.57 (left=-1.57, right=+1.57)");
+  console.groupEnd();
+
+  if (!state.skeleton) {
+    console.warn("no skeleton present yet");
+    console.groupEnd();
+    return;
+  }
+
+  // ----- 2. live bindPositions -----
+  const bindPositions = getBindPositionsByJointKey();
+  const positionKeys = [...armKeys, "chest", "spineBase", "pelvis", "neck"];
+  const bindPosTable = positionKeys.reduce((acc, key) => {
+    const p = bindPositions[key];
+    if (p) acc[key] = { x: +p.x.toFixed(3), y: +p.y.toFixed(3), z: +p.z.toFixed(3) };
+    return acc;
+  }, {});
+  console.group("2. bindPositions (world space, computed live)");
+  console.table(bindPosTable);
+  console.log(
+    "   At T-pose preset, leftElbow.x should be roughly leftShoulder.x - upperArmLength",
+  );
+  console.groupEnd();
+
+  // ----- 3. vertex weight samples -----
+  if (!state.importedSkin) {
+    console.log("3. no rigged mesh present - run '2 rig mesh' or 'quick rig' first");
+    console.groupEnd();
+    return;
+  }
+
+  const lS = bindPositions.leftShoulder;
+  const lE = bindPositions.leftElbow;
+  const lW = bindPositions.leftWrist;
+  const lP = bindPositions.leftPalm;
+  const shoulderY = lS.y;
+  // Body's neutral facing correction (-PI yaw) can put the named "left" joints
+  // on +X. Detect which sign the left side actually lives on so the side filter
+  // matches the named-side semantics rather than world-axis sign.
+  const leftSign = lS.x >= 0 ? 1 : -1;
+
+  const refs = [
+    { label: "centerline (torso)", x: 0 },
+    { label: "shoulder/torso mid", x: lS.x * 0.5 },
+    { label: "shoulder",           x: lS.x },
+    { label: "shoulder-elbow mid", x: (lS.x + lE.x) / 2 },
+    { label: "elbow",              x: lE.x },
+    { label: "elbow-wrist mid",    x: (lE.x + lW.x) / 2 },
+    { label: "wrist",              x: lW.x },
+    { label: "palm/hand",          x: lP.x },
+  ];
+  console.log(
+    `   left-arm side detected on ${leftSign > 0 ? "+X" : "-X"} (leftShoulder.x = ${lS.x.toFixed(3)})`,
+  );
+
+  state.importedSkin.meshes.forEach((skinnedMesh, meshIndex) => {
+    const geometry = skinnedMesh.geometry;
+    const positions = geometry.attributes.position;
+    const skinIndices = geometry.attributes.skinIndex;
+    const skinWeights = geometry.attributes.skinWeight;
+
+    if (!positions || !skinIndices || !skinWeights) {
+      console.log(`mesh ${meshIndex}: missing position/skin attributes`);
+      return;
+    }
+
+    const bones = skinnedMesh.skeleton.bones;
+    const boneName = (idx) =>
+      (bones[idx]?.name || `?${idx}`).replace(/-generated-bone$/, "");
+
+    const closest = refs.map((r) => ({
+      label: r.label,
+      refX: +r.x.toFixed(2),
+      bestDx: Infinity,
+      best: null,
+      bones: null,
+    }));
+    const vertex = new THREE.Vector3();
+
+    for (let i = 0; i < positions.count; i++) {
+      vertex.fromBufferAttribute(positions, i);
+      // Keep vertices on the left-arm side (or near centerline). leftSign
+      // accounts for the body-yaw flip — left can live on +X or -X.
+      if (vertex.x * leftSign < -0.05) continue;
+      if (Math.abs(vertex.y - shoulderY) > 0.15) continue; // shoulder-height band
+
+      closest.forEach((c) => {
+        const dx = Math.abs(vertex.x - c.refX);
+        if (dx < c.bestDx) {
+          c.bestDx = dx;
+          c.best = {
+            idx: i,
+            x: +vertex.x.toFixed(2),
+            y: +vertex.y.toFixed(2),
+            z: +vertex.z.toFixed(2),
+          };
+          c.bones = [
+            `${boneName(skinIndices.getX(i))}=${skinWeights.getX(i).toFixed(2)}`,
+            `${boneName(skinIndices.getY(i))}=${skinWeights.getY(i).toFixed(2)}`,
+            `${boneName(skinIndices.getZ(i))}=${skinWeights.getZ(i).toFixed(2)}`,
+            `${boneName(skinIndices.getW(i))}=${skinWeights.getW(i).toFixed(2)}`,
+          ];
+        }
+      });
+    }
+
+    const table = closest.reduce((acc, c) => {
+      if (!c.best) {
+        acc[c.label] = { refX: c.refX, vx: "-", vy: "-", vz: "-", bone1: "(no vertex)" };
+      } else {
+        acc[c.label] = {
+          refX: c.refX,
+          vx: c.best.x,
+          vy: c.best.y,
+          vz: c.best.z,
+          bone1: c.bones[0],
+          bone2: c.bones[1],
+          bone3: c.bones[2],
+          bone4: c.bones[3],
+        };
+      }
+      return acc;
+    }, {});
+
+    console.group(
+      `3. mesh ${meshIndex}: left-arm vertex weight samples (y ~ ${shoulderY.toFixed(2)})`,
+    );
+    console.table(table);
+    console.log(
+      "   Read each row: bone1..bone4 are the 4 skin influences with weights summing to ~1.",
+    );
+    console.log(
+      "   Red flag: a vertex in the 'elbow' or 'forearm' band whose dominant bone is chest/spineBase/pelvis/neck.",
+    );
+    console.groupEnd();
+  });
+
+  console.groupEnd();
 }

@@ -42,18 +42,18 @@ Map first. Surgery later.
 
 ### Documentation And Scripts
 
-| File                | Category                | What It Does                                                                                  | Status                                                           |
-| ------------------- | ----------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `README.md`         | Project changelog/guide | Long-running build notes, version history, usage notes. Also preserves older terminology.     | KEEP. Update carefully; also contains old asset references.      |
-| `START_HERE.md`     | Onboarding              | Entry notes for using the project.                                                            | KEEP.                                                            |
-| `SOLO_WORKFLOW.md`  | User workflow           | Practical solo work guide.                                                                    | KEEP.                                                            |
-| `NEXT_STEPS.md`     | Planning                | Current/older task list.                                                                      | KEEP, but review after this map.                                 |
-| `ENCOUNTERS.md`     | Encounter cookbook      | Explains data-driven encounter zones and actions, including sky-moon actions.                 | KEEP.                                                           |
-| `WORLD_COOKBOOK.md` | World editing guide     | Recipes for world objects, colliders, sky objects, room edits.                                | KEEP.                                                           |
-| `JUMP.md`           | Research/reference      | Jump math notes.                                                                              | ARCHIVE/REFERENCE. Runtime now uses `physics.js`.                |
-| `runCycle.md`       | Research/reference      | Run-cycle math notes.                                                                         | ARCHIVE/REFERENCE. Runtime now uses `physics.js` plus `main.js`. |
-| `verify.ps1`        | Verification script     | Checks expected files/assets and likely does source sanity checks.                            | KEEP, but asset list includes old optional assets.               |
-| `checkpoint.ps1`    | Utility                 | Project checkpoint/copy helper.                                                               | KEEP.                                                            |
+| File                | Category                | What It Does                                                                              | Status                                                           |
+| ------------------- | ----------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `README.md`         | Project changelog/guide | Long-running build notes, version history, usage notes. Also preserves older terminology. | KEEP. Update carefully; also contains old asset references.      |
+| `START_HERE.md`     | Onboarding              | Entry notes for using the project.                                                        | KEEP.                                                            |
+| `SOLO_WORKFLOW.md`  | User workflow           | Practical solo work guide.                                                                | KEEP.                                                            |
+| `NEXT_STEPS.md`     | Planning                | Current/older task list.                                                                  | KEEP, but review after this map.                                 |
+| `ENCOUNTERS.md`     | Encounter cookbook      | Explains data-driven encounter zones and actions, including sky-moon actions.             | KEEP.                                                            |
+| `WORLD_COOKBOOK.md` | World editing guide     | Recipes for world objects, colliders, sky objects, room edits.                            | KEEP.                                                            |
+| `JUMP.md`           | Research/reference      | Jump math notes.                                                                          | ARCHIVE/REFERENCE. Runtime now uses `physics.js`.                |
+| `runCycle.md`       | Research/reference      | Run-cycle math notes.                                                                     | ARCHIVE/REFERENCE. Runtime now uses `physics.js` plus `main.js`. |
+| `verify.ps1`        | Verification script     | Checks expected files/assets and likely does source sanity checks.                        | KEEP, but asset list includes old optional assets.               |
+| `checkpoint.ps1`    | Utility                 | Project checkpoint/copy helper.                                                           | KEEP.                                                            |
 
 ### Assets
 
@@ -635,13 +635,13 @@ Do not delete these now. These are candidates for a later cleanup branch after a
 
 ### Do Not Touch Yet
 
-| Item                               | Where                                        | Why                                                                                                                                                       |
-| ---------------------------------- | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `jupiterColor` / `jupiterScale` compatibility aliases | `world.js`, old docs/saved encounters | Old action names still map to the sky moon for backwards compatibility. New data should use `skyMoonColor` / `skyMoonScale`. |
-| `combat_updated.js` filename       | root and `main.js` imports                   | Name exists because of the earlier editor save issue. It is active. Rename only when the project is stable and imports/docs update together.              |
-| `rigTuning` broad package shape    | `main.js`, `puppetShop.js`                   | It mixes dev, gameplay, rig, and UI values, but saved rigs depend on it now. Split schema later.                                                          |
-| `restoreRuntimeArmBindRotations()` | `main.js:2926`                               | No direct call found, but recent rigging history makes this a useful emergency tool. Keep until arm/reference/visible pose path is unquestionably stable. |
-| Old assets checked by `verify.ps1` | `assets/`, `verify.ps1:89-104`               | Removing assets before updating verification will create false failures.                                                                                  |
+| Item                                                  | Where                                 | Why                                                                                                                                                       |
+| ----------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `jupiterColor` / `jupiterScale` compatibility aliases | `world.js`, old docs/saved encounters | Old action names still map to the sky moon for backwards compatibility. New data should use `skyMoonColor` / `skyMoonScale`.                              |
+| `combat_updated.js` filename                          | root and `main.js` imports            | Name exists because of the earlier editor save issue. It is active. Rename only when the project is stable and imports/docs update together.              |
+| `rigTuning` broad package shape                       | `main.js`, `puppetShop.js`            | It mixes dev, gameplay, rig, and UI values, but saved rigs depend on it now. Split schema later.                                                          |
+| `restoreRuntimeArmBindRotations()`                    | `main.js:2926`                        | No direct call found, but recent rigging history makes this a useful emergency tool. Keep until arm/reference/visible pose path is unquestionably stable. |
+| Old assets checked by `verify.ps1`                    | `assets/`, `verify.ps1:89-104`        | Removing assets before updating verification will create false failures.                                                                                  |
 
 ---
 
