@@ -4,7 +4,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.54-alpha`
+- Empyrean build: `0.1.57-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
