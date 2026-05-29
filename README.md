@@ -183,29 +183,32 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 
 ### Where to Make Common Changes
 
-| You want to change... | Go to... |
-|---|---|
-| Movement speed, camera feel, colors | `SOLO_TWEAKS` near the top of `main.js` |
-| Ambient/combat audio paths, fade behavior, one-shots, pause/resume | `audioManager.js` |
-| Sword asset path, scale, grip origin, hand offset, pitch/yaw/roll | `Sword Offsets` in the GUI |
-| Sword default values, swing timing, hit range | `SWORD_TWEAKS` near the top of `main.js` |
-| Arm stances and sword swing rotations | `getControlledArmPoseTargets()` in `main.js` |
-| Combat balance formulas or Low Guard body/leg stance | `combatPhysics.js` |
-| Physical d20 look, roll timing, face numbers, result-facing quaternion math | `oracleD20.js` |
-| Neutral anatomical facing correction | `RIG_BASE_BODY_YAW` near the top of `main.js` |
-| Complete rig package shape or local rig-library behavior | `puppetShop.js` |
-| Room size, wall colors, ghost sphere count | `WORLD_TWEAKS` near the top of `world.js` |
-| Default body proportions | `DEFAULT_RIG_DIMENSIONS` in `rig.js` |
-| Trigger zones (enter/exit events) | `encounters.js` |
-| Enemy combat prototype | `combat_updated.js` |
-| Jump feel (gravity, height, duration) | `rigTuning` values in the GUI, or `getJumpGravityValue` in `physics.js` |
-| Walk cycle timing | `walkPhaseSpeed` in `SOLO_TWEAKS`, walk amplitude sliders in GUI |
-| Run cycle timing/feel | `runSpeed` / `runPhaseSpeed` in `SOLO_TWEAKS`, run sliders in `Motion` |
+| You want to change...                                                       | Go to...                                                                |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Movement speed, camera feel, colors                                         | `SOLO_TWEAKS` near the top of `main.js`                                 |
+| Ambient/combat audio paths, fade behavior, one-shots, pause/resume          | `audioManager.js`                                                       |
+| Sword asset path, scale, grip origin, hand offset, pitch/yaw/roll           | `Sword Offsets` in the GUI                                              |
+| Sword default values, swing timing, hit range                               | `SWORD_TWEAKS` near the top of `main.js`                                |
+| Arm stances and sword swing rotations                                       | `getControlledArmPoseTargets()` in `main.js`                            |
+| Combat balance formulas or Low Guard body/leg stance                        | `combatPhysics.js`                                                      |
+| Physical d20 look, roll timing, face numbers, result-facing quaternion math | `oracleD20.js`                                                          |
+| Neutral anatomical facing correction                                        | `RIG_BASE_BODY_YAW` near the top of `main.js`                           |
+| Complete rig package shape or local rig-library behavior                    | `puppetShop.js`                                                         |
+| Room size, wall colors, ghost sphere count                                  | `WORLD_TWEAKS` near the top of `world.js`                               |
+| Default body proportions                                                    | `DEFAULT_RIG_DIMENSIONS` in `rig.js`                                    |
+| Trigger zones (enter/exit events)                                           | `encounters.js`                                                         |
+| Enemy combat prototype                                                      | `combat_updated.js`                                                     |
+| Jump feel (gravity, height, duration)                                       | `rigTuning` values in the GUI, or `getJumpGravityValue` in `physics.js` |
+| Walk cycle timing                                                           | `walkPhaseSpeed` in `SOLO_TWEAKS`, walk amplitude sliders in GUI        |
+| Run cycle timing/feel                                                       | `runSpeed` / `runPhaseSpeed` in `SOLO_TWEAKS`, run sliders in `Motion`  |
 
 ---
 
 ## Change Notes
 
+- `0.1.57-alpha`: repositioned camera view to 3rd person, added in mouse controls for player panning right left/looking up and down. These are only active when RMB is pressed to not interfere with dev mode. LMB now swings sword. All existing controls were preserved/
+- `0.1.56-alpha`: islolated enemy into a factory `enemy.js` Added second enemy encounter. Added logic for sound and d20 behavior upon additional encounters.
+- `0.1.55-alpha`: creates music module `audieManager.js` and d20 module `oricleD20.js`. Replace existing track for encounters with `combatIntro.ogg` and `cobatLoop.ogg`.
 - `0.1.54-alpha`: Moved the moon/sky focal object into `world.js`, renamed the active runtime handle from the old `jupiter` name to `skyMoon`, moved current encounter data to `skyMoonColor`, and kept old `jupiterColor` / `jupiterScale` action names as compatibility aliases.
 - `0.1.53-alpha`: Extracted audio ownership into `audioManager.js`; main now creates one audio manager, combat delegates ambient/combat music fades to it, world encounter audio actions call it instead of mutating an Audio element, and verification now checks the audio module.
 - `0.1.52-alpha`: Extracted the physical d20/oracle mechanic into `oracleD20.js`; combat now delegates die config, mesh creation, face/value mapping, roll quaternions, roll value, settled state, and rolling updates to the oracle module while keeping enemy decisions, banners, and encounter phases in `combat_updated.js`.
@@ -489,6 +492,7 @@ Every object in Three.js has two matrices:
 **Local matrix** — stores position/rotation/scale relative to the parent. This updates immediately when you set `object.position` or `object.quaternion`.
 
 **World matrix** (`matrixWorld`) — stores the accumulated transform from the scene root all the way down to this object. This is what `worldToLocal()` and `getWorldPosition()` use to convert between coordinate spaces. **Three.js does NOT update this automatically** every time you change a local transform. It only updates world matrices in two moments:
+
 1. When `renderer.render()` is called (which calls `scene.updateMatrixWorld()` at the start of every frame).
 2. When you explicitly call `object.updateMatrixWorld(true)`.
 
@@ -507,7 +511,7 @@ After those calls, every joint's **local** transform was correct. But their **wo
 Then, on the **next** `pointermove` event (which could arrive before the render loop runs), the code called:
 
 ```js
-joint.parent.worldToLocal(dragCurrentParentLocal)
+joint.parent.worldToLocal(dragCurrentParentLocal);
 ```
 
 `worldToLocal()` inverts `joint.parent.matrixWorld`. Because that matrix was stale, the conversion gave the wrong parent-local coordinates. The joint's calculated offset was in the wrong coordinate space — as if the parent had not moved at all. That is exactly "parent-child relationships are not being followed."
@@ -534,29 +538,29 @@ The `true` argument means "update this node AND all its children." This walks th
 
 The default rig is `4.46` scene units tall. All proportions are ratios of that height:
 
-| Landmark | Height (scene units) | Ratio of total height |
-|----------|---------------------|-----------------------|
-| Head pivot | 4.0586 | 91% |
-| Neck pivot | 3.7464 | 84% |
-| Chest pivot | 3.2112 | 72% |
-| Torso (spine base) pivot | 2.6760 | 60% |
-| Pelvis pivot | 2.2300 | 50% |
-| Shoulder width (half) | 0.8474 | 19% |
-| Hip width (half) | 0.4014 | 9% |
-| Upper arm length | 0.8474 | 19% |
-| Forearm length | 0.7582 | 17% |
-| Thigh length | 1.0927 | 24.5% |
-| Shin length | 1.0927 | 24.5% |
+| Landmark                 | Height (scene units) | Ratio of total height |
+| ------------------------ | -------------------- | --------------------- |
+| Head pivot               | 4.0586               | 91%                   |
+| Neck pivot               | 3.7464               | 84%                   |
+| Chest pivot              | 3.2112               | 72%                   |
+| Torso (spine base) pivot | 2.6760               | 60%                   |
+| Pelvis pivot             | 2.2300               | 50%                   |
+| Shoulder width (half)    | 0.8474               | 19%                   |
+| Hip width (half)         | 0.4014               | 9%                    |
+| Upper arm length         | 0.8474               | 19%                   |
+| Forearm length           | 0.7582               | 17%                   |
+| Thigh length             | 1.0927               | 24.5%                 |
+| Shin length              | 1.0927               | 24.5%                 |
 
 **Derived floor positions (with no offsets, root at Y=0):**
 
-| Joint | World Y |
-|-------|---------|
-| Pelvis | 2.2300 |
+| Joint           | World Y                    |
+| --------------- | -------------------------- |
+| Pelvis          | 2.2300                     |
 | Hip joint (L/R) | 2.2300 (hip X-offset only) |
-| Knee | 1.1373 (pelvis − thigh) |
-| Ankle | 0.0446 (knee − shin) |
-| Foot pivot | −0.0354 (ankle − 0.08) |
+| Knee            | 1.1373 (pelvis − thigh)    |
+| Ankle           | 0.0446 (knee − shin)       |
+| Foot pivot      | −0.0354 (ankle − 0.08)     |
 
 The foot pivot sits a small amount below the floor surface. This is intentional — the foot joint is a pivot at the ankle/heel region, not the sole of the foot. When a mesh is attached, the mesh geometry extends below the pivot to the actual ground contact.
 
@@ -570,25 +574,25 @@ The walk cycle uses a sine-wave phase to drive all motion. The left leg is offse
 
 **Per-frame quantities computed from the phase:**
 
-| Variable | Formula | Effect |
-|----------|---------|--------|
-| `leftSwing` | `sin(phase)` | Left leg timing value used by arm counter-swing |
-| `rightSwing` | `sin(phase + PI)` | Right leg timing value used by arm counter-swing |
-| `pelvisSide` | `-sin(phase)` | Side-to-side weight transfer signal |
-| `pelvisStep` | `abs(sin(phase * 2))` | Twice-per-cycle footfall bob signal |
-| `pelvisSwayX` | `pelvisSide * hipSway * walkAmplitude` | Pelvis shifts over the planted foot |
-| `pelvisBobY` | `pelvisStep * hipBob * walkAmplitude` | Pelvis rises slightly once per footfall |
-| `pelvisTiltZ` | `pelvisSide * hipTilt * walkAmplitude` | Pelvis leans around the forward axis |
-| `pelvisTwistY` | `pelvisSide * hipTwist * walkAmplitude` | Pelvis twists around the vertical axis |
-| `chestCounterSway` | `-pelvisTiltZ * 0.62 + sin(phase * 2 - 0.55) * 0.012` | Chest reacts opposite to hip tilt |
-| `headStabilizer` | `pelvisTwistY * 0.45 + sin(phase * 2 - 1.1) * 0.01` | Head counteracts the carrier motion |
+| Variable           | Formula                                               | Effect                                           |
+| ------------------ | ----------------------------------------------------- | ------------------------------------------------ |
+| `leftSwing`        | `sin(phase)`                                          | Left leg timing value used by arm counter-swing  |
+| `rightSwing`       | `sin(phase + PI)`                                     | Right leg timing value used by arm counter-swing |
+| `pelvisSide`       | `-sin(phase)`                                         | Side-to-side weight transfer signal              |
+| `pelvisStep`       | `abs(sin(phase * 2))`                                 | Twice-per-cycle footfall bob signal              |
+| `pelvisSwayX`      | `pelvisSide * hipSway * walkAmplitude`                | Pelvis shifts over the planted foot              |
+| `pelvisBobY`       | `pelvisStep * hipBob * walkAmplitude`                 | Pelvis rises slightly once per footfall          |
+| `pelvisTiltZ`      | `pelvisSide * hipTilt * walkAmplitude`                | Pelvis leans around the forward axis             |
+| `pelvisTwistY`     | `pelvisSide * hipTwist * walkAmplitude`               | Pelvis twists around the vertical axis           |
+| `chestCounterSway` | `-pelvisTiltZ * 0.62 + sin(phase * 2 - 0.55) * 0.012` | Chest reacts opposite to hip tilt                |
+| `headStabilizer`   | `pelvisTwistY * 0.45 + sin(phase * 2 - 1.1) * 0.01`   | Head counteracts the carrier motion              |
 
 **Gait markers per leg** (from `getStepPhase` in `physics.js`):
 
-| Phase range | Name | Description |
-|-------------|------|-------------|
-| 0.0 → 0.5 | Stance | Foot planted; toe-push ramps in late |
-| 0.5 → 1.0 | Swing | Foot off ground; knee lifts via sin curve |
+| Phase range | Name   | Description                               |
+| ----------- | ------ | ----------------------------------------- |
+| 0.0 → 0.5   | Stance | Foot planted; toe-push ramps in late      |
+| 0.5 → 1.0   | Swing  | Foot off ground; knee lifts via sin curve |
 
 The visible leg now uses `getLegStrideValues()` in `physics.js` for the foot path. The normalized forward/back value is `footZ`, where `+0.5` means the foot is reaching forward, `0` means it is under the body, and `-0.5` means it is trailing behind.
 
@@ -612,18 +616,18 @@ Hold `Shift + W` to run. Normal `W` still uses the walking cycle.
 
 The run pass uses the math from `runCycle.md` but keeps the live joint edits inside `main.js`:
 
-| Variable | Formula | Effect |
-|----------|---------|--------|
-| `phase` | `2 * PI * f_run * t` | One full left/right running cycle |
-| `footZ` | `-cos(phase)` | Normalized forward/back foot travel |
-| `footTravel` | `footZ * runStrideLength * 0.5 * runAmplitude` | Visible stride span in scene units |
-| `footLift` | `max(0, sin(phase)) ^ 0.72 * runFootLift` | Higher recovery lift while the leg swings forward |
-| `flightSignal` | soft window at `0.35..0.5` and `0.85..1.0` | Brief airborne lift twice per cycle |
-| `bobY` | `springSignal * runBounce * 0.38 + flightSignal * runBounce` | Vertical body bounce without sinking below the floor |
-| `leanX` | `-(v / vMax) * runForwardLean` | Forward lean from the ankles/torso direction |
-| `hipTwistY` | `sin(phase) * runHipTwist` | Hip yaw |
-| `shoulderTwistY` | `-sin(phase) * runShoulderTwist` | Opposite shoulder yaw for balance |
-| `armPump` | `-sin(legPhase) * runArmPump` | Same-side arm swings opposite the same-side leg |
+| Variable         | Formula                                                      | Effect                                               |
+| ---------------- | ------------------------------------------------------------ | ---------------------------------------------------- |
+| `phase`          | `2 * PI * f_run * t`                                         | One full left/right running cycle                    |
+| `footZ`          | `-cos(phase)`                                                | Normalized forward/back foot travel                  |
+| `footTravel`     | `footZ * runStrideLength * 0.5 * runAmplitude`               | Visible stride span in scene units                   |
+| `footLift`       | `max(0, sin(phase)) ^ 0.72 * runFootLift`                    | Higher recovery lift while the leg swings forward    |
+| `flightSignal`   | soft window at `0.35..0.5` and `0.85..1.0`                   | Brief airborne lift twice per cycle                  |
+| `bobY`           | `springSignal * runBounce * 0.38 + flightSignal * runBounce` | Vertical body bounce without sinking below the floor |
+| `leanX`          | `-(v / vMax) * runForwardLean`                               | Forward lean from the ankles/torso direction         |
+| `hipTwistY`      | `sin(phase) * runHipTwist`                                   | Hip yaw                                              |
+| `shoulderTwistY` | `-sin(phase) * runShoulderTwist`                             | Opposite shoulder yaw for balance                    |
+| `armPump`        | `-sin(legPhase) * runArmPump`                                | Same-side arm swings opposite the same-side leg      |
 
 The pure formulas live in `physics.js` as `getRunStrideValues()` and `getPelvisRunValues()`. The live puppet application lives in `main.js` as `updateRunMotion()` and `updateLegRun()`. The bent-elbow pumping shape lives in `getControlledArmPoseTargets()` under the `pose === "down" && controlState.isRunning` branch.
 
@@ -724,6 +728,7 @@ Before this split, `main.js` also contained all the GLB mesh loading, preview, s
 When a function gets moved to a new file, the old copy in the original file has to be removed. During this split, the new imports were added to `main.js` before the old local copies were deleted. JavaScript modules (the kind used here) treat an import and a local function definition with the same name as a hard error — it refuses to run the file at all. This meant the program was temporarily broken with a black screen until the old copies were cleaned out.
 
 The fix required:
+
 1. Updating the call sites where the moved functions now need slightly different inputs (the new versions are "pure" — they don't grab variables on their own, they take what they need as arguments).
 2. Deleting the old duplicate function definitions.
 3. Adding the one missing startup call (`initSkin`) that the skin module needs before anything else runs.
