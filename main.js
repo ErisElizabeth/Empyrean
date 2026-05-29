@@ -147,6 +147,21 @@ const SOLO_TWEAKS = {
     // Wheel zoom has a slightly closer max than arrow-key zoom so trackpad
     // gestures stay easy to control while placing pivots.
     wheelMaxDistance: 18,
+
+    // Lurch damping for the "return to behind" behavior after the player starts
+    // walking/running. Higher = catches up faster. Tuned so the camera takes
+    // ~0.6s to noticeably recenter, not so fast it feels like a snap.
+    lurchDamping: 1.5,
+
+    // RMB-held mouse controls (gated by controlState.mouseLookActive).
+    // Sensitivity is per-pixel of pointer movement.
+    mouseTurnSensitivity: 0.003,   // player yaw (mirrors A/D direction)
+    mousePitchSensitivity: 0.002,  // camera pitch (look up/down)
+    mouseInvertY: false,           // false: forward = look up at sky
+    maxPitch: Math.PI / 3,         // ~60deg; prevents flipping over the top
+
+    // RMB-held mouse wheel orbits instead of zooming.
+    wheelOrbitSpeed: 0.45,
   },
 
   audio: {
@@ -893,6 +908,15 @@ const controlState = {
   cameraYaw: 0,
   cameraDistance: SOLO_TWEAKS.camera.startDistance,
   cameraHeight: SOLO_TWEAKS.camera.startHeight,
+  // cameraPitch: third-person camera tilt. 0 = horizontal orbit (legacy
+  // behavior), positive = camera above target / looking down, negative =
+  // camera below target / looking up at sky. Clamped to +/-maxPitch.
+  cameraPitch: 0,
+  // mouseLookActive: set true while right mouse button is held in the scene.
+  // Gates pointer-driven yaw/pitch input AND switches scroll wheel from zoom
+  // to orbit. Reset on RMB release, pointer cancel, or pointer leaving the
+  // scene container.
+  mouseLookActive: false,
   waveUntil: 0,
   leftArm: "down",
   rightArm: "down",
@@ -4619,6 +4643,24 @@ function updateKeyboardMotion(delta, currentTime) {
   controlState.yaw += turnInput * delta * 2.2;
   controlState.cameraYaw +=
     orbitInput * delta * SOLO_TWEAKS.camera.keyboardOrbitSpeed;
+
+  /*
+    Lurch back to behind when the player is moving and not actively orbiting.
+
+    Why "and not actively orbiting": if the player is holding an arrow key to
+    pan, the damping would fight that input. We only pull cameraYaw back to
+    zero when the player isn't asking the camera to be anywhere else.
+
+    The formula is the same exponential-decay-toward-target shape used by
+    dampJointRotation, just applied to a scalar:
+      t = 1 - 0.001^(delta * lurchDamping / 4)
+      cameraYaw *= (1 - t)
+  */
+  if (moveInput !== 0 && orbitInput === 0) {
+    const t = 1 - Math.pow(0.001, delta * SOLO_TWEAKS.camera.lurchDamping / 4);
+    controlState.cameraYaw *= 1 - t;
+  }
+
   controlState.cameraDistance = THREE.MathUtils.clamp(
     controlState.cameraDistance +
       zoomInput * delta * SOLO_TWEAKS.camera.keyboardZoomSpeed,
@@ -7158,23 +7200,34 @@ function updateCamera(delta) {
       body, not the feet.
 
     yaw:
-      avatar yaw + extra camera orbit yaw
+      avatar yaw + extra camera orbit yaw + PI
+      The +PI puts the camera behind the player. Before the rework this term
+      was absent and the camera sat in front of the player, which made sense
+      for the puppet rigging origin of this project but not for gameplay.
 
-    offset:
-      x = sin(yaw) * distance
-      z = cos(yaw) * distance
-      y = cameraHeight
+    pitch:
+      controlState.cameraPitch, applied as a vertical orbit (latitude).
+      pitch = 0   -> horizontal orbit (legacy)
+      pitch > 0   -> camera higher, looks down at target (ground in view)
+      pitch < 0   -> camera lower, looks up at target (sky in view)
+
+    offset (polar coords around target):
+      x = sin(yaw) * cos(pitch) * distance
+      y = cameraHeight + sin(pitch) * distance
+      z = cos(yaw) * cos(pitch) * distance
 
     The camera lerps to the desired position for smooth following.
   */
   const target = state.skeleton.root.position
     .clone()
     .add(new THREE.Vector3(0, 1.65, 0));
-  const yaw = controlState.yaw + controlState.cameraYaw;
+  const yaw = controlState.yaw + controlState.cameraYaw + Math.PI;
+  const pitch = controlState.cameraPitch;
+  const dist = controlState.cameraDistance;
   const offset = new THREE.Vector3(
-    Math.sin(yaw) * controlState.cameraDistance,
-    controlState.cameraHeight,
-    Math.cos(yaw) * controlState.cameraDistance,
+    Math.sin(yaw) * Math.cos(pitch) * dist,
+    controlState.cameraHeight + Math.sin(pitch) * dist,
+    Math.cos(yaw) * Math.cos(pitch) * dist,
   );
   const desiredPosition = target.clone().add(offset);
 
@@ -7862,6 +7915,176 @@ function handleJointEditPointerUp(event) {
   sceneContainer.releasePointerCapture?.(event.pointerId);
 }
 
+function isAnyDevModeActive() {
+  /*
+    Union check used to gate gameplay mouse input (LMB sword, RMB mouse-look).
+
+    Returns true if any rigging/dev tool currently owns the pointer or would
+    be disrupted by gameplay input. Adding a new dev mode? Add it here so the
+    sword does not swing while you place pivots and the camera does not whip
+    around while you drag the dev probe.
+  */
+  return (
+    state.g53RiggingMode.active ||
+    rigTuning.mouseJointEditMode ||
+    rigTuning.devProbeVisible ||
+    state.devProbe.dragging ||
+    mouseJointEditor.dragging
+  );
+}
+
+function handleGameplayPointerDown(event) {
+  /*
+    Routes gameplay mouse buttons:
+
+      RMB (button === 2):
+        Enters mouse-look mode. While active:
+          - pointer movement turns the player (yaw) and pitches the camera
+          - mouse wheel orbits instead of zooming
+        Suppressed in any dev mode (G53, joint edit, dev probe).
+        The browser context menu is suppressed by a separate contextmenu handler
+        so dragging right does not pop a system menu over the scene.
+
+      LMB (button === 0):
+        Triggers a sword swing. startSwordSwing() already auto-equips if the
+        sword is stowed, so a fresh-loaded player can click once to equip and
+        the first swing fires on that same click. Suppressed in dev modes so
+        a rigging session does not accidentally produce swings.
+
+    Other buttons are ignored. This handler is additive to the existing dev
+    handlers; they all run on the same pointerdown event but each guards its
+    own preconditions.
+  */
+  if (isAnyDevModeActive()) {
+    return;
+  }
+
+  if (event.button === 2) {
+    event.preventDefault();
+    sceneContainer.setPointerCapture?.(event.pointerId);
+    /*
+      Pointer Lock hides the OS cursor and "pins" it in place for the duration
+      of RMB. The browser keeps reporting movementX/Y deltas in pointermove
+      events, so the camera still pans, but the cursor never drifts off the
+      scene container or hits a screen edge. Released in pointerup/cancel.
+
+      requestPointerLock can return a Promise in modern browsers; we don't
+      await it because failure is non-fatal (the camera still pans, just with
+      a moving cursor that can drift).
+    */
+    sceneContainer.requestPointerLock?.();
+    controlState.mouseLookActive = true;
+    return;
+  }
+
+  if (event.button === 0) {
+    startSwordSwing();
+  }
+}
+
+function handleGameplayPointerMove(event) {
+  /*
+    Applies mouse-look deltas while RMB is held.
+
+    Sources:
+      event.movementX, event.movementY = pointer delta since the previous
+      pointermove event, in pixels. Browsers provide this without the page
+      having to track its own previous coords.
+
+    Axes:
+      dx (horizontal) -> turn the PLAYER (controlState.yaw). Mirrors A/D
+        keys: positive dx (mouse moved right) -> turn right -> yaw decreases.
+      dy (vertical)   -> pitch the CAMERA (controlState.cameraPitch).
+        Default mouseInvertY=false means forward (dy<0) makes pitch decrease,
+        which puts the camera lower and tilts the view up at the sky.
+        Setting mouseInvertY=true flips this so forward looks down.
+
+    Pitch is clamped to +/- maxPitch to prevent the camera flipping over the
+    top of the player.
+  */
+  if (!controlState.mouseLookActive) {
+    return;
+  }
+  if (isAnyDevModeActive()) {
+    return;
+  }
+
+  const dx = event.movementX || 0;
+  const dy = event.movementY || 0;
+
+  controlState.yaw -= dx * SOLO_TWEAKS.camera.mouseTurnSensitivity;
+
+  const pitchSign = SOLO_TWEAKS.camera.mouseInvertY ? -1 : 1;
+  controlState.cameraPitch = THREE.MathUtils.clamp(
+    controlState.cameraPitch + dy * SOLO_TWEAKS.camera.mousePitchSensitivity * pitchSign,
+    -SOLO_TWEAKS.camera.maxPitch,
+    SOLO_TWEAKS.camera.maxPitch,
+  );
+}
+
+function handleGameplayPointerUp(event) {
+  /*
+    Exits mouse-look mode when RMB is released. Pointer capture is released so
+    the scene container stops swallowing other events. Pointer lock is also
+    released so the OS cursor reappears. Also fires on pointercancel/leave via
+    the same listener wiring below, so a stuck mouseLookActive state does not
+    survive an interrupted gesture.
+  */
+  if (event.button !== 2) {
+    return;
+  }
+  if (!controlState.mouseLookActive) {
+    return;
+  }
+  controlState.mouseLookActive = false;
+  sceneContainer.releasePointerCapture?.(event.pointerId);
+  if (document.pointerLockElement === sceneContainer) {
+    document.exitPointerLock?.();
+  }
+}
+
+function handleGameplayPointerCancel(event) {
+  /*
+    Defensive: if the OS interrupts a gesture (alt-tab, focus loss, etc.),
+    clear the mouse-look flag and release pointer lock so it does not survive
+    into the next session.
+  */
+  if (!controlState.mouseLookActive) {
+    return;
+  }
+  controlState.mouseLookActive = false;
+  sceneContainer.releasePointerCapture?.(event.pointerId);
+  if (document.pointerLockElement === sceneContainer) {
+    document.exitPointerLock?.();
+  }
+}
+
+function handlePointerLockChange() {
+  /*
+    Pointer lock can be lost without our pointerup handler firing — most
+    commonly when the user presses Esc to escape lock, or when the browser
+    revokes it due to focus loss. If that happens while RMB is still believed
+    to be held, clear mouseLookActive so the next pointermove does not whip
+    the camera around as soon as the OS cursor reappears.
+  */
+  if (
+    document.pointerLockElement !== sceneContainer &&
+    controlState.mouseLookActive
+  ) {
+    controlState.mouseLookActive = false;
+  }
+}
+
+function handleSceneContextMenu(event) {
+  /*
+    Suppresses the browser's right-click context menu inside the 3D scene so
+    holding RMB to mouse-look does not pop a menu over the gameplay view.
+    The dev GUI (lil-gui) is outside the scene container, so its right-click
+    behavior is unaffected.
+  */
+  event.preventDefault();
+}
+
 function handleWheelZoom(event) {
   event.preventDefault();
 
@@ -7869,13 +8092,24 @@ function handleWheelZoom(event) {
     Mouse wheels report pixel, line, or page deltas depending on the device.
     This normalizes the value enough that a wheel notch and a trackpad gesture
     both feel like camera dolly movement instead of a wild teleport.
+
+    Dual mode:
+      default       -> wheel adjusts cameraDistance (zoom)
+      RMB held      -> wheel adjusts cameraYaw (orbit)
+    This lets the player keep zoom on the wheel for general use while making
+    fine orbit adjustments a "hold RMB and scroll" gesture during aim/look.
   */
   const modeScale =
     event.deltaMode === 1 ? 0.08 : event.deltaMode === 2 ? 0.35 : 0.0035;
-  const zoomAmount = event.deltaY * modeScale;
+  const wheelAmount = event.deltaY * modeScale;
+
+  if (controlState.mouseLookActive) {
+    controlState.cameraYaw += wheelAmount * SOLO_TWEAKS.camera.wheelOrbitSpeed;
+    return;
+  }
 
   controlState.cameraDistance = THREE.MathUtils.clamp(
-    controlState.cameraDistance + zoomAmount,
+    controlState.cameraDistance + wheelAmount,
     SOLO_TWEAKS.camera.minDistance,
     SOLO_TWEAKS.camera.wheelMaxDistance,
   );
@@ -7916,6 +8150,39 @@ function handleKeyUp(event) {
   controlState.keys.delete(event.code);
 }
 
+function handleWindowBlur() {
+  /*
+    Clears all held-key state and any active mouse-look when the window loses
+    focus.
+
+    Why this exists:
+      controlState.keys is a Set populated by keydown and emptied by keyup.
+      If a key is held when the window loses focus (Alt+Tab, browser tab
+      switch, OS modal, dev tools, etc.), the matching keyup may never reach
+      our listener and the key stays "stuck" in the Set forever.
+
+      Symptom in practice: hold W to walk, switch focus to dev tools mid-walk,
+      switch back — the player keeps walking with no key held. Pressing W
+      again restores normal behavior because the next keyup fires.
+
+      Confirming clue: Shift can still enter/exit the run cycle while in the
+      stuck state, because Shift was pressed/released entirely AFTER focus
+      returned to the window. Only the pre-blur key (W) is stuck.
+
+    Fix:
+      Clear the entire held-key Set on window blur. Also drop mouseLookActive
+      and release pointer lock if RMB was being held during the focus loss,
+      so the next session starts clean.
+  */
+  controlState.keys.clear();
+  if (controlState.mouseLookActive) {
+    controlState.mouseLookActive = false;
+    if (document.pointerLockElement === sceneContainer) {
+      document.exitPointerLock?.();
+    }
+  }
+}
+
 function handleKeyDown(event) {
   /*
     Handles one-shot key actions and records held movement keys.
@@ -7933,12 +8200,21 @@ function handleKeyDown(event) {
       J     = jump
       1     = equip sword and enter combat stance
       2     = despawn sword and return arms to idle
-      Enter = sword swing / combat hit attempt
+      Enter = sword swing / combat hit attempt   (backup; LMB also works)
       F2    = toggle G53 machine-home rigging mode
       Y     = toggle TEMP devProbe marker
       Shift + J/L = move devProbe local X
       Shift + U/O = move devProbe local Y
       Shift + I/K = move devProbe local Z
+
+    Mouse bindings (handled separately in handleGameplayPointerDown/Move/Up):
+      LMB           = swing sword; equips first if not yet equipped
+      RMB hold      = engage mouse-look:
+                        drag horizontal -> turn player (same as A/D)
+                        drag vertical   -> pitch camera (forward = look up)
+                        scroll wheel    -> orbit instead of zoom
+      wheel (no RMB)= zoom camera (same as before)
+      All gated by isAnyDevModeActive(); none fire during G53/joint-edit/probe.
   */
   if (event.code === "F2") {
     event.preventDefault();
@@ -8061,6 +8337,7 @@ settleStartupPoseBehindTitleCard();
 window.addEventListener("keydown", handleG53HotkeyCapture, { capture: true });
 window.addEventListener("keydown", handleKeyDown);
 window.addEventListener("keyup", handleKeyUp);
+window.addEventListener("blur", handleWindowBlur);
 window.addEventListener("resize", resizeRendererToContainer);
 sceneContainer.addEventListener("wheel", handleWheelZoom, { passive: false });
 sceneContainer.addEventListener("pointerdown", handleDevProbePointerDown);
@@ -8071,6 +8348,13 @@ sceneContainer.addEventListener("pointerdown", handleJointEditPointerDown);
 sceneContainer.addEventListener("pointermove", handleJointEditPointerMove);
 sceneContainer.addEventListener("pointerup", handleJointEditPointerUp);
 sceneContainer.addEventListener("pointercancel", handleJointEditPointerUp);
+sceneContainer.addEventListener("pointerdown", handleGameplayPointerDown);
+sceneContainer.addEventListener("pointermove", handleGameplayPointerMove);
+sceneContainer.addEventListener("pointerup", handleGameplayPointerUp);
+sceneContainer.addEventListener("pointercancel", handleGameplayPointerCancel);
+sceneContainer.addEventListener("pointerleave", handleGameplayPointerCancel);
+sceneContainer.addEventListener("contextmenu", handleSceneContextMenu);
+document.addEventListener("pointerlockchange", handlePointerLockChange);
 
 requestAnimationFrame(animate);
 initWorkshopLoader();
