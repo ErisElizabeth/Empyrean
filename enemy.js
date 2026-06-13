@@ -46,8 +46,8 @@ export function createCombatEnemy({ scene, modelPath, config }) {
                         enemy:    { ... },
                         evasion:  { ... },
                         health:   { ... },
-                        enemyFade:{ ... },   // currently unused inside; kept
-                                             // for symmetry with combat config
+                        enemyFade:{ ... },   // visual materialize/vanish
+                                             // timings for this enemy
                       }
 
     Returned API: see the bottom of this function.
@@ -84,8 +84,7 @@ export function createCombatEnemy({ scene, modelPath, config }) {
     // (e.g. enemy A is hiding while enemy B is being hit).
     //
     //   idle      — never spawned, or fully cleaned up.
-    //   spawning  — fading in locally over enemyFade.inSeconds.
-    //   active    — chasing the rig; can be hit.
+    //   active    — chasing the rig; can be hit. Fade-in is visual only.
     //   hiding    — briefly invisible after a non-lethal hit; auto-relocates
     //               and returns to active after health.hideSeconds.
     //   dying     — fading out locally over enemyFade.outSeconds after a
@@ -95,6 +94,7 @@ export function createCombatEnemy({ scene, modelPath, config }) {
     lifecycle: "idle",
     fadeInElapsed: 0,
     fadeOutElapsed: 0,
+    fadeOutStartOpacity: 1,
     hidingElapsed: 0,
   };
 
@@ -247,6 +247,42 @@ export function createCombatEnemy({ scene, modelPath, config }) {
     if (state.hitbox && state.hitbox.material) {
       state.hitbox.material.opacity = config.enemy.hitboxOpacity * value;
     }
+  }
+
+  function getFadeInSeconds() {
+    return Math.max(config.enemyFade?.inSeconds || 0.01, 0.01);
+  }
+
+  function getFadeOutSeconds() {
+    return Math.max(config.enemyFade?.outSeconds || 0.01, 0.01);
+  }
+
+  function tickVisualFadeIn(delta) {
+    /*
+      Fade-in is now a visual-only materialization layer.
+
+      Older behavior used a separate "spawning" lifecycle and returned early
+      until the enemy was fully visible. That looked fine, but it also meant
+      hits, prompts, and evasion were blocked during the first second of an
+      encounter. Combat now treats the enemy as active immediately; this
+      helper only ramps mesh/hitbox alpha while the active enemy can already
+      move and be struck.
+    */
+    const fadeInSeconds = getFadeInSeconds();
+    if (state.fadeInElapsed >= fadeInSeconds) {
+      return;
+    }
+
+    state.fadeInElapsed = Math.min(
+      state.fadeInElapsed + delta,
+      fadeInSeconds,
+    );
+    const progress = THREE.MathUtils.clamp(
+      state.fadeInElapsed / fadeInSeconds,
+      0,
+      1,
+    );
+    setOpacity(progress);
   }
 
   function normalize(root) {
@@ -446,7 +482,8 @@ export function createCombatEnemy({ scene, modelPath, config }) {
         the player using rigYaw (rig's facing at trigger time). Resets HP
         from the current difficulty config so a fresh encounter always
         starts at full health. Starts fade-in opacity at 0; tick() handles
-        the ramp via the local fadeInElapsed clock.
+        the ramp via the local fadeInElapsed clock while the enemy is already
+        active for gameplay.
 
         Kicks the GLB load if it hasn't started yet — first spawn pays the
         fetch cost, subsequent spawns are instant.
@@ -468,12 +505,13 @@ export function createCombatEnemy({ scene, modelPath, config }) {
       state.hitbox.visible = true;
       state.healthBar.visible = true;
 
-      // Reset all lifecycle clocks and enter the spawning state. tick() will
-      // ramp opacity up over enemyFade.inSeconds and flip to "active" when
-      // the local clock completes.
-      state.lifecycle = "spawning";
+      // Reset all lifecycle clocks and enter active immediately. The fade-in
+      // is only visual now, so movement, sword hits, and prompts can begin
+      // on the same frame the encounter starts.
+      state.lifecycle = "active";
       state.fadeInElapsed = 0;
       state.fadeOutElapsed = 0;
+      state.fadeOutStartOpacity = 1;
       state.hidingElapsed = 0;
       state.localElapsed = 0;
 
@@ -504,6 +542,7 @@ export function createCombatEnemy({ scene, modelPath, config }) {
       if (state.lifecycle === "dying" || state.lifecycle === "gone") return;
       state.lifecycle = "dying";
       state.fadeOutElapsed = 0;
+      state.fadeOutStartOpacity = state.currentOpacity;
       // The enemy stays visible during the fade — visibility flips off when
       // the fade completes inside tick().
       state.group.visible = true;
@@ -519,31 +558,13 @@ export function createCombatEnemy({ scene, modelPath, config }) {
       /*
         Single per-frame entry point for the orchestrator. Handles the local
         state machine; only does evasion movement when in "active" AND the
-        caller passed movement=true (so the orchestrator can freeze enemies
-        during the visible d20 roll without skipping fade-in advancement).
+        caller passed movement=true. Fade-in keeps advancing inside "active"
+        because it is presentation, not a gameplay blocker.
       */
       state.localElapsed += delta;
 
-      if (state.lifecycle === "spawning") {
-        state.fadeInElapsed += delta;
-        const fadeInSeconds = Math.max(
-          config.enemyFade?.inSeconds || 0.01,
-          0.01,
-        );
-        const progress = THREE.MathUtils.clamp(
-          state.fadeInElapsed / fadeInSeconds,
-          0,
-          1,
-        );
-        setOpacity(progress);
-        if (progress >= 1) {
-          state.lifecycle = "active";
-          state.localElapsed = 0; // restart juke phase at active entry
-        }
-        return state.lifecycle;
-      }
-
       if (state.lifecycle === "active") {
+        tickVisualFadeIn(delta);
         if (movement) {
           updateEvasion(delta, rigX, rigZ);
           faceTowardRig(rigX, rigZ, delta);
@@ -580,6 +601,7 @@ export function createCombatEnemy({ scene, modelPath, config }) {
           state.hitbox.visible = true;
           state.healthBar.visible = true;
           setOpacity(1);
+          state.fadeInElapsed = getFadeInSeconds();
           state.lifecycle = "active";
           state.localElapsed = 0;
           state.hidingElapsed = 0;
@@ -589,16 +611,13 @@ export function createCombatEnemy({ scene, modelPath, config }) {
 
       if (state.lifecycle === "dying") {
         state.fadeOutElapsed += delta;
-        const fadeOutSeconds = Math.max(
-          config.enemyFade?.outSeconds || 0.01,
-          0.01,
-        );
+        const fadeOutSeconds = getFadeOutSeconds();
         const progress = THREE.MathUtils.clamp(
           state.fadeOutElapsed / fadeOutSeconds,
           0,
           1,
         );
-        setOpacity(1 - progress);
+        setOpacity(state.fadeOutStartOpacity * (1 - progress));
         if (progress >= 1) {
           state.lifecycle = "gone";
           state.group.visible = false;
@@ -712,6 +731,7 @@ export function createCombatEnemy({ scene, modelPath, config }) {
       state.hitbox.visible = true;
       state.healthBar.visible = true;
       setOpacity(1);
+      state.fadeInElapsed = getFadeInSeconds();
       state.localElapsed = 0;
     },
 

@@ -10,7 +10,7 @@
     - numbered face creation and face/value mapping
     - roll start/end quaternions
     - roll value and settled state
-    - per-frame roll update while combat is in its rolling phase
+    - per-frame roll update while combat's HUD presentation is active
 
   It deliberately does NOT own:
 
@@ -34,14 +34,28 @@ import * as THREE from "three";
 const ORACLE_D20_CONFIG = {
   // The d20 is no longer a quick arcade spinner. It is an omen. The longer
   // timing gives it a slower, mournful roll before combat begins.
-  rollSeconds: 4.2,
-  postRollSeconds: 2.1,
-  // Instead of floating over the enemy, the die manifests in front of the
-  // player so it is prominent no matter where the enemy spawned.
-  forwardDistance: 1.75,
-  playerHeight: 1.88,
+  // The HUD presentation now needs to be gameplay-light: 3.0 seconds total
+  // after the 0.25 second combat-side delay. The tumble takes most of that
+  // time, then the settled face/message gets a short hold.
+  rollSeconds: 2.3,
+  postRollSeconds: 0.7,
+  // Instead of floating over the enemy/player, the die now manifests on the
+  // camera ray that passes through the HUD center. It remains a real Three.js
+  // object; this config only chooses the screen-space anchor for its group.
+  hudAnchor: {
+    screenWidthMm: 698.5,
+    screenHeightMm: 298.45,
+    xMm: 88.9,
+    // The original HUD request describes screen Y as negative downward.
+    // CSS/camera math uses positive distance down from the top edge, so
+    // Y-57.15 mm becomes yMmFromTop = 57.15.
+    yMmFromTop: 57.15,
+    cameraDistance: 8,
+  },
   // Visual size of the d20 in world units (icosahedron radius).
-  size: 0.72,
+  // 0.4493 is an additional 20% reduction from 0.5616 so the die sits more
+  // comfortably inside the HUD without filling it corner-to-corner.
+  size: 0.4493,
   // Stone texture/material settings. The room wall textures already have the
   // right ancient gray mood, so the die reuses them as rough stone skin.
   diffusePath: "assets/stoneWallDiff.jpg",
@@ -60,7 +74,7 @@ const ORACLE_D20_CONFIG = {
 // PUBLIC FACTORY
 // ===============================================================
 
-export function createOracleD20({ controlState, rigTuning } = {}) {
+export function createOracleD20({ controlState, rigTuning, camera } = {}) {
   /*
     Creates one self-contained oracle instance.
 
@@ -72,12 +86,14 @@ export function createOracleD20({ controlState, rigTuning } = {}) {
       hide()         - hide the group
       getRollValue() - read the current result
 
-    controlState and rigTuning are references owned by combat/main. The oracle
-    only reads them so it can keep the die in front of the player.
+    controlState, rigTuning, and camera are references owned by combat/main.
+    The oracle only reads them so it can keep the die visually centered in the
+    roll HUD and solve the final numbered face toward the viewer.
   */
   const oracle = {
     controlState,
     rigTuning,
+    camera,
     group: null,
     d20Mesh: null,
     d20StoneMesh: null,
@@ -101,26 +117,29 @@ export function createOracleD20({ controlState, rigTuning } = {}) {
     setContext({
       controlState: nextControlState = oracle.controlState,
       rigTuning: nextRigTuning = oracle.rigTuning,
+      camera: nextCamera = oracle.camera,
     } = {}) {
       oracle.controlState = nextControlState;
       oracle.rigTuning = nextRigTuning;
+      oracle.camera = nextCamera;
     },
 
-    startRoll() {
+    startRoll({ rollValue } = {}) {
       /*
-        The actual roll value is decided up-front:
+        The actual roll value may be provided by combat:
 
-          rollValue = floor(random() * 20) + 1
+          rollValue = precomputed combat result
 
-        The die animation is then aimed at the physical face for that value, so
-        the random number dictates the final 3D orientation instead of merely
-        changing a flat label.
+        If combat does not provide a value, the oracle falls back to its own
+        random d20 value for isolated tests. The die animation is then aimed at
+        the physical face for that value, so the number dictates the final 3D
+        orientation instead of merely changing a flat label.
       */
       oracle.elapsed = 0;
       oracle.rollHasSettled = false;
-      oracle.rollValue = Math.floor(Math.random() * 20) + 1;
+      oracle.rollValue = normalizeRollValue(rollValue);
 
-      positionD20ForPlayer(oracle);
+      positionD20ForHud(oracle);
       oracle.group.visible = true;
 
       oracle.d20RollStartQuaternion.copy(makeRandomD20StartQuaternion());
@@ -166,10 +185,10 @@ export function createOracleD20({ controlState, rigTuning } = {}) {
         1,
       );
 
-      // Keep the die locked in front of the player during the whole omen. If the
-      // player turns mid-roll, the end quaternion is solved again so the rolled
+      // Keep the die locked to the HUD center during the whole omen. If the
+      // camera moves mid-roll, the end quaternion is solved again so the rolled
       // face remains readable instead of drifting off-axis.
-      positionD20ForPlayer(oracle);
+      positionD20ForHud(oracle);
       oracle.d20RollEndQuaternion.copy(
         getD20FinalQuaternion(oracle, oracle.rollValue),
       );
@@ -224,7 +243,7 @@ function buildStoneNumberedD20Group(oracle) {
 
     The numbers are not a billboard floating in front of the die anymore. Each
     number belongs to an actual face. The roll animation later solves which face
-    must point toward the player for the random value that was generated.
+    must point toward the HUD/camera for the random value that was generated.
   */
   const group = new THREE.Group();
   group.name = "combat-d20";
@@ -586,20 +605,58 @@ function queueD20FontRefresh(oracle) {
 // D20 POSITION AND ROLL MATH
 // ===============================================================
 
-function positionD20ForPlayer(oracle) {
-  const yaw = oracle.controlState?.yaw || 0;
-  const rigX =
-    (oracle.controlState?.position?.x || 0) +
-    (oracle.rigTuning?.rootOffsetX || 0);
-  const rigZ =
-    (oracle.controlState?.position?.z || 0) +
-    (oracle.rigTuning?.rootOffsetZ || 0);
-  const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+function normalizeRollValue(rollValue) {
+  /*
+    Accepts a precomputed combat result and clamps it into the physical d20's
+    1..20 range. If no valid result is provided, keep the oracle usable as a
+    standalone test object by rolling locally.
+  */
+  const value = Math.trunc(Number(rollValue));
+  if (Number.isFinite(value) && value >= 1 && value <= 20) {
+    return value;
+  }
+  return Math.floor(Math.random() * 20) + 1;
+}
 
-  oracle.group.position.set(
-    rigX + forward.x * ORACLE_D20_CONFIG.forwardDistance,
-    ORACLE_D20_CONFIG.playerHeight,
-    rigZ + forward.z * ORACLE_D20_CONFIG.forwardDistance,
+function positionD20ForHud(oracle) {
+  /*
+    Screen-space-to-world placement.
+
+    Input drawing coordinates:
+      Xscreen = 698.5 mm
+      Yscreen = 298.45 mm
+      Xhud    = 88.9 mm
+      Yhud    = -57.15 mm, written as 57.15 mm down from the top edge here
+
+    Convert to normalized device coordinates:
+      ndcX = (Xhud / Xscreen) * 2 - 1
+      ndcY = 1 - (Ydown / Yscreen) * 2
+
+    Then unproject a point on that camera ray and place the die a fixed
+    distance from the camera:
+      rayDirection = normalize(unproject(ndcX, ndcY, 0.5) - camera.position)
+      worldPoint   = camera.position + rayDirection * cameraDistance
+
+    Result: the d20 remains a real 3D object in the scene, but visually sits at
+    the center of the oracle HUD.
+  */
+  const camera = oracle.camera;
+  if (!camera) {
+    return;
+  }
+
+  camera.updateMatrixWorld(true);
+  const anchor = ORACLE_D20_CONFIG.hudAnchor;
+  const ndcX = (anchor.xMm / anchor.screenWidthMm) * 2 - 1;
+  const ndcY = 1 - (anchor.yMmFromTop / anchor.screenHeightMm) * 2;
+  const pointOnRay = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera);
+
+  const rayDirection = pointOnRay.sub(camera.position).normalize();
+  oracle.group.position.copy(
+    camera.position.clone().addScaledVector(
+      rayDirection,
+      anchor.cameraDistance,
+    ),
   );
 }
 
@@ -612,7 +669,7 @@ function getD20FinalQuaternion(oracle, value) {
       Qfinal = Qtwist * Qface
 
     This is why the d20 can be a real object. The random roll chooses the face,
-    and the quaternion math physically turns that face toward the player.
+    and the quaternion math physically turns that face toward the camera.
   */
   const face = oracle.d20FacesByValue[value] || oracle.d20FacesByValue[1];
   if (!face) {
@@ -645,9 +702,16 @@ function getD20FinalQuaternion(oracle, value) {
 }
 
 function getD20ViewerNormal(oracle) {
-  // This is the die's outward-facing normal that should point back toward the
-  // player. A slight upward component presents the face to the camera instead
-  // of aiming it perfectly horizontal at the rig's waist.
+  /*
+    The final numbered face should point toward the camera now that the d20 is
+    screen-pinned to the HUD. Fallback to the older player-yaw direction if the
+    camera has not been injected yet, which keeps the oracle defensive during
+    startup or isolated module tests.
+  */
+  if (oracle.camera) {
+    return oracle.camera.position.clone().sub(oracle.group.position).normalize();
+  }
+
   const yaw = oracle.controlState?.yaw || 0;
   return new THREE.Vector3(-Math.sin(yaw), 0.18, -Math.cos(yaw)).normalize();
 }

@@ -1,9 +1,16 @@
 # EMPYREAN SYSTEM MAP
 
 5/27/2026 0500 note:
-oricleD20 module and audioManager module created
+oracleD20 module and audioManager module created
+
+5/31/2026 update:
+README/runtime version alignment pass added the current Entity layer notes. This
+map still preserves the original audit structure, but now includes `entity.js`
+and `entityControllers.js` so the newer NPC/enemy rig boundary is visible.
+
 Generated: 2026-05-27  
-Scope: analysis-only audit. No behavior changes, no refactors, no code fixes.
+Updated: 2026-05-31
+Scope: analysis-only audit plus documentation alignment notes. No gameplay behavior changes.
 
 This document maps the current Empyrean prototype as it exists now: a browser-based Three.js game/workshop hybrid with an active puppet rig, imported mesh skinning, dev rigging tools, a dark exploratory world, sword stance work, combat encounter logic, a d20/oracle presentation, and several older experimental systems still present.
 
@@ -30,15 +37,17 @@ Map first. Surgery later.
 | ------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------- |
 | `index.html`        | UI/bootstrap                | Browser entry point. Loads CSS, import map, loader/title card DOM, Three.js app container, and `main.js`.                                                                                | DOM roots: `#emp-loader`, `#scene-container`, old `#puppet-lab-container`.                                                                         | CDN import map for Three.js and lil-gui.                                                                                                                 | Browser.                                                         | KEEP, with old DOM cleanup candidates.                   |
 | `styles.css`        | UI/title card               | Styles body, loader/title card, scene canvas, and lil-gui controls.                                                                                                                      | Visual shell and loader/title presentation.                                                                                                        | DOM ids/classes from `index.html`.                                                                                                                       | Browser.                                                         | KEEP.                                                    |
-| `main.js`           | Core/gameplay/workshop      | Main application module. Bootstraps scene, renderer, camera, title, audio, player rig, GUI, G53, input, movement, animation, sword, combat wiring, imported mesh hooks, and update loop. | Almost all runtime state: `rigTuning`, `state`, `controlState`, skeleton creation, GUI, player movement, visible pose application, sword, startup. | Three.js, lil-gui, GLTFLoader, `world.js`, `skin.js`, `physics.js`, `rig.js`, `puppetShop.js`, `combat_updated.js`, `combatPhysics.js`, `encounters.js`. | Browser via `index.html`; every gameplay frame flows through it. | KEEP, but overgrown and fragile.                         |
+| `main.js`           | Core/gameplay/workshop      | Main application module. Bootstraps scene, renderer, camera, title, audio, player rig, GUI, G53, input, movement, animation, sword, combat wiring, imported mesh hooks, entity setup, and update loop. | Almost all runtime state: `rigTuning`, `state`, `controlState`, skeleton creation, GUI, player movement, visible pose application, sword, startup, entity runtime wiring. | Three.js, lil-gui, GLTFLoader, `world.js`, `skin.js`, `physics.js`, `rig.js`, `puppetShop.js`, `combat_updated.js`, `combatPhysics.js`, `entity.js`, `entityControllers.js`, `encounters.js`. | Browser via `index.html`; every gameplay frame flows through it. | KEEP, but overgrown and fragile.                         |
 | `world.js`          | World/environment/collision | Builds rooms, outside area, stone materials, torches, GLB trees, ghost spheres, lighting, collision, encounter triggers, debug overlays, dispose utilities, label sprites.               | `worldCollision`, world materials, world object creation, world debug view, encounter trigger processing.                                          | Three.js, GLTFLoader.                                                                                                                                    | `main.js`, `skin.js` for `disposeObjectTree`.                    | KEEP. Good module boundary.                              |
 | `skin.js`           | Asset loading/puppet skin   | Loads GLB meshes, shows static previews, generates bones/weights, rigs imported meshes to puppet skeleton, syncs generated bones every frame, applies mesh opacity/wireframe.            | Imported mesh preview/skin pipeline.                                                                                                               | Three.js, GLTFLoader, `disposeObjectTree` from `world.js`. Gets app context by `initSkin()`.                                                             | `main.js`.                                                       | KEEP. Important but heuristic/fragile for production.    |
 | `physics.js`        | Body mechanics/math         | Pure formulas for jump state, jump pose weights, stride phase, pelvis walk/run values, interpolation helpers.                                                                            | Pure math only. No Three.js objects.                                                                                                               | None.                                                                                                                                                    | `main.js`.                                                       | KEEP. Good extraction.                                   |
 | `combatPhysics.js`  | Combat stance/math          | Pure math/data for low guard stance, combined center of mass, support box, stability margin, tipping angle.                                                                              | Combat stance profile and balance formulas.                                                                                                        | None.                                                                                                                                                    | `main.js`.                                                       | KEEP. Good extraction.                                   |
-| `combat_updated.js` | Combat/d20/oracle           | Combat encounter state machine, trigger cylinder, enemy GLB, enemy hitbox, health bar, d20 geometry/numbers/roll, battle audio crossfade, enemy hiding/evasion.                          | Private `combat` module state.                                                                                                                     | Three.js, GLTFLoader.                                                                                                                                    | `main.js`.                                                       | KEEP, but should eventually be split and renamed.        |
+| `combat_updated.js` | Combat encounter controller | Multi-encounter combat state machine, trigger cylinders, session pressure/evasion tier, public sword-hit API, oracle roll orchestration, combat audio refcount calls, and enemy lifecycle coordination. | Private `combat` session state, trigger zones, active-enemy set, roll/evasion bookkeeping.                                                          | Three.js, `oracleD20.js`, `enemy.js`. Audio manager is passed in by `main.js`.                                                                            | `main.js`.                                                       | KEEP, but rename/split further after entity work.        |
 | `encounters.js`     | Encounter data              | Data-driven non-blocking trigger definitions for world events.                                                                                                                           | `ENCOUNTER_DEFINITIONS`.                                                                                                                           | None.                                                                                                                                                    | `main.js` passes it to `world.js`.                               | KEEP. Uses current sky-moon action names.                |
 | `rig.js`            | Rig defaults                | Default body proportions and GUI slider ranges.                                                                                                                                          | `DEFAULT_RIG_DIMENSIONS`, `DEFAULT_RIG_HEIGHT`, `RIG_DIMENSION_CONTROLS`, `getRigStats()`.                                                         | None.                                                                                                                                                    | `main.js`, `puppetShop.js` indirectly through package data.      | KEEP.                                                    |
 | `puppetShop.js`     | Puppet workshop/storage     | Pure data module for creating, serializing, validating, saving, loading, listing, and deleting complete rig packages in localStorage.                                                    | Puppet package schema and local rig library.                                                                                                       | Browser `localStorage` passed by caller. No Three.js.                                                                                                    | `main.js`.                                                       | KEEP as dev/workshop support. Schema needs future split. |
+| `entity.js`         | Entity runtime scaffold     | Wraps player/NPC/enemy rigs as Entity records and creates spawned NPC/enemy skeletons from saved Puppet Shop rig packages.                                                               | Entity role names, entity descriptors, spawn factories, per-entity state, per-entity idle/skin update hook.                                         | Three.js. Receives skeleton, calibration, idle, and skin helpers by dependency injection from `main.js`.                                                  | `main.js`.                                                       | KEEP. New boundary; good next extraction target.         |
+| `entityControllers.js` | Entity control scaffold  | Defines controller types and controller dispatch shape for keyboard, static, and future AI-driven entities.                                                                               | Controller type names, keyboard/static controller stubs, `runController()`.                                                                         | None.                                                                                                                                                    | `main.js`, future entity update loop.                            | KEEP. Scaffold only; behavior mostly future work.        |
 
 ### Documentation And Scripts
 
@@ -85,7 +94,7 @@ Map first. Surgery later.
 State:
 
 - DOM: `#emp-loader`, `#emp-title`, `#scene-container`.
-- App constants: `APP_VERSION` at `main.js:87`.
+- App constants: `APP_VERSION` at `main.js:101`.
 
 Update loop:
 
@@ -271,6 +280,65 @@ Should not own:
 Risk note:
 
 - Skeleton creation is still inside `main.js`. This should eventually become its own puppet module.
+
+### Entity Layer
+
+The Entity layer is the current bridge between "the puppet rig" and "actors in
+the game world." It is additive: the player still uses the old `state.skeleton`
+and `controlState` path, while `state.player` wraps those same references as an
+Entity record.
+
+Current locations:
+
+- `entity.js`
+  - `EntityRole` names player/NPC/enemy/workshop-scratch roles.
+  - `createPlayerEntity()` wraps the existing player skeleton, skin,
+    `controlState`, and `rigTuning` without replacing them.
+  - `createEntityFactories()` receives main/skin helpers by dependency
+    injection and returns `spawnNPC`, `spawnEnemy`, and `update`.
+  - Spawned NPC/enemy entities get fresh skeleton roots, cloned rig tuning,
+    optional mesh binding from a saved Puppet Shop package, and their own
+    state record.
+- `entityControllers.js`
+  - `ControllerType` names keyboard/static/future controller roles.
+  - `createKeyboardController()` is a placeholder around the existing player
+    input path.
+  - `createStaticController()` keeps spawned entities idle for now.
+  - `runController()` is the future dispatch point.
+- `main.js`
+  - Imports the entity modules near the top of the file.
+  - Creates `state.player` and `state.entities` during startup.
+  - Exposes `empyreanSpawnNPC()`, `empyreanSpawnEnemy()`, and
+    `empyreanListEntities()` on `window` for development console work.
+  - Runs non-player entity idle/skin sync in the animation loop.
+
+State:
+
+- `state.player`
+- `state.entities`
+- Each entity's `skeleton`, `skin`, `state`, `rigTuning`, `controller`, and
+  `role`
+
+Update loop:
+
+- `main.js` still drives the player through `updateSkeleton()` and
+  `syncImportedSkinToPuppet()`.
+- Non-player entities are iterated after the player update and passed to the
+  injected entity factory `update()` method.
+- Current non-player update scope is idle motion plus skin sync only.
+
+Should not own:
+
+- Puppet Shop GUI controls.
+- Combat encounter decisions.
+- World collision rules.
+- Low Guard/sword swing animation ownership.
+
+Risk note:
+
+- This is the correct direction, but the runtime glue still lives in `main.js`.
+  A future `entityRuntime.js` split would be a low-risk organization step once
+  the current console spawn workflow is stable.
 
 ### Rigging And Calibration
 
@@ -1583,6 +1651,26 @@ After any future cleanup, run:
 
 ### Near-Term: Module Splits
 
+Recommended first module split after this documentation pass: extract an
+`entityRuntime.js` wrapper from `main.js`.
+
+Move:
+- `state.player` / `state.entities` setup
+- `createEntityFactories({...})` wiring
+- console helpers `empyreanSpawnNPC`, `empyreanSpawnEnemy`, and
+  `empyreanListEntities`
+- the non-player entity update loop currently inside `animate()`
+
+Why:
+This is lower risk than moving the core puppet builder because it mostly wraps
+newer code. It also gives NPC/enemy rig work a clean doorway before combat AI or
+entity walking grows.
+
+Risk:
+Low/medium. Verify by spawning an NPC/enemy from a saved Puppet Shop package,
+checking `empyreanListEntities()`, and confirming the player path still moves,
+runs, jumps, swings, and enters G53 normally.
+
 1. Split puppet creation out of `main.js`.
 
    Move:
@@ -1711,7 +1799,12 @@ Use these anchors when navigating the current code.
 
 ### Main Runtime
 
-- `main.js:87` - `APP_VERSION`
+- `main.js:101` - `APP_VERSION`
+- `main.js:91-99` - Entity imports
+- `main.js:8480` - Entity layer setup
+- `main.js:8511` - `empyreanSpawnNPC`
+- `main.js:8548` - `empyreanSpawnEnemy`
+- `main.js:8568` - `empyreanListEntities`
 - `main.js:655` - scene
 - `main.js:659` - camera
 - `main.js:808` - renderer

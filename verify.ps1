@@ -34,6 +34,7 @@ $RequiredFiles = @(
   "physics.js",
   "rig.js",
   "puppetShop.js",
+  "sword.js",
   "world.js",
   "skin.js",
   "audioManager.js",
@@ -41,6 +42,8 @@ $RequiredFiles = @(
   "oracleD20.js",
   "combat_updated.js",
   "enemy.js",
+  "entity.js",
+  "entityControllers.js",
   "encounters.js",
   "styles.css",
   "README.md",
@@ -65,6 +68,7 @@ node --check main.js
 node --check physics.js
 node --check rig.js
 node --check puppetShop.js
+node --check sword.js
 node --check world.js
 node --check skin.js
 node --check audioManager.js
@@ -72,6 +76,8 @@ node --check combatPhysics.js
 node --check oracleD20.js
 node --check combat_updated.js
 node --check enemy.js
+node --check entity.js
+node --check entityControllers.js
 node --check encounters.js
 Write-Host "  OK JavaScript syntax"
 
@@ -97,6 +103,12 @@ $AssetFiles = @(
   "assets/enemy.glb",
   "assets/sword.glb",
   "assets/plainSword.glb",
+  "assets/churchRough.glb",
+  "assets/cave.glb",
+  "assets/campfire.glb",
+  "assets/skull.glb",
+  "assets/rock1.glb",
+  "assets/rock2.glb",
   "assets/Jupiter.jpg",
   "assets/moon.glb",
   "assets/tree.glb",

@@ -22,14 +22,16 @@ If those three things work, the project is in a sane state.
 
 ## Current Build
 
-Current build: `0.1.54-alpha`
+Current build: `0.1.97-alpha`
 
 The project currently has:
 
 - a Three.js exploration world
-- three connected rooms
+- four connected rooms
 - an outside enclosure
 - moon.glb in the sky
+- moon.glb keeps its detailed shell, contains a self-lit inner glow sphere, and anchors moonlight direction
+- moon-aligned directional light prepared for a future day/night sky path
 - background audio
 - EMPYREAN stone title card loader
 - puppet skeleton
@@ -66,6 +68,11 @@ The project currently has:
 - Shift+W running cycle with tunable stride, bounce, lean, and arm pump
 - neutral body/knee facing correction so `rightPalm` reads as anatomical right and lower legs/feet face correctly
 - stone room textures and dim torch lighting for the interior rooms
+- four-room stone block footprint: nominal `48 x 48 x 24` scene units, or `48.1 x 48.1 x 24.1` including the current `0.1` wall/floor/ceiling thickness
+- churchRough.glb visual shell loaded around the four-room block from its authored CAD fixture zero
+- expanded outside enclosure: `384 x 384 x 36` scene units, centered on gameplay `X0/Z0`
+- cave.glb rough-draft world prop at `X20/Z-90` with simple proxy rectangle colliders
+- seeded outside landmark scatter using extra trees, dead trees, rocks, skulls, and campfires
 - alternating tree.glb/deadTree.glb props outside
 - solo workflow docs
 - checkpoint and verify scripts
@@ -152,7 +159,8 @@ Recommended flow:
 - Open `Combat`, set difficulty, press `1`, and test whether the sword scale/hand angle feels right.
 - Press `1` while standing still and check whether Low Guard reads as grounded instead of stiff.
 - Hold `Shift + W` in a clear space and tune `Motion > run stride`, `run foot lift`, and `run bounce` by eye.
-- Use `Sword Offsets` to tune `plainSword.glb` position, length, grip point, pitch, yaw, and roll live.
+- Use `Sword Offsets` to tune `plainSword.glb` position, length, grip point, grip trim X/Y/Z, pitch, yaw, and roll live.
+- Use `Sword Offsets > save preset` / `load preset` to preserve weapon-only setups without saving the entire rig.
 - Use `Mesh > relax visible arms` if a test pose or old saved arm command leaves the arms raised after rigging.
 - Press `Y`, move `devProbe`, and copy rig-local values for sword or hitbox experiments.
 - Press `F2`, tune a pivot at machine home, then press `F2` again to confirm gameplay restores cleanly.

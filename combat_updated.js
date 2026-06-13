@@ -13,24 +13,27 @@
       attemptCombatSwordHit
     - main.js calls init once and update each frame.
 
-  STEP 2 — MULTI-ENCOUNTER SHAPE (current rollout)
-  ------------------------------------------------
-  Two layers of state:
+  CURRENT MULTI-ENCOUNTER SHAPE
+  -----------------------------
+  Three layers of state:
 
     SESSION (singleton, in this file)
-      idle / starting / rolling / active / ending
+      idle / active / ending
+
+    ORACLE PRESENTATION (singleton, in this file)
+      delayed HUD/d20 replay of a roll that already affected gameplay
 
     PER-ENEMY (one per trigger zone, owned by enemy.js)
-      idle / spawning / active / hiding / dying / gone
+      idle / active / hiding / dying / gone
 
   Triggers are an array (COMBAT_CONFIG.triggers.zones). Each zone owns a
   cylinder and a pre-created enemy instance. When the rig walks into a zone:
 
-    - if session is idle    → cold start: visible d20 will run after audio fades in
-    - if session is active  → silent spawn: hidden d20 contributes to pressure
-    - if session is rolling → silent spawn while the first d20 is still settling
-    - if session is starting→ silent spawn during audio fade-in
-    - if session is ending  → cancel the fade-out, return to active
+    - if session is idle   -> cold start: roll immediately, apply evasion
+                              immediately, enter active combat immediately,
+                              and start a delayed non-blocking HUD omen
+    - if session is active -> silent spawn: hidden d20 contributes to pressure
+    - if session is ending -> cancel the fade-out, return to active
 
   Pressure: a session-level shared "evasion tier" that ALL living enemies use.
   Recomputed as the hardest tier across all currently-rolled enemies whenever
@@ -50,6 +53,38 @@
 import * as THREE from "three";
 import { createOracleD20 } from "./oracleD20.js";
 import { createCombatEnemy } from "./enemy.js";
+
+const ORACLE_ROLL_MESSAGES = [
+  "",
+  "You're fuct, girl.",
+  "Absolute garbage.",
+  "Deeply embarrassing.",
+  "Just... tragic.",
+  "Sit down.",
+  "Oof. Hard pass.",
+  "Pure mediocrity.",
+  "Not dead yet.",
+  "Room temperature.",
+  "Aggressively basic.",
+  "Barely legal.",
+  "Don't brag.",
+  "Lucky bastard.",
+  "Look at you.",
+  "Free pass.",
+  "Big ego energy.",
+  "Main character.",
+  "Okay, flex.",
+  "Pure filth.",
+  "Disgusting. Flex.",
+];
+
+const ORACLE_HUD_FONT_PROBE_MESSAGE = ORACLE_ROLL_MESSAGES[3];
+
+const ORACLE_PRESENTATION_CONFIG = {
+  // Encounter starts, gameplay result applies immediately, then the HUD omen
+  // appears a quarter-second later as presentation only.
+  hudDelaySeconds: 0.25,
+};
 
 // ===============================================================
 // CONFIG (tweak these freely — they are the only "knobs" you need)
@@ -175,6 +210,7 @@ const COMBAT_CONFIG = {
 const combat = {
   // Set during init by the caller.
   scene: null,
+  camera: null,
   controlState: null,
   rigTuning: null,
   audioManager: null,
@@ -188,32 +224,41 @@ const combat = {
   triggerZones: [],
 
   // ACTIVE enemies (subset of triggerZones[i].enemy values whose lifecycle
-  // is currently spawning / active / hiding / dying). Once an enemy goes to
-  // "gone", it is removed from this array and its zone re-arms.
+  // is currently active / hiding / dying). Once an enemy goes to "gone", it
+  // is removed from this array and its zone re-arms.
   enemies: [],
 
   // Each enemy's d20 roll tier (BEST/MODERATE/WORST). Used to recompute the
   // shared `pressureTier`. Stored as a Map so removal-on-death is O(1).
   enemyRolls: null, // initialized in initCombatEncounter
 
-  // The first enemy of a cold-started session — the one whose roll the
-  // VISIBLE d20 represents. Cleared when the visible roll lands. Subsequent
-  // enemies during the same session roll silently in fireTrigger().
-  coldStartEnemy: null,
+  // Presentation-only oracle HUD state. Combat results are applied before this
+  // starts; the d20/HUD are now an omen replay instead of a gameplay blocker.
+  oraclePresentation: {
+    active: false,
+    elapsed: 0,
+    rollValue: 0,
+    started: false,
+    messageShown: false,
+  },
 
   // Shared "hardest tier" across all rolled-and-living enemies. All living
   // enemies' effective evasion tier is set to this value via recomputePressure().
   pressureTier: null,
 
-  // DOM banner (created lazily; reused).
+  // DOM overlays. The banner is created lazily; the oracle HUD is defined in
+  // index.html and cached here the first time combat needs to toggle it.
   banner: null,
+  oracleRollHud: null,
+  oracleRollHudMessage: null,
+  oracleRollHudResizeListenerAttached: false,
 
   // TEMP / DEV: G53 rigging mode can suppress combat visuals while measuring.
   riggingVisibilitySuppressed: false,
   riggingVisibilitySnapshot: null,
 
   // Session state machine.
-  sessionPhase: "idle", // "idle" | "starting" | "rolling" | "active" | "ending"
+  sessionPhase: "idle", // "idle" | "active" | "ending"
   sessionElapsed: 0,
 };
 
@@ -230,6 +275,7 @@ export function initCombatEncounter(opts) {
     itself is still lazy-loaded on first spawn (see enemy.js loadGlbIfNeeded).
   */
   combat.scene = opts.scene;
+  combat.camera = opts.camera;
   combat.controlState = opts.controlState;
   combat.rigTuning = opts.rigTuning;
   combat.audioManager = opts.audioManager;
@@ -273,6 +319,7 @@ export function initCombatEncounter(opts) {
   combat.oracleD20 = createOracleD20({
     controlState: combat.controlState,
     rigTuning: combat.rigTuning,
+    camera: combat.camera,
   });
   combat.oracleD20.hide();
   combat.scene.add(combat.oracleD20.group);
@@ -289,8 +336,8 @@ export function updateCombatEncounter(delta) {
 
     Per-frame work, in order:
       1. Check all armed trigger zones for rig entry. Fire if entered.
-      2. Tick session-level work (audio fades, visible d20).
-      3. Tick every live enemy. Movement is allowed only during session "active".
+      2. Tick non-blocking presentation work (audio fade-in + HUD oracle).
+      3. Tick every live enemy. Movement is allowed once the session is active.
       4. Sweep enemies that just hit "gone" and re-arm their zones.
       5. If no live enemies remain, transition session → ending.
       6. Show the "Press Enter to strike" banner if the rig is in range of
@@ -320,8 +367,8 @@ export function updateCombatEncounter(delta) {
     zone.rigInside = isInside;
 
     // A zone is armed when its enemy is "idle" (never spawned this session)
-    // or "gone" (fully cleaned up). During spawning / active / hiding /
-    // dying, the zone is locked to its current enemy.
+    // or "gone" (fully cleaned up). During active / hiding / dying, the zone
+    // is locked to its current enemy.
     const enemyState = zone.enemy.getState();
     const armed = enemyState === "idle" || enemyState === "gone";
 
@@ -330,38 +377,14 @@ export function updateCombatEncounter(delta) {
     }
   }
 
-  // 2) Session-level work.
-  if (combat.sessionPhase === "starting") {
-    const audioProgress =
-      combat.audioManager?.updateCombatMusicFadeIn(delta) ??
-      Math.min(combat.sessionElapsed, 1);
-    if (audioProgress >= 1) {
-      enterSession_rolling();
-    }
-  } else if (combat.sessionPhase === "rolling") {
-    const roll = combat.oracleD20.update(delta);
-    if (roll.settledThisFrame) {
-      // Banner: nat 1 / nat 20 / tier label.
-      if (roll.rollValue === 20) {
-        showBanner("CRIT!", "#43d7c4");
-      } else if (roll.rollValue === 1) {
-        showBanner("CRIT FAIL!", "#ff6b6b");
-      } else {
-        const tier = computeEvasionTier(roll.rollValue);
-        showBanner(`Enemy evasion: ${tier}`, "#f7f0df");
-      }
-    }
-    if (roll.complete) {
-      // Apply the visible roll to the cold-start enemy, then recompute
-      // pressure across everyone alive (including any silent spawns that
-      // happened during fade-in/rolling).
-      if (combat.coldStartEnemy) {
-        applyRollToEnemy(combat.coldStartEnemy, roll.rollValue);
-        combat.coldStartEnemy = null;
-      }
-      enterSession_active();
-    }
-  } else if (combat.sessionPhase === "ending") {
+  // 2) Session-level work. Audio fade-in and the HUD oracle are now
+  //    presentation systems; neither one blocks active combat.
+  if (combat.sessionPhase === "active") {
+    combat.audioManager?.updateCombatMusicFadeIn(delta);
+  }
+  tickOraclePresentation(delta);
+
+  if (combat.sessionPhase === "ending") {
     const audioProgress =
       combat.audioManager?.updateCombatMusicFadeOut(delta) ??
       Math.min(combat.sessionElapsed, 1);
@@ -459,6 +482,9 @@ export function setCombatRiggingVisibilitySuppressed(suppressed = false) {
   if (combat.oracleD20) {
     combat.oracleD20.group.visible = snapshot.oracleD20;
   }
+  setOracleRollHudVisible(
+    combat.oraclePresentation.active && combat.oraclePresentation.started,
+  );
 }
 
 function applyCombatRiggingVisibilitySuppression() {
@@ -472,6 +498,7 @@ function applyCombatRiggingVisibilitySuppression() {
     zone.enemy?.hide();
   }
   combat.oracleD20?.hide();
+  setOracleRollHudVisible(false);
 }
 
 export function setCombatDifficulty(difficulty = "EASY") {
@@ -580,22 +607,26 @@ export function attemptCombatSwordHit({
 // TRIGGER FIRING (cold start vs. silent spawn)
 // ===============================================================
 
+function rollD20Value() {
+  return Math.floor(Math.random() * 20) + 1;
+}
+
 function fireTrigger(zone) {
   /*
     Called when the rig steps into an armed trigger zone. Branches on the
     current session phase:
 
-      idle    — cold start. Move session to "starting", play the audio fade-
-                in, prepare the visible d20 to roll after the fade. Tag this
-                enemy as coldStartEnemy so the visible roll lands on it.
+      idle    -> cold start. Roll immediately, apply that result to the enemy,
+                enter active combat immediately, then replay the result through
+                the delayed HUD/oracle presentation.
 
-      ending  — a new encounter began while the previous session's fade-out
+      ending  -> a new encounter began while the previous session's fade-out
                 was still running. Cancel the fade-out by snapping session
                 back to "active" (the audio manager has its own cancel-fade-
                 out path for the volume snap). The new enemy rolls silently.
 
-      starting / rolling / active — silent spawn. Roll a hidden d20, apply
-                to this enemy, recompute global pressure.
+      active  -> silent spawn. Roll a hidden d20, apply to this enemy, and
+                recompute global pressure.
 
     In every branch we call audioManager.startCombatMusic() to increment the
     refcount. The audio manager itself decides whether that translates into
@@ -610,11 +641,14 @@ function fireTrigger(zone) {
   combat.audioManager?.startCombatMusic();
 
   if (combat.sessionPhase === "idle") {
-    combat.sessionPhase = "starting";
+    const rollValue = rollD20Value();
+    applyRollToEnemy(zone.enemy, rollValue);
+    combat.sessionPhase = "active";
     combat.sessionElapsed = 0;
-    combat.coldStartEnemy = zone.enemy;
-    combat.oracleD20.hide(); // ensure hidden until enterSession_rolling
-    console.info(`[combat] cold start at trigger '${zone.id}'.`);
+    startOraclePresentation(rollValue);
+    console.info(
+      `[combat] cold start at trigger '${zone.id}' (d20=${rollValue}, pressure=${combat.pressureTier}).`,
+    );
     return;
   }
 
@@ -627,7 +661,7 @@ function fireTrigger(zone) {
   }
 
   // Silent d20: pick a value, derive tier, contribute to pressure.
-  const rollValue = Math.floor(Math.random() * 20) + 1;
+  const rollValue = rollD20Value();
   applyRollToEnemy(zone.enemy, rollValue);
   console.info(
     `[combat] silent spawn at '${zone.id}' (d20=${rollValue}, pressure=${combat.pressureTier}).`,
@@ -638,28 +672,82 @@ function fireTrigger(zone) {
 // SESSION STATE TRANSITIONS
 // ===============================================================
 
-function enterSession_rolling() {
+function startOraclePresentation(rollValue) {
   /*
-    Audio fade-in just completed. Make the d20 visible and start its roll.
-    The roll's tier will be applied to combat.coldStartEnemy when it lands
-    (see updateCombatEncounter's "rolling" branch).
+    Starts the non-blocking oracle HUD show.
+
+    Important ownership split:
+      - combat difficulty/evasion has ALREADY been applied to the enemy
+      - sessionPhase is ALREADY "active"
+      - this state only controls the delayed HUD/d20 replay
   */
-  combat.sessionPhase = "rolling";
-  combat.sessionElapsed = 0;
-  combat.oracleD20.startRoll();
-  console.info("[combat] session -> rolling (visible d20).");
+  combat.oraclePresentation.active = true;
+  combat.oraclePresentation.elapsed = 0;
+  combat.oraclePresentation.rollValue = rollValue;
+  combat.oraclePresentation.started = false;
+  combat.oraclePresentation.messageShown = false;
+  combat.oracleD20.hide();
+  clearOracleRollHudMessage();
+  setOracleRollHudVisible(false);
 }
 
-function enterSession_active() {
-  /*
-    Visible d20 just settled. Hide the die, clear the banner after a moment
-    so the player can read it, and let combat run.
-  */
-  combat.sessionPhase = "active";
-  combat.sessionElapsed = 0;
+function tickOraclePresentation(delta) {
+  const presentation = combat.oraclePresentation;
+  if (!presentation.active) {
+    return;
+  }
+
+  presentation.elapsed += delta;
+
+  let oracleDelta = delta;
+  if (!presentation.started) {
+    if (presentation.elapsed < ORACLE_PRESENTATION_CONFIG.hudDelaySeconds) {
+      return;
+    }
+
+    presentation.started = true;
+    oracleDelta = Math.max(
+      presentation.elapsed - ORACLE_PRESENTATION_CONFIG.hudDelaySeconds,
+      0,
+    );
+    combat.oracleD20.startRoll({ rollValue: presentation.rollValue });
+    setOracleRollHudVisible(true);
+    console.info(
+      `[combat] oracle HUD -> rolling (d20=${presentation.rollValue}).`,
+    );
+  }
+
+  const roll = combat.oracleD20.update(oracleDelta);
+  if (roll.settledThisFrame && !presentation.messageShown) {
+    presentation.messageShown = true;
+    setOracleRollHudMessageForRoll(roll.rollValue);
+  }
+
+  if (roll.complete) {
+    finishOraclePresentation();
+  }
+}
+
+function finishOraclePresentation() {
+  combat.oraclePresentation.active = false;
+  combat.oraclePresentation.elapsed = 0;
+  combat.oraclePresentation.rollValue = 0;
+  combat.oraclePresentation.started = false;
+  combat.oraclePresentation.messageShown = false;
   combat.oracleD20.hide();
-  setTimeout(() => clearBanner(), 1500);
-  console.info("[combat] session -> active.");
+  setOracleRollHudVisible(false);
+  console.info("[combat] oracle HUD -> complete.");
+}
+
+function cancelOraclePresentation() {
+  combat.oraclePresentation.active = false;
+  combat.oraclePresentation.elapsed = 0;
+  combat.oraclePresentation.rollValue = 0;
+  combat.oraclePresentation.started = false;
+  combat.oraclePresentation.messageShown = false;
+  combat.oracleD20.hide();
+  setOracleRollHudVisible(false);
+  clearOracleRollHudMessage();
 }
 
 function enterSession_ending() {
@@ -672,6 +760,7 @@ function enterSession_ending() {
   */
   combat.sessionPhase = "ending";
   combat.sessionElapsed = 0;
+  cancelOraclePresentation();
   console.info("[combat] session -> ending (no live enemies).");
 }
 
@@ -686,7 +775,7 @@ function enterSession_idle() {
   combat.sessionElapsed = 0;
   combat.pressureTier = null;
   combat.enemyRolls.clear();
-  combat.coldStartEnemy = null;
+  cancelOraclePresentation();
   for (const zone of combat.triggerZones) {
     if (zone.cylinder) zone.cylinder.visible = true;
   }
@@ -859,4 +948,145 @@ function clearBanner() {
   if (!combat.banner) return;
   combat.banner.style.opacity = "0";
   combat.banner.textContent = "";
+}
+
+// ===============================================================
+// ORACLE ROLL HUD  (passive DOM overlay shown only during visible d20 roll)
+// ===============================================================
+function ensureOracleRollHud() {
+  /*
+    The HUD box itself lives in index.html/styles.css because it is a screen
+    overlay, not a Three.js object. Combat only owns the timing: visible during
+    the oracle presentation, hidden everywhere else.
+
+    Fallback creation keeps older cached HTML from throwing if the script loads
+    before the new markup is present. The CSS rules still control geometry,
+    color, opacity, border, radius, and fade timing.
+  */
+  if (combat.oracleRollHud) {
+    return combat.oracleRollHud;
+  }
+
+  let hud = document.getElementById("oracle-roll-hud");
+  if (!hud) {
+    hud = document.createElement("div");
+    hud.id = "oracle-roll-hud";
+    hud.setAttribute("aria-hidden", "true");
+    document.body.appendChild(hud);
+  }
+  combat.oracleRollHud = hud;
+  return hud;
+}
+
+function ensureOracleRollHudMessage() {
+  /*
+    The message element is a child of the HUD panel. CSS owns its position,
+    color, opacity, and 105 mm proportional width. Combat only writes the text
+    that corresponds to the d20 result.
+  */
+  if (combat.oracleRollHudMessage) {
+    return combat.oracleRollHudMessage;
+  }
+
+  const hud = ensureOracleRollHud();
+  let message = document.getElementById("oracle-roll-hud-message");
+  if (!message) {
+    message = document.createElement("div");
+    message.id = "oracle-roll-hud-message";
+    message.setAttribute("aria-hidden", "true");
+    hud.appendChild(message);
+  }
+
+  combat.oracleRollHudMessage = message;
+  attachOracleHudResizeCalibration();
+  calibrateOracleHudMessageFont();
+  document.fonts?.ready?.then(() => calibrateOracleHudMessageFont());
+  return message;
+}
+
+function setOracleRollHudVisible(visible) {
+  const hud = ensureOracleRollHud();
+  ensureOracleRollHudMessage();
+  hud.classList.toggle("is-visible", Boolean(visible));
+}
+
+function setOracleRollHudMessageForRoll(rollValue) {
+  const message = ensureOracleRollHudMessage();
+  const safeRoll = Math.max(1, Math.min(20, Math.trunc(rollValue || 0)));
+  message.textContent = ORACLE_ROLL_MESSAGES[safeRoll] || "";
+  message.dataset.rollValue = String(safeRoll);
+  message.setAttribute("aria-hidden", message.textContent ? "false" : "true");
+  calibrateOracleHudMessageFont();
+}
+
+function clearOracleRollHudMessage() {
+  const message = ensureOracleRollHudMessage();
+  message.textContent = "";
+  delete message.dataset.rollValue;
+  message.setAttribute("aria-hidden", "true");
+}
+
+function attachOracleHudResizeCalibration() {
+  if (combat.oracleRollHudResizeListenerAttached) {
+    return;
+  }
+  combat.oracleRollHudResizeListenerAttached = true;
+  window.addEventListener("resize", () => calibrateOracleHudMessageFont(), {
+    passive: true,
+  });
+}
+
+function calibrateOracleHudMessageFont() {
+  /*
+    The request defines the longest placeholder, "Deeply embarrassing.", as
+    105 mm wide in the same 698.5 mm screen frame as the HUD. CSS gives the
+    message element that exact proportional width. This function measures the
+    Caesar Dressing rendering at a known test size and solves the font size:
+
+      targetWidthPx = messageElement.width
+      measuredPx    = width of probe text at probeFontPx
+      solvedFontPx  = probeFontPx * targetWidthPx / measuredPx
+
+    That gives us the height/aspect ratio the font naturally wants while
+    preserving the requested text width foundation.
+  */
+  const hud = combat.oracleRollHud;
+  const message = combat.oracleRollHudMessage;
+  if (!hud || !message) {
+    return;
+  }
+
+  const targetWidth = message.getBoundingClientRect().width;
+  if (!Number.isFinite(targetWidth) || targetWidth <= 0) {
+    return;
+  }
+
+  const probe = document.createElement("span");
+  probe.textContent = ORACLE_HUD_FONT_PROBE_MESSAGE;
+  probe.style.cssText = [
+    "position: fixed",
+    "left: -9999px",
+    "top: -9999px",
+    "visibility: hidden",
+    "white-space: nowrap",
+    "font-family: 'Caesar Dressing', Georgia, serif",
+    "font-weight: 400",
+    "font-size: 100px",
+    "letter-spacing: 0",
+    "line-height: 1",
+  ].join(";");
+
+  document.body.appendChild(probe);
+  const measuredWidth = probe.getBoundingClientRect().width;
+  probe.remove();
+
+  if (!Number.isFinite(measuredWidth) || measuredWidth <= 0) {
+    return;
+  }
+
+  const solvedFontSize = (100 * targetWidth) / measuredWidth;
+  hud.style.setProperty(
+    "--hud-message-font-size",
+    `${solvedFontSize.toFixed(3)}px`,
+  );
 }

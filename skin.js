@@ -22,7 +22,7 @@
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { disposeObjectTree } from "./world.js";
+import { disposeObjectTree } from "./world.js?v=0.1.97-alpha";
 
 export const DEFAULT_IMPORTED_MESH_PATH = "assets/Sigewynn.glb";
 
@@ -249,6 +249,47 @@ export function loadImportedMeshPreviewFromPath(path = DEFAULT_IMPORTED_MESH_PAT
   );
 }
 
+export function bindRiggedSkinFromPath(skeleton, tuning, path) {
+  /*
+    Async load + rig for non-player entities.
+
+    Returns a Promise resolving to a rigged skin descriptor:
+      { group, meshes, boneBindings, path }
+
+    The skin is NOT added to any parent or attached to state.importedSkin.
+    The caller (entity.js) decides where to add the group in the scene tree
+    and how to track it on the entity. This keeps skin.js's player-specific
+    state (state.importedSkin) untouched while supporting multiple entities.
+
+    Parameters:
+      skeleton: the entity's skeleton (must have createSkeleton-style joints)
+      tuning:   the entity's rigTuning clone (controls scale, offset, opacity)
+      path:     GLB asset path
+
+    Throws:
+      Rejects the Promise on load failure or empty GLB.
+  */
+  return new Promise((resolve, reject) => {
+    if (!path) {
+      reject(new Error("bindRiggedSkinFromPath: path is required"));
+      return;
+    }
+    gltfLoader.load(
+      path,
+      (gltf) => {
+        try {
+          const skin = createRiggedSkinFromGltf(gltf, path, skeleton, tuning);
+          resolve(skin);
+        } catch (error) {
+          reject(error);
+        }
+      },
+      undefined,
+      (error) => reject(error),
+    );
+  });
+}
+
 export function loadImportedMeshFromPath(path = DEFAULT_IMPORTED_MESH_PATH) {
   /*
     Loads a GLB/GLTF and immediately converts it into a generated SkinnedMesh.
@@ -381,7 +422,7 @@ function createPreviewMeshFromGltf(gltf, path) {
   return { group, gltf, meshes, path };
 }
 
-function createRiggedSkinFromGltf(gltf, path) {
+function createRiggedSkinFromGltf(gltf, path, skeletonArg = null, tuning = null) {
   /*
     Converts imported mesh geometry into generated skin.
 
@@ -394,17 +435,23 @@ function createRiggedSkinFromGltf(gltf, path) {
       6. Generate skinIndex and skinWeight attributes per vertex.
       7. Create THREE.SkinnedMesh and bind it to the generated skeleton.
 
+    skeletonArg + tuning: optional. Default to _ctx.state.skeleton and
+    _ctx.rigTuning (player). The entity layer passes its own skeleton + tuning
+    so non-player NPCs/enemies can have meshes bound to their own rigs.
+
     The original puppet joints remain the animator-facing controls. The
     generated bones are the mesh-facing deformation skeleton.
   */
+  const targetSkeleton = skeletonArg || _ctx.state.skeleton;
+  const targetTuning = tuning || _ctx.rigTuning;
   const sourceMeshes = collectImportableMeshes(gltf.scene);
 
   if (!sourceMeshes.length) {
     throw new Error("The GLB did not contain any Mesh objects.");
   }
 
-  const preparedMeshes = prepareImportedGeometries(sourceMeshes);
-  const bindPositions = getBindPositionsByJointKey();
+  const preparedMeshes = prepareImportedGeometries(sourceMeshes, targetTuning);
+  const bindPositions = getBindPositionsByJointKey(targetSkeleton);
   const skinMeshes = [];
   const boneBindings = [];
   const group = new THREE.Group();
@@ -413,7 +460,7 @@ function createRiggedSkinFromGltf(gltf, path) {
   group.userData.sourcePath = path;
 
   preparedMeshes.forEach((meshInfo) => {
-    const boneRig = createSkinBoneHierarchy();
+    const boneRig = createSkinBoneHierarchy(targetSkeleton);
 
     addGeneratedSkinWeights(
       meshInfo.geometry,
@@ -456,7 +503,7 @@ function collectImportableMeshes(root) {
   return meshes;
 }
 
-function prepareImportedGeometries(sourceMeshes) {
+function prepareImportedGeometries(sourceMeshes, tuning = null) {
   /*
     Prepares imported geometry for this workshop's coordinate space.
 
@@ -477,8 +524,13 @@ function prepareImportedGeometries(sourceMeshes) {
       targetHeight = skeleton height target from getImportedMeshTargetHeight()
       autoFitScale = targetHeight / rawHeight when auto-fit is on, otherwise 1
       finalScale   = autoFitScale * importedMeshScale slider
+
+    tuning parameter: optional. Defaults to _ctx.rigTuning (the player's). For
+    non-player entities, the entity's own rigTuning clone is passed so each
+    entity's mesh import sliders (scale, offset, rotation, auto-fit) are
+    honored without disturbing the workshop's live tuning.
   */
-  const { rigTuning } = _ctx;
+  const rigTuning = tuning || _ctx.rigTuning;
   const rotationMatrix = new THREE.Matrix4().makeRotationFromEuler(
     new THREE.Euler(
       rigTuning.importedMeshRotationX,
@@ -497,7 +549,7 @@ function prepareImportedGeometries(sourceMeshes) {
     return {
       name: mesh.name,
       geometry,
-      material: cloneImportedMaterial(mesh.material),
+      material: cloneImportedMaterial(mesh.material, rigTuning),
     };
   });
 
@@ -509,7 +561,7 @@ function prepareImportedGeometries(sourceMeshes) {
   const center      = combinedBox.getCenter(new THREE.Vector3());
   const rawHeight   = Math.max(0.001, combinedBox.max.y - combinedBox.min.y);
   const autoFitScale = rigTuning.importedMeshAutoFit
-    ? getImportedMeshTargetHeight() / rawHeight
+    ? getImportedMeshTargetHeight(rigTuning) / rawHeight
     : 1;
   const finalScale = autoFitScale * rigTuning.importedMeshScale;
   const offset = new THREE.Vector3(
@@ -538,14 +590,18 @@ function prepareImportedGeometries(sourceMeshes) {
   return prepared;
 }
 
-function cloneImportedMaterial(sourceMaterial) {
+function cloneImportedMaterial(sourceMaterial, tuning = null) {
   /*
     Clones the imported material so workshop opacity/wireframe sliders do not
     mutate the original GLTF material object.
 
     Falls back to a neutral gray MeshStandardMaterial if nothing is present.
+
+    tuning parameter: optional. Defaults to _ctx.rigTuning. Per-entity tuning
+    can be passed when binding non-player skins so each entity respects its
+    own opacity/wireframe setting.
   */
-  const { rigTuning } = _ctx;
+  const rigTuning = tuning || _ctx.rigTuning;
   const material = Array.isArray(sourceMaterial)
     ? sourceMaterial.map((entry) => entry.clone())
     : sourceMaterial?.clone?.() ||
@@ -567,16 +623,18 @@ function getMaterialList(material) {
   return Array.isArray(material) ? material : [material];
 }
 
-function getImportedMeshTargetHeight() {
+function getImportedMeshTargetHeight(tuning = null) {
   // headY is the top skeleton pivot; the wire head extends slightly above it.
-  return Math.max(1, _ctx.rigTuning.headY + 0.42);
+  // tuning: optional, defaults to _ctx.rigTuning for the player.
+  const rigTuning = tuning || _ctx.rigTuning;
+  return Math.max(1, rigTuning.headY + 0.42);
 }
 
 // =============================================================
 // INTERNAL — BIND POSITION AND BONE HIERARCHY
 // =============================================================
 
-function getBindPositionsByJointKey() {
+function getBindPositionsByJointKey(skeletonArg = null) {
   /*
     Computes bind-pose world positions for every puppet joint.
 
@@ -588,8 +646,12 @@ function getBindPositionsByJointKey() {
       worldPosition    = parentWorldPosition +
                          localBindPosition rotated by parentWorldQuaternion
       worldQuaternion  = parentWorldQuaternion * localBindQuaternion
+
+    skeletonArg: optional. Defaults to _ctx.state.skeleton (the player's). For
+    non-player entities, the entity's own skeleton is passed so bind positions
+    are computed against THAT joint hierarchy, not the workshop's.
   */
-  const { skeleton } = _ctx.state;
+  const skeleton = skeletonArg || _ctx.state.skeleton;
   const jointToKey = new Map(
     Object.entries(skeleton.joints).map(([key, joint]) => [joint, key]),
   );
@@ -621,7 +683,7 @@ function getBindPositionsByJointKey() {
   return bindPositions;
 }
 
-function createSkinBoneHierarchy() {
+function createSkinBoneHierarchy(skeletonArg = null) {
   /*
     Creates a real THREE.Bone hierarchy that mirrors the puppet joint hierarchy.
 
@@ -629,11 +691,15 @@ function createSkinBoneHierarchy() {
     separate lets the workshop controls stay as readable THREE.Group pivots
     while the mesh deformation system gets what Three.js expects.
 
+    skeletonArg: optional. Defaults to _ctx.state.skeleton. For non-player
+    entities, the entity's own skeleton is passed so the cloned bones mirror
+    THAT joint hierarchy.
+
     Returned maps:
       bonesByJointKey     = joint name -> generated Bone object
       boneIndexByJointKey = joint name -> index used by skinIndex attribute
   */
-  const { skeleton } = _ctx.state;
+  const skeleton = skeletonArg || _ctx.state.skeleton;
   const jointToKey = new Map(
     Object.entries(skeleton.joints).map(([key, joint]) => [joint, key]),
   );
@@ -875,16 +941,36 @@ export function syncImportedSkinToPuppet() {
     Generated bone: deformation object used by THREE.SkinnedMesh
 
     This bridge is what makes the imported mesh move with the workshop skeleton.
+
+    This wrapper preserves the player call site that animate() makes every
+    frame. Per-entity NPCs/enemies use syncSkinToSkeleton directly with their
+    own (skin, skeleton).
   */
   const { state } = _ctx;
-
   if (!state.importedSkin) {
     return;
   }
+  syncSkinToSkeleton(state.importedSkin, state.skeleton);
+}
 
-  state.importedSkin.boneBindings.forEach((bonesByJointKey) => {
+export function syncSkinToSkeleton(skin, skeleton) {
+  /*
+    Parameterized version of syncImportedSkinToPuppet used by the entity layer.
+
+    Copies the given skeleton's joint transforms onto the bones of the given
+    skin. Each entity has its own skeleton + skin pair, so this routes one
+    entity's joint motion to that entity's deformation bones without touching
+    any other entity's state.
+
+    Defensive: silently returns if either side is missing (NPC with no mesh,
+    or mid-rebuild state).
+  */
+  if (!skin?.boneBindings || !skeleton?.joints) {
+    return;
+  }
+  skin.boneBindings.forEach((bonesByJointKey) => {
     Object.entries(bonesByJointKey).forEach(([key, bone]) => {
-      const joint = state.skeleton.joints[key];
+      const joint = skeleton.joints[key];
 
       if (!joint || key === "root") {
         bone.position.copy(joint?.userData.bindLocalPosition || new THREE.Vector3());

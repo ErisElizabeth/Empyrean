@@ -29,7 +29,11 @@ body {
     dark passes keep it from reading as a flat gray browser screen.
   */
   background:
-    radial-gradient(circle at 50% 44%, rgba(255, 255, 255, 0.12), transparent 34%),
+    radial-gradient(
+      circle at 50% 44%,
+      rgba(255, 255, 255, 0.12),
+      transparent 34%
+    ),
     linear-gradient(135deg, #6f6f6f 0%, #888888 42%, #9a9a9a 58%, #747474 100%);
   display: flex;
   justify-content: center;
@@ -55,7 +59,9 @@ body {
   background:
     linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px),
     linear-gradient(0deg, rgba(0, 0, 0, 0.05) 1px, transparent 1px);
-  background-size: 52px 52px, 48px 48px;
+  background-size:
+    52px 52px,
+    48px 48px;
   opacity: 0.18;
   pointer-events: none;
 }
@@ -94,10 +100,7 @@ body {
   -webkit-background-clip: text;
   color: #444444;
   -webkit-text-fill-color: transparent;
-  font-family:
-    "Caesar Dressing",
-    Georgia,
-    serif;
+  font-family: "Caesar Dressing", Georgia, serif;
   font-size: clamp(4rem, 14vw, 12rem);
   font-weight: 400;
   letter-spacing: 0;
@@ -133,6 +136,115 @@ body {
   width: 100vw;
   height: 100vh;
   overflow: hidden;
+}
+
+#oracle-roll-hud {
+  /*
+    ORACLE ROLL HUD
+
+    Coordinate frame from the 2026-06-06 HUD request:
+      visible screen X = 698.5 mm
+      visible screen Y = 298.45 mm
+      screen origin     = upper-left corner
+      Y values          = negative downward, like a shop drawing
+
+    Requested corners:
+      P1 = X25.4  Y-25.4
+      P2 = X152.4 Y-25.4
+      P3 = X152.4 Y-88.9
+      P4 = X25.4  Y-88.9
+
+    CSS conversion:
+      left   = 25.4 / 698.5 * 100vw
+      top    = 25.4 / 298.45 * 100vh
+      width  = (152.4 - 25.4) / 698.5 * 100vw
+      height = (88.9 - 25.4) / 298.45 * 100vh
+
+    The border is drawn outside the panel with ::before, so the requested HUD
+    rectangle remains the exact panel body and the border does not shove the
+    panel inward.
+  */
+  --hud-left: 3.6364vw;
+  --hud-top: 8.5106vh;
+  --hud-width: 18.1818vw;
+  --hud-height: 21.277vh;
+  --hud-border-width: 0.1145vw; /* 0.8 / 698.5 * 100vw */
+  --hud-radius: 0.4545vw; /* 3.175 / 698.5 * 100vw */
+  --hud-message-width: 15.0322vw; /* 105 / 698.5 * 100vw */
+  --hud-message-font-size: 1.25vw; /* runtime-calibrated fallback */
+
+  position: fixed;
+  left: var(--hud-left);
+  top: var(--hud-top);
+  width: var(--hud-width);
+  height: var(--hud-height);
+  z-index: 40;
+  box-sizing: border-box;
+  pointer-events: none;
+  background: rgba(105, 150, 108, 0.45);
+  border-radius: var(--hud-radius);
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.3s ease,
+    visibility 0s linear 0.3s;
+}
+
+#oracle-roll-hud::before {
+  content: "";
+  position: absolute;
+  inset: calc(-1 * var(--hud-border-width));
+  border: var(--hud-border-width) solid #999b9b;
+  border-radius: calc(var(--hud-radius) + var(--hud-border-width));
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+#oracle-roll-hud.is-visible {
+  opacity: 1;
+  visibility: visible;
+  transition:
+    opacity 0.3s ease,
+    visibility 0s;
+}
+
+#oracle-roll-hud-message {
+  /*
+    ORACLE ROLL HUD MESSAGE
+
+    Message center:
+      X = 88.9 mm
+      Y = -57.15 mm
+
+    That is also the center of the HUD rectangle, so this child sits at 50% /
+    50% inside #oracle-roll-hud. The text box width is 105 mm in the same
+    proportional screen frame:
+
+      width = 105 / 698.5 * 100vw = 15.0322vw
+
+    combat_updated.js calibrates --hud-message-font-size against the placeholder
+    longest message, "Deeply embarrassing.", once the Caesar Dressing font is
+    available. The CSS fallback keeps the message usable if font measurement is
+    delayed or blocked.
+  */
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--hud-message-width);
+  transform: translate(-50%, -50%);
+  color: #f5f5f5;
+  opacity: 0.37;
+  font-family: "Caesar Dressing", Georgia, serif;
+  font-size: var(--hud-message-font-size);
+  font-weight: 400;
+  line-height: 1;
+  letter-spacing: 0;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+  pointer-events: none;
+  user-select: none;
 }
 
 canvas {

@@ -1,6 +1,5 @@
-﻿import * as THREE from "three";
+import * as THREE from "three";
 import GUI from "lil-gui";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { ENCOUNTER_DEFINITIONS } from "./encounters.js";
 import { createEmpyreanAudioManager } from "./audioManager.js";
 // Combat encounter prototype: wires /empyrean_dice (d20 roll) and the
@@ -51,6 +50,8 @@ import {
 } from "./puppetShop.js";
 import {
   GUIDE_COLOR,
+  applyWorldAtmosphere,
+  applyWorldSkyMode,
   buildExplorationWorld,
   buildGhostSpheres,
   buildLighting,
@@ -68,7 +69,7 @@ import {
   tickEncounterSystem,
   updateGhostSphereMotion,
   worldCollision,
-} from "./world.js";
+} from "./world.js?v=0.1.97-alpha";
 import {
   DEFAULT_IMPORTED_MESH_PATH,
   applyImportedMeshPresentation,
@@ -85,9 +86,30 @@ import {
   renderDefaultImportedMesh,
   rigCurrentImportedMesh,
   syncImportedSkinToPuppet,
-} from "./skin.js";
+  bindRiggedSkinFromPath,
+  syncSkinToSkeleton,
+} from "./skin.js?v=0.1.97-alpha";
+import {
+  EntityRole,
+  createPlayerEntity,
+  createEntityFactories,
+} from "./entity.js";
+import {
+  createKeyboardController,
+  createStaticController,
+} from "./entityControllers.js";
+import {
+  SWORD_OFFSET_LIMITS,
+  SWORD_TWEAKS,
+  createSwordController,
+  createSwordPresetState,
+  createSwordRuntimeState,
+  isLegacySwordDefaultTuning,
+  makeDefaultSwordRigTuning,
+  sanitizeSwordPresetValues,
+} from "./sword.js";
 
-const APP_VERSION = "0.1.54-alpha";
+const APP_VERSION = "0.1.97-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -96,10 +118,10 @@ const THREE_VERSION_PIN = "0.164.1";
 /*
   This is the "I have twenty minutes and want to safely experiment" section.
 
-  Most of the values a solo builder is likely to change are grouped here so you
-  do not have to hunt through the entire file. The rest of main.js still uses
-  named constants such as roomSize, outsideWallColor, and treeColliderRadius,
-  but many of those constants are now fed by this object.
+  Most player/camera/audio values a solo builder is likely to change are grouped
+  here so you do not have to hunt through the entire file. World atmosphere
+  colors now live in world.js, because sky/fog/grass/light palettes need to
+  evolve together for the future day/night/weather system.
 
   Editing rule of thumb:
     - Change values in SOLO_TWEAKS first.
@@ -118,19 +140,19 @@ const SOLO_TWEAKS = {
     collisionMargin: 0.08,
 
     // moveSpeed is forward/back keyboard speed in scene units per second.
-    moveSpeed: 1.55,
+    moveSpeed: 1.9375,
 
     // runSpeed is used while holding Shift and moving forward.
     // It is paired with runPhaseSpeed below so the feet cycle faster when the
     // player crosses the room faster.
-    runSpeed: 2.7,
+    runSpeed: 3.375,
 
     // walkPhaseSpeed is how quickly the leg cycle advances while walking.
-    walkPhaseSpeed: 6.4,
+    walkPhaseSpeed: 8.0,
 
     // runPhaseSpeed is how quickly the leg cycle advances while running.
     // Higher values mean faster turnover: more steps per second.
-    runPhaseSpeed: 9.8,
+    runPhaseSpeed: 12.25,
   },
 
   camera: {
@@ -155,10 +177,10 @@ const SOLO_TWEAKS = {
 
     // RMB-held mouse controls (gated by controlState.mouseLookActive).
     // Sensitivity is per-pixel of pointer movement.
-    mouseTurnSensitivity: 0.003,   // player yaw (mirrors A/D direction)
-    mousePitchSensitivity: 0.002,  // camera pitch (look up/down)
-    mouseInvertY: false,           // false: forward = look up at sky
-    maxPitch: Math.PI / 3,         // ~60deg; prevents flipping over the top
+    mouseTurnSensitivity: 0.003, // player yaw (mirrors A/D direction)
+    mousePitchSensitivity: 0.002, // camera pitch (look up/down)
+    mouseInvertY: false, // false: forward = look up at sky
+    maxPitch: Math.PI / 3, // ~60deg; prevents flipping over the top
 
     // RMB-held mouse wheel orbits instead of zooming.
     wheelOrbitSpeed: 0.45,
@@ -171,50 +193,6 @@ const SOLO_TWEAKS = {
     loop: true,
     autoplay: true,
   },
-};
-
-const SWORD_TWEAKS = {
-  /*
-    Right-hand sword prototype.
-
-    The sword is a GLB authored outside this project, so its source units and
-    axis orientation may not match Empyrean. The loader below measures the
-    imported model's bounding box, scales its longest side to targetLength, and
-    then attaches it to the rightPalm joint.
-
-    Tuning workflow:
-      1. Adjust targetLength if the sword feels too large/small.
-      2. Adjust localPosition to move the handle relative to the palm.
-      3. Adjust localRotation if the blade points the wrong way.
-
-    localRotation values are radians:
-      Math.PI * 0.5 = 90 degrees
-      Math.PI       = 180 degrees
-  */
-  assetPath: "assets/plainSword.glb",
-  targetLength: 1.02,
-  /*
-    gripFromLowerEnd is used by normalizeSwordModel().
-
-    Formula:
-      gripCoordinate = box.min[longAxis] + box.size[longAxis] * gripFromLowerEnd
-
-    where:
-      box.min[longAxis]       = low end of the sword along its longest axis
-      box.size[longAxis]      = full length of the sword along that axis
-      gripFromLowerEnd = 0.14 = put the hand origin 14% up from that low end
-
-    Why:
-      A sword held from its geometric center looks floaty. A sword held near the
-      hilt behaves more like a real prop. If a future sword imports upside down,
-      this one number is the first place to tune before changing arm animation.
-  */
-  gripFromLowerEnd: 0.14,
-  localPosition: [0.025, -0.015, 0.025],
-  localRotation: [-Math.PI * 0.5, 0, Math.PI * 0.04],
-  swingDurationMs: 520,
-  hitRange: 1.55,
-  hitArcRadians: Math.PI * 0.78,
 };
 
 const DEV_PROBE_TWEAKS = {
@@ -439,7 +417,6 @@ const sceneContainer = document.getElementById("scene-container");
 */
 sceneContainer.tabIndex = -1;
 const STORAGE_KEY = "empyrean.puppetWorkshop.rigTuning.v1";
-const WALL_COLOR = "#131111";
 
 // Slider ranges. These are intentionally broad because the rig lab should be
 // able to accommodate strange proportions, not only "normal" humanoids.
@@ -581,6 +558,9 @@ const RIG_TUNING_KEYS = [
   "swordAssetPath",
   "swordTargetLength",
   "swordGripFromLowerEnd",
+  "swordGripX",
+  "swordGripY",
+  "swordGripZ",
   "swordOffsetX",
   "swordOffsetY",
   "swordOffsetZ",
@@ -654,8 +634,6 @@ const RIG_TUNING_KEYS = [
 ];
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(WALL_COLOR);
-scene.fog = new THREE.FogExp2(WALL_COLOR, 0.018);
 
 const camera = new THREE.PerspectiveCamera(
   42,
@@ -673,6 +651,7 @@ ghostSpheres.forEach((sphere) => scene.add(sphere.group));
 // WORLD-OWNED SKY FOCAL POINT
 const skyMoon = buildSkyMoon();
 scene.add(skyMoon);
+let worldLighting = null;
 
 const rigHeightDisk = buildRigHeightDisk();
 scene.add(rigHeightDisk);
@@ -719,9 +698,9 @@ function buildRigHeightDisk() {
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(sceneContainer.clientWidth, sceneContainer.clientHeight);
-renderer.setClearColor(WALL_COLOR, 1);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 sceneContainer.appendChild(renderer.domElement);
+applyWorldAtmosphere(scene, renderer);
 
 const clock = new THREE.Clock();
 const rigTuning = loadSavedRigTuning(makeDefaultRigTuning());
@@ -804,7 +783,7 @@ const state = {
   importedMeshStatus: "no mesh loaded",
   /*
     meshBlobUrl holds the object URL created when a user browses for a local
-    file using the "open fileâ€¦" button. It is separate from
+    file using the "open file…" button. It is separate from
     rigTuning.importedMeshPath because:
       - The blob URL is a session-only memory reference. It cannot be saved or
         shared, and it must be revoked when a new file replaces it.
@@ -828,29 +807,8 @@ const state = {
   */
   walkArmSwing: { left: 0, right: 0 },
   lastVisibilityKey: "",
-  sword: {
-    /*
-      Runtime sword object.
-
-      group:
-        The normalized GLB wrapper that eventually becomes a child of
-        rightPalm. It is kept out of the disposable skeleton tree when the rig
-        rebuilds, so slider changes do not accidentally destroy the loaded GLB.
-
-      loading:
-        Prevents repeated GLTFLoader requests if the user taps 1 several times
-        while the sword asset is still coming in.
-
-      loaded:
-        Tells the equip flow whether it can attach immediately or needs to wait
-        for the loader callback.
-    */
-    group: null,
-    model: null,
-    loading: false,
-    loaded: false,
-    loadedAssetPath: "",
-  },
+  sword: createSwordRuntimeState(),
+  swordPreset: createSwordPresetState(),
   combatBalance: {
     /*
       Runtime balance estimate from combatPhysics.js.
@@ -887,6 +845,20 @@ const state = {
     leave G53 mode after committing calibration and relaxing the visible arms.
   */
   exitG53AfterImportedMeshRig: false,
+  /*
+    Prototype day/night cycle switch.
+
+    Pass 1 started as a moon-only switch. It now controls the first small
+    "night sky" bundle:
+      - visible skyMoon group
+      - moon DirectionalLight that lights the world
+      - moon PointLight helper that belongs to the moon presentation rig
+      - floating ghost spheres near the outside walls and ceiling
+
+    This is runtime-only state. It does not belong in rigTuning or saved puppet
+    packages because it is world/gameplay atmosphere, not skeleton calibration.
+  */
+  moonSystemEnabled: true,
 };
 
 const controlState = {
@@ -944,6 +916,17 @@ const controlState = {
   },
 };
 
+const swordController = createSwordController({
+  appVersion: APP_VERSION,
+  rigTuning,
+  runtime: state.sword,
+  presetState: state.swordPreset,
+  getRightPalm: () => state.skeleton?.joints?.rightPalm,
+  isWeaponEquipped: () => controlState.weaponEquipped,
+  disposeObjectTree,
+  updateGuiDisplays,
+});
+
 const mouseJointEditor = {
   /*
     Tiny pointer editing state for dragging joint pivot markers.
@@ -994,6 +977,7 @@ applyWorldDebugVisibility();
 */
 initCombatEncounter({
   scene,
+  camera,
   controlState,
   rigTuning,
   audioManager: empyreanAudio,
@@ -1023,15 +1007,7 @@ function makeDefaultRigTuning() {
     showEncounterLabels: true,
     encounterSystemEnabled: true,
     combatDifficulty: "EASY",
-    swordAssetPath: SWORD_TWEAKS.assetPath,
-    swordTargetLength: SWORD_TWEAKS.targetLength,
-    swordGripFromLowerEnd: SWORD_TWEAKS.gripFromLowerEnd,
-    swordOffsetX: SWORD_TWEAKS.localPosition[0],
-    swordOffsetY: SWORD_TWEAKS.localPosition[1],
-    swordOffsetZ: SWORD_TWEAKS.localPosition[2],
-    swordPitch: SWORD_TWEAKS.localRotation[0],
-    swordYaw: SWORD_TWEAKS.localRotation[1],
-    swordRoll: SWORD_TWEAKS.localRotation[2],
+    ...makeDefaultSwordRigTuning(),
     puppetRigName: "Sigewynn player rig",
     puppetRigNotes: "Reusable player/NPC skeleton package.",
     devProbeVisible: false,
@@ -1184,22 +1160,27 @@ function sanitizeRigTuning(candidate) {
     typeof clean.swordAssetPath === "string" && clean.swordAssetPath.trim()
       ? clean.swordAssetPath.trim()
       : defaults.swordAssetPath;
-  clean.swordTargetLength = Number.isFinite(clean.swordTargetLength)
-    ? THREE.MathUtils.clamp(clean.swordTargetLength, 0.05, 4)
-    : defaults.swordTargetLength;
-  clean.swordGripFromLowerEnd = Number.isFinite(clean.swordGripFromLowerEnd)
-    ? THREE.MathUtils.clamp(clean.swordGripFromLowerEnd, 0, 1)
-    : defaults.swordGripFromLowerEnd;
-  [
-    "swordOffsetX",
-    "swordOffsetY",
-    "swordOffsetZ",
-    "swordPitch",
-    "swordYaw",
-    "swordRoll",
-  ].forEach((key) => {
-    clean[key] = Number.isFinite(clean[key]) ? clean[key] : defaults[key];
-  });
+  Object.assign(clean, sanitizeSwordPresetValues(clean, defaults));
+
+  if (isLegacySwordDefaultTuning(clean)) {
+    Object.assign(clean, {
+      swordAssetPath: defaults.swordAssetPath,
+      swordTargetLength: defaults.swordTargetLength,
+      swordGripFromLowerEnd: defaults.swordGripFromLowerEnd,
+      swordGripX: defaults.swordGripX,
+      swordGripY: defaults.swordGripY,
+      swordGripZ: defaults.swordGripZ,
+      swordOffsetX: defaults.swordOffsetX,
+      swordOffsetY: defaults.swordOffsetY,
+      swordOffsetZ: defaults.swordOffsetZ,
+      swordPitch: defaults.swordPitch,
+      swordYaw: defaults.swordYaw,
+      swordRoll: defaults.swordRoll,
+    });
+    console.info(
+      "[sword] migrated legacy default offsets to current defaults.",
+    );
+  }
   clean.puppetRigName = normalizePuppetRigName(
     clean.puppetRigName,
     defaults.puppetRigName,
@@ -1375,13 +1356,16 @@ function saveRigTuningToBrowser() {
 
 function loadRigTuningFromBrowser() {
   // Reloads saved tuning, rebuilds the skeleton from it, then redraws the GUI.
+  // The mesh is loaded as a fully rigged skin (not a static preview) because
+  // the saved tuning represents a completed rigging setup, and the user's
+  // expectation is that "load saved" restores the rigged player end-to-end.
   assignRigTuningValues(loadSavedRigTuning(makeDefaultRigTuning()));
   state.runtimeArmBindRotationBackup = null;
   state.walkPhase = 0;
   state.walkArmSwing = { left: 0, right: 0 };
   rebuildSkeletonWorkshop();
   if (rigTuning.importedMeshPath) {
-    loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
+    loadImportedMeshFromPath(rigTuning.importedMeshPath);
   }
   updateGuiDisplays();
 }
@@ -1504,7 +1488,7 @@ function createJoint(name, position = [0, 0, 0]) {
 
     WHY THREE.Group, NOT THREE.Bone?
       Three.js Bones are built for SkinnedMesh and come with extra constraints.
-      Using plain Groups here keeps the puppet joints simple and inspectable â€”
+      Using plain Groups here keeps the puppet joints simple and inspectable —
       you can attach debug markers, labels, and bone lines to them without
       fighting the bone system. The actual Three.js Bone objects used for mesh
       skinning are created separately and just copy their transforms from these
@@ -1519,7 +1503,7 @@ function createJoint(name, position = [0, 0, 0]) {
         - Moving the pelvis carries both legs.
         - Moving the body joint carries everything.
 
-      You never need to manually update child positions when a parent moves â€”
+      You never need to manually update child positions when a parent moves —
       Three.js handles that through the matrix hierarchy.
 
     userData FIELDS (the rig's "ground truth" for every joint's rest pose):
@@ -1939,7 +1923,20 @@ function applyPuppetRigPackage(payload) {
   applyRelaxedVisiblePose();
 
   if (rigTuning.importedMeshPath) {
-    loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
+    /*
+      Load the mesh as a fully rigged skin, not a static preview.
+
+      Historical context: this used to call loadImportedMeshPreviewFromPath,
+      which displayed the raw GLB at its modeling pose without binding to the
+      skeleton. The visible result was a T-pose mesh that translated with the
+      skeleton root but did not deform with arm/leg animation -- "floating
+      Sigewynn impending doom" per a 2026-05-29 bug report.
+
+      The save captures a complete rigged setup. The load should restore
+      that setup, including the rigged skin. Use loadImportedMeshFromPath so
+      the mesh comes back skinned and animation-driven.
+    */
+    loadImportedMeshFromPath(rigTuning.importedMeshPath);
   }
 
   updatePuppetShopStatus(`loaded ${summarizePuppetRigPackage(payload)}`);
@@ -2294,7 +2291,7 @@ function applyJointPointOffsets() {
 
     where:
       baseBindLocalPosition = original joint position from createSkeleton()
-                              â€” never changes after creation
+                              — never changes after creation
       offset                = the value from the Joint Point Offset sliders
                               (or from a mouse drag, which writes the same value)
 
@@ -2304,7 +2301,7 @@ function applyJointPointOffsets() {
         updates as soon as a slider or drag changes an offset
 
     WHY offset-from-base instead of storing an absolute position?
-      An absolute position would make export/import fragile â€” if the base
+      An absolute position would make export/import fragile — if the base
       skeleton proportions change, a saved position that was once correct would
       place the joint in the wrong spot. Storing the offset relative to the
       base means:
@@ -2317,23 +2314,39 @@ function applyJointPointOffsets() {
     these changes immediately (e.g., during a drag event), call:
       state.skeleton.root.updateMatrixWorld(true)
   */
-  JOINT_ORDER.forEach((jointName) => {
-    const joint = state.skeleton?.joints[jointName];
+  applyJointPointOffsetsTo(state.skeleton, rigTuning);
+  state.debugView?.refreshBones?.();
+  updateAxisMarkerAttachment();
+}
 
-    if (!joint) {
+function applyJointPointOffsetsTo(skeleton, tuning) {
+  /*
+    Parameterized version of applyJointPointOffsets used by the entity layer.
+
+    Same math, but operates on the passed-in skeleton + tuning instead of the
+    globals. This lets entity.js spawn NPCs/enemies with their own skeletons
+    and apply each entity's own jointPointOffsets without disturbing the
+    player skeleton or rigTuning.
+
+    Does NOT call state.debugView.refreshBones or updateAxisMarkerAttachment;
+    those touch player-specific helpers and would be wrong for non-player
+    skeletons.
+  */
+  if (!skeleton?.joints || !tuning?.jointPointOffsets) {
+    return;
+  }
+  JOINT_ORDER.forEach((jointName) => {
+    const joint = skeleton.joints[jointName];
+    if (!joint || !joint.userData?.baseBindLocalPosition) {
       return;
     }
-
-    const offset = getJointPointOffset(jointName);
+    const offset = tuning.jointPointOffsets[jointName] || { x: 0, y: 0, z: 0 };
     joint.userData.bindLocalPosition.copy(joint.userData.baseBindLocalPosition);
     joint.userData.bindLocalPosition.add(
       new THREE.Vector3(offset.x, offset.y, offset.z),
     );
     joint.position.copy(joint.userData.bindLocalPosition);
   });
-
-  state.debugView?.refreshBones?.();
-  updateAxisMarkerAttachment();
 }
 
 function setJointPointOffsetFromLocalPosition(jointName, desiredLocal) {
@@ -2422,14 +2435,28 @@ function applyBindRotationOffsets() {
     Animation functions still pass "motion deltas" like walk swing or arm lift;
     dampJointRotation adds those deltas on top of this bind rotation.
   */
-  BIND_ROTATION_JOINTS.forEach((jointName) => {
-    const joint = state.skeleton?.joints[jointName];
+  applyBindRotationOffsetsTo(state.skeleton, rigTuning);
+}
 
+function applyBindRotationOffsetsTo(skeleton, tuning) {
+  /*
+    Parameterized version used by the entity layer. Same math as
+    applyBindRotationOffsets but on the given skeleton + tuning so each entity
+    can have its own rest-pose calibration.
+  */
+  if (!skeleton?.joints || !tuning?.bindRotationOffsets) {
+    return;
+  }
+  BIND_ROTATION_JOINTS.forEach((jointName) => {
+    const joint = skeleton.joints[jointName];
     if (!joint) {
       return;
     }
-
-    const offset = getBindRotationOffset(jointName);
+    const offset = tuning.bindRotationOffsets[jointName] || {
+      x: 0,
+      y: 0,
+      z: 0,
+    };
     const offsetEuler = new THREE.Euler(offset.x, offset.y, offset.z);
     const offsetQuaternion = new THREE.Quaternion().setFromEuler(offsetEuler);
 
@@ -2649,7 +2676,9 @@ function armBindPoseLooksLikeRiggingReference() {
     for getVisibleArmPoseDelta(), which needs to know when a visible gameplay
     target should compensate for a lifted bind/reference arm.
   */
-  return armRotationTableLooksLikeRiggingReference(rigTuning.bindRotationOffsets);
+  return armRotationTableLooksLikeRiggingReference(
+    rigTuning.bindRotationOffsets,
+  );
 }
 
 function getVisibleArmPoseDelta(jointName, visibleTargetEuler) {
@@ -2743,9 +2772,7 @@ function clearArmControlStateForRelaxedPose() {
   controlState.swordSwingStart = 0;
   controlState.swordSwingUntil = 0;
 
-  if (state.sword.group) {
-    state.sword.group.visible = false;
-  }
+  swordController.hide();
 }
 
 function setJointRotationFromBindDelta(joint, targetEuler) {
@@ -2938,8 +2965,7 @@ function handleImportedMeshRigged(details = {}) {
   const shouldExitG53 =
     state.exitG53AfterImportedMeshRig && state.g53RiggingMode.active;
   const shouldRelaxVisibleGameplayArms =
-    hadTemporaryArmPose ||
-    armBindPoseLooksLikeRiggingReference();
+    hadTemporaryArmPose || armBindPoseLooksLikeRiggingReference();
 
   if (shouldExitG53) {
     exitG53RiggingMode();
@@ -3074,9 +3100,9 @@ function resetSkeletonToBindPose() {
     Resets every puppet joint to its current bind pose.
 
     "Bind pose" here means the stored rest values in userData:
-      bindLocalPosition   â€” base position + slider offsets
-      bindLocalQuaternion â€” base rotation + bind-pose rotation sliders
-      bindLocalScale      â€” always (1,1,1) unless deliberately changed
+      bindLocalPosition   — base position + slider offsets
+      bindLocalQuaternion — base rotation + bind-pose rotation sliders
+      bindLocalScale      — always (1,1,1) unless deliberately changed
 
     WHAT THIS DOES NOT DO:
       It does NOT erase slider offsets or bind rotations. Those live in
@@ -3085,9 +3111,9 @@ function resetSkeletonToBindPose() {
       at rest."
 
     WHEN IT IS CALLED:
-      - After applyJointPointOffsets() â€” so the new pivot positions take effect
-      - After applyBindRotationOffsets() â€” so the new rest pose takes effect
-      - In handleJointEditPointerMove â€” at the end of every drag step to
+      - After applyJointPointOffsets() — so the new pivot positions take effect
+      - After applyBindRotationOffsets() — so the new rest pose takes effect
+      - In handleJointEditPointerMove — at the end of every drag step to
         establish a clean base that the next animation frame can layer motion on
 
     Animation functions (walk, idle, jump) then run AFTER this reset and add
@@ -3431,7 +3457,7 @@ function enterG53RiggingMode() {
 
     if (controlState.weaponEquipped) {
       controlState.weaponEquipped = false;
-      state.sword.group && (state.sword.group.visible = false);
+      swordController.hide();
     }
 
     rigTuning.idleMotion = false;
@@ -3519,6 +3545,7 @@ function exitG53RiggingMode() {
   syncSwordAttachment();
   selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
   applyVisibility();
+  applyMoonSystemEnabled();
   updateGuiDisplays();
   updateG53RiggingStatus("OFF");
   console.info(
@@ -3558,30 +3585,36 @@ function buildGui() {
   /*
     GUI panel structure (top to bottom):
 
-      Mesh              â€” file browser, workflow steps, appearance, transform
-      Puppet Shop       â€” named reusable rig packages and local rig library
-      Rig Dimensions    â€” body proportions (sliders)
-      Pivot Offsets     â€” per-joint XYZ position nudges
-      Bind Pose         â€” per-joint rest-pose rotations for mesh alignment
-      Motion            â€” idle, walk, jump, damping, presets
-      Skeleton Lab      â€” debug markers, labels, collider ring
-      Workshop          â€” root alignment, mouse point editing, axis marker
-      G53 Rigging Mode  â€” temporary machine-home setup for pivot editing
-      Save              â€” browser save/load and JSON export
-      World Debug       â€” collision and encounter zone overlays
-      Combat            â€” sword buttons and enemy difficulty
-      Sword Offsets     â€” live sword path, scale, grip, position, rotation
+      Mesh              — file browser, workflow steps, appearance, transform
+      Puppet Shop       — named reusable rig packages and local rig library
+      Rig Dimensions    — body proportions (sliders)
+      Pivot Offsets     — per-joint XYZ position nudges
+      Bind Pose         — per-joint rest-pose rotations for mesh alignment
+      Motion            — idle, walk, jump, damping, presets
+      Skeleton Lab      — debug markers, labels, collider ring
+      Workshop          — root alignment, mouse point editing, axis marker
+      G53 Rigging Mode  — temporary machine-home setup for pivot editing
+      Save              — browser save/load and JSON export
+      World Debug       — collision and encounter zone overlays
+      Combat            — sword buttons and enemy difficulty
+      Sword Offsets     — live sword path, scale, grip, position, rotation
 
     All folders except Mesh start closed so the panel is not overwhelming on
     first open. Click a folder header to expand it.
   */
-  state.gui = new GUI({ title: "Empyrean Puppet Workshop" });
+  /*
+    GUI title signals that the workshop is a dev tool, not the gameplay.
+    The "(editing: Player)" suffix names the current edit target. When edit-
+    target switching lands in Step 4 of the entity refactor, this label will
+    update to reflect whichever entity the workshop is currently authoring.
+  */
+  state.gui = new GUI({ title: "Empyrean Puppet Workshop (editing: Player)" });
   state.guiFolders = {};
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // MESH
   // Everything you need to load, align, and rig a character mesh in one place.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   const meshFolder = state.gui.addFolder("Mesh");
   state.guiFolders.mesh = meshFolder;
 
@@ -3589,7 +3622,7 @@ function buildGui() {
     FILE BROWSER BUTTON
     Opens the operating system's native file picker filtered to .glb and .gltf.
     Selecting a file:
-      1. Creates a temporary blob URL (session-only â€” not saved with the rig).
+      1. Creates a temporary blob URL (session-only — not saved with the rig).
       2. Stores the filename in the "path" field for reference.
       3. Automatically loads a static preview so you can see the mesh right away.
 
@@ -3638,21 +3671,21 @@ function buildGui() {
       },
       "openFile",
     )
-    .name("open fileâ€¦");
+    .name("open file…");
 
   /*
-    PATH FIELD â€” fallback for typing a relative path like "assets/Sigewynn.glb"
+    PATH FIELD — fallback for typing a relative path like "assets/Sigewynn.glb"
     or for re-loading a path that was exported with the rig package.
     When the file browser is used, this shows the chosen filename.
   */
   addGuiController(meshFolder, rigTuning, "importedMeshPath").name("path");
 
-  // â”€â”€ WORKFLOW â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── WORKFLOW ─────────────────────────────────────────────────────────────────
   /*
     Standard two-step workflow:
-      1 Â· preview  â€” loads the mesh as a static visual reference.
+      1 · preview  — loads the mesh as a static visual reference.
                      Drag skeleton pivots to match it without skinning yet.
-      2 Â· rig      â€” generates skin weights from the current pivot positions
+      2 · rig      — generates skin weights from the current pivot positions
                      and drives the mesh from the skeleton.
 
     quick rig skips preview and rigs immediately. Useful when pivots are already
@@ -3675,7 +3708,7 @@ function buildGui() {
   meshFolder.add({ fn: rerigImportedMesh }, "fn").name("re-rig");
   meshFolder.add({ fn: clearImportedMesh }, "fn").name("clear mesh");
 
-  // â”€â”€ APPEARANCE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── APPEARANCE ────────────────────────────────────────────────────────────────
   // Controls how the mesh looks while you are placing pivots.
   const appearanceFolder = meshFolder.addFolder("Appearance");
   addGuiController(appearanceFolder, rigTuning, "importedMeshVisible")
@@ -3696,7 +3729,7 @@ function buildGui() {
     .onChange(applyImportedMeshPresentation);
   appearanceFolder.close();
 
-  // â”€â”€ TRANSFORM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── TRANSFORM ─────────────────────────────────────────────────────────────────
   // Fine-tune the mesh position, scale, and orientation relative to the skeleton.
   const transformFolder = meshFolder.addFolder("Transform");
   addGuiController(transformFolder, rigTuning, "importedMeshAutoFit")
@@ -3774,7 +3807,7 @@ function buildGui() {
     .onFinishChange(refreshImportedMeshReference);
   transformFolder.close();
 
-  // â”€â”€ RIG PACKAGE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── RIG PACKAGE ───────────────────────────────────────────────────────────────
   // Export/import both rig tuning and mesh binding settings as a JSON bundle.
   meshFolder
     .add({ fn: exportRigPackageToConsole }, "fn")
@@ -3824,11 +3857,11 @@ function buildGui() {
     .name("paste complete rig");
   puppetShopFolder.close();
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // RIG DIMENSIONS
-  // Changes here rebuild the skeleton hierarchy from scratch. Drag slowly â€”
+  // Changes here rebuild the skeleton hierarchy from scratch. Drag slowly —
   // each slider fires rebuildSkeletonWorkshop on release.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   const dimensionFolder = state.gui.addFolder("Rig Dimensions");
   state.guiFolders.dimensions = dimensionFolder;
   RIG_DIMENSION_CONTROLS.forEach(([key, min, max, step]) => {
@@ -3838,21 +3871,21 @@ function buildGui() {
   });
   dimensionFolder.close();
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // PIVOT OFFSETS  +  BIND POSE
   // buildJointPointControls and buildBindRotationControls each create their own
   // top-level folder. The "reset bind pose" button lives in the Bind Pose folder
   // instead of a separate one-button folder.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   state.guiFolders.jointPointControls = buildJointPointControls(state.gui);
   state.guiFolders.bindRotationControls = buildBindRotationControls(state.gui);
   state.guiFolders.bindRotationControls
     .add({ fn: resetSkeletonToBindPose }, "fn")
     .name("reset bind pose");
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // MOTION
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   const motionFolder = state.gui.addFolder("Motion");
   state.guiFolders.motion = motionFolder;
   addGuiController(motionFolder, rigTuning, "presetName", Object.keys(PRESETS))
@@ -4020,11 +4053,11 @@ function buildGui() {
   ).name("phase offset");
   motionFolder.close();
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // SKELETON LAB
   // Toggle debug helpers: joint pivot spheres, bone lines, labels, collider ring.
   // R key also toggles the lab. L key toggles joint labels.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   const labFolder = state.gui.addFolder("Skeleton Lab");
   state.guiFolders.visibility = labFolder;
   addGuiController(labFolder, rigTuning, "labEnabled")
@@ -4047,10 +4080,10 @@ function buildGui() {
     .onChange(applyVisibility);
   labFolder.close();
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // WORKSHOP
   // Root alignment offsets, mouse-drag joint editing, label and axis controls.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   const alignmentFolder = state.gui.addFolder("Workshop");
   state.guiFolders.alignment = alignmentFolder;
   addGuiController(
@@ -4188,10 +4221,10 @@ function buildGui() {
   devProbeFolder.add({ fn: copyDevProbeRigLocal }, "fn").name("copy rig local");
   devProbeFolder.close();
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // SAVE
   // Browser save/load and JSON export. Tuning is auto-loaded on page refresh.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   const saveFolder = state.gui.addFolder("Save");
   state.guiFolders.save = saveFolder;
   saveFolder.add({ fn: saveRigTuningToBrowser }, "fn").name("save tuning");
@@ -4203,11 +4236,11 @@ function buildGui() {
   saveFolder.add({ fn: clearSavedRigTuning }, "fn").name("clear saved");
   saveFolder.close();
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   // WORLD DEBUG
   // Draws invisible collision shapes and encounter zones so you can see where
   // things are without guessing. Does not affect gameplay or physics.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ─────────────────────────────────────────────────────────────────────────────
   const worldDebugFolder = state.gui.addFolder("World Debug");
   state.guiFolders.worldDebug = worldDebugFolder;
   addGuiController(worldDebugFolder, rigTuning, "showWorldDebug")
@@ -4267,44 +4300,124 @@ function buildGui() {
   addGuiController(swordFolder, rigTuning, "swordAssetPath")
     .name("asset path")
     .onFinishChange(reloadSwordAsset);
-  addGuiController(swordFolder, rigTuning, "swordTargetLength", 0.05, 4, 0.01)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordTargetLength",
+    SWORD_OFFSET_LIMITS.targetLength.min,
+    SWORD_OFFSET_LIMITS.targetLength.max,
+    SWORD_OFFSET_LIMITS.targetLength.step,
+  )
     .name("length / scale")
     .onChange(refreshSwordOffsetPresentation);
-  addGuiController(swordFolder, rigTuning, "swordGripFromLowerEnd", 0, 1, 0.01)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordGripFromLowerEnd",
+    SWORD_OFFSET_LIMITS.gripFromLowerEnd.min,
+    SWORD_OFFSET_LIMITS.gripFromLowerEnd.max,
+    SWORD_OFFSET_LIMITS.gripFromLowerEnd.step,
+  )
     .name("grip point")
     .onChange(refreshSwordOffsetPresentation);
-  addGuiController(swordFolder, rigTuning, "swordOffsetX", -1, 1, 0.005)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordGripX",
+    SWORD_OFFSET_LIMITS.gripTrim.min,
+    SWORD_OFFSET_LIMITS.gripTrim.max,
+    SWORD_OFFSET_LIMITS.gripTrim.step,
+  )
+    .name("grip trim X")
+    .onChange(refreshSwordOffsetPresentation);
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordGripY",
+    SWORD_OFFSET_LIMITS.gripTrim.min,
+    SWORD_OFFSET_LIMITS.gripTrim.max,
+    SWORD_OFFSET_LIMITS.gripTrim.step,
+  )
+    .name("grip trim Y")
+    .onChange(refreshSwordOffsetPresentation);
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordGripZ",
+    SWORD_OFFSET_LIMITS.gripTrim.min,
+    SWORD_OFFSET_LIMITS.gripTrim.max,
+    SWORD_OFFSET_LIMITS.gripTrim.step,
+  )
+    .name("grip trim Z")
+    .onChange(refreshSwordOffsetPresentation);
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordOffsetX",
+    SWORD_OFFSET_LIMITS.localPosition.min,
+    SWORD_OFFSET_LIMITS.localPosition.max,
+    SWORD_OFFSET_LIMITS.localPosition.step,
+  )
     .name("pos X")
     .onChange(syncSwordAttachment);
-  addGuiController(swordFolder, rigTuning, "swordOffsetY", -1, 1, 0.005)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordOffsetY",
+    SWORD_OFFSET_LIMITS.localPosition.min,
+    SWORD_OFFSET_LIMITS.localPosition.max,
+    SWORD_OFFSET_LIMITS.localPosition.step,
+  )
     .name("pos Y")
     .onChange(syncSwordAttachment);
-  addGuiController(swordFolder, rigTuning, "swordOffsetZ", -1, 1, 0.005)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordOffsetZ",
+    SWORD_OFFSET_LIMITS.localPosition.min,
+    SWORD_OFFSET_LIMITS.localPosition.max,
+    SWORD_OFFSET_LIMITS.localPosition.step,
+  )
     .name("pos Z")
     .onChange(syncSwordAttachment);
   addGuiController(
     swordFolder,
     rigTuning,
     "swordPitch",
-    -Math.PI,
-    Math.PI,
-    0.005,
+    SWORD_OFFSET_LIMITS.localRotation.min,
+    SWORD_OFFSET_LIMITS.localRotation.max,
+    SWORD_OFFSET_LIMITS.localRotation.step,
   )
     .name("pitch X")
     .onChange(syncSwordAttachment);
-  addGuiController(swordFolder, rigTuning, "swordYaw", -Math.PI, Math.PI, 0.005)
+  addGuiController(
+    swordFolder,
+    rigTuning,
+    "swordYaw",
+    SWORD_OFFSET_LIMITS.localRotation.min,
+    SWORD_OFFSET_LIMITS.localRotation.max,
+    SWORD_OFFSET_LIMITS.localRotation.step,
+  )
     .name("yaw Y")
     .onChange(syncSwordAttachment);
   addGuiController(
     swordFolder,
     rigTuning,
     "swordRoll",
-    -Math.PI,
-    Math.PI,
-    0.005,
+    SWORD_OFFSET_LIMITS.localRotation.min,
+    SWORD_OFFSET_LIMITS.localRotation.max,
+    SWORD_OFFSET_LIMITS.localRotation.step,
   )
     .name("roll Z")
     .onChange(syncSwordAttachment);
+  addGuiController(swordFolder, state.swordPreset, "name").name("preset name");
+  swordFolder.add({ fn: saveSwordPresetToBrowser }, "fn").name("save preset");
+  swordFolder.add({ fn: loadSwordPresetFromBrowser }, "fn").name("load preset");
+  swordFolder
+    .add({ fn: deleteSwordPresetFromBrowser }, "fn")
+    .name("delete preset");
+  swordFolder.add({ fn: listSwordPresetsToConsole }, "fn").name("list presets");
+  swordFolder.add({ fn: copySwordPresetJson }, "fn").name("copy preset JSON");
   swordFolder.add({ fn: reloadSwordAsset }, "fn").name("reload sword");
   swordFolder.add({ fn: resetSwordOffsets }, "fn").name("reset sword offsets");
   swordFolder.close();
@@ -4591,8 +4704,28 @@ function animate(currentTime) {
   updateJumpPhysics(delta);
   updateSkeleton(delta, elapsed, currentTime);
   syncImportedSkinToPuppet();
+  /*
+    Per-entity animation pass (Step 3a). Iterates spawned non-player entities
+    and runs their idle motion + skin sync. The player is excluded here
+    because updateSkeleton + syncImportedSkinToPuppet above already drove it;
+    routing the player through both paths would double-apply idle motion and
+    show as drift jitter.
+
+    Scope this step: idle breathing + head drift only. Walk/run/combat/jump
+    for non-player entities lands in Step 3b.
+  */
+  if (state.entities && state.entities.length > 1) {
+    for (let i = 0; i < state.entities.length; i += 1) {
+      const entity = state.entities[i];
+      if (!entity || entity === state.player) {
+        continue;
+      }
+      entityFactories.update(entity, delta, elapsed);
+    }
+  }
   updateDevProbeReadout();
   updateGhostSphereMotion(ghostSpheres, elapsed);
+  worldLighting?.update?.();
   updateCamera(delta);
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
@@ -4657,7 +4790,8 @@ function updateKeyboardMotion(delta, currentTime) {
       cameraYaw *= (1 - t)
   */
   if (moveInput !== 0 && orbitInput === 0) {
-    const t = 1 - Math.pow(0.001, delta * SOLO_TWEAKS.camera.lurchDamping / 4);
+    const t =
+      1 - Math.pow(0.001, (delta * SOLO_TWEAKS.camera.lurchDamping) / 4);
     controlState.cameraYaw *= 1 - t;
   }
 
@@ -4981,16 +5115,45 @@ function updateIdleMotion(delta, elapsed) {
       headLead  = sin(time * 0.58) * headDriftAmplitude
 
     Different frequencies keep the motion from feeling like one obvious loop.
+
+    This wrapper preserves the player call site. Per-entity NPCs/enemies use
+    updateIdleMotionTo directly with their own (skeleton, tuning).
   */
-  const joints = state.skeleton.joints;
-  const time = elapsed * rigTuning.motionSpeed + rigTuning.phaseOffset;
-  const breathing = Math.sin(time * 1.5) * rigTuning.breathingAmplitude;
-  const headLead = Math.sin(time * 0.58) * rigTuning.headDriftAmplitude;
+  updateIdleMotionTo(state.skeleton, rigTuning, delta, elapsed);
+}
+
+function updateIdleMotionTo(skeleton, tuning, delta, elapsed) {
+  /*
+    Parameterized version of updateIdleMotion used by the entity layer.
+    Same math, but operates on the given skeleton + tuning so each spawned
+    NPC/enemy can breathe and drift on its own time base (motionSpeed +
+    phaseOffset) without sharing state with the player.
+
+    Defensive: if the skeleton is missing required joints (mid-rebuild,
+    incomplete entity, etc.), this no-ops silently rather than throwing.
+  */
+  if (!skeleton?.joints || !tuning) {
+    return;
+  }
+  const joints = skeleton.joints;
+  if (
+    !joints.spineBase ||
+    !joints.chest ||
+    !joints.pelvis ||
+    !joints.neck ||
+    !joints.head
+  ) {
+    return;
+  }
+
+  const time = elapsed * tuning.motionSpeed + tuning.phaseOffset;
+  const breathing = Math.sin(time * 1.5) * tuning.breathingAmplitude;
+  const headLead = Math.sin(time * 0.58) * tuning.headDriftAmplitude;
   const headNod =
-    Math.sin(time * 0.43 + 1.4) * rigTuning.headDriftAmplitude * 0.34;
-  const torsoSway = Math.sin(time * 0.72 + 0.25) * rigTuning.torsoSwayAmplitude;
+    Math.sin(time * 0.43 + 1.4) * tuning.headDriftAmplitude * 0.34;
+  const torsoSway = Math.sin(time * 0.72 + 0.25) * tuning.torsoSwayAmplitude;
   const delayedTorso =
-    Math.sin(time * 0.72 - 0.48) * rigTuning.torsoSwayAmplitude * 0.55;
+    Math.sin(time * 0.72 - 0.48) * tuning.torsoSwayAmplitude * 0.55;
 
   joints.spineBase.scale.set(
     1 + breathing * 0.55,
@@ -5004,28 +5167,31 @@ function updateIdleMotion(delta, elapsed) {
     joints.pelvis,
     new THREE.Euler(0, 0, -delayedTorso * 0.35),
     delta,
+    tuning.damping,
   );
   dampJointRotation(
     joints.spineBase,
     new THREE.Euler(breathing * 0.75, 0, delayedTorso * 0.55),
     delta,
+    tuning.damping,
   );
   dampJointRotation(
     joints.chest,
     new THREE.Euler(breathing * 0.45, headLead * 0.16, torsoSway),
     delta,
+    tuning.damping,
   );
   dampJointRotation(
     joints.neck,
     new THREE.Euler(headNod * 0.45, headLead * 0.38, -torsoSway * 0.62),
     delta,
-    rigTuning.damping * 0.92,
+    tuning.damping * 0.92,
   );
   dampJointRotation(
     joints.head,
     new THREE.Euler(headNod, headLead, -torsoSway * 0.32),
     delta,
-    rigTuning.damping * 0.82,
+    tuning.damping * 0.82,
   );
 }
 
@@ -5093,9 +5259,7 @@ function despawnSword() {
   controlState.combatStance = COMBAT_STANCE_NAMES.NONE;
   resetCombatBalanceEstimate();
 
-  if (state.sword.group) {
-    state.sword.group.visible = false;
-  }
+  swordController.hide();
 }
 
 function startSwordSwing() {
@@ -5138,409 +5302,60 @@ function startSwordSwing() {
   console.info("[sword] swing result", result);
 }
 
-function getSwordAssetPath() {
-  /*
-    Returns the currently requested sword asset path.
-
-    The path now lives in rigTuning so you can change it from the GUI and save
-    it with the rest of the workshop setup. SWORD_TWEAKS remains the built-in
-    default, not the only source of truth.
-  */
-  return rigTuning.swordAssetPath?.trim() || SWORD_TWEAKS.assetPath;
+function saveSwordPresetToBrowser() {
+  swordController.savePresetToBrowser();
 }
 
+function loadSwordPresetFromBrowser() {
+  swordController.loadPresetFromBrowser();
+}
+
+function deleteSwordPresetFromBrowser() {
+  swordController.deletePresetFromBrowser();
+}
+
+function listSwordPresetsToConsole() {
+  swordController.listPresetsToConsole();
+}
+
+function copySwordPresetJson() {
+  swordController.copyPresetJson();
+}
+
+/*
+  Sword bridge functions.
+
+  main.js still calls these names from GUI controls, skeleton rebuilds, and
+  combat input. The actual weapon asset/workholding implementation now lives in
+  sword.js; these wrappers keep existing call sites stable during the module
+  split.
+*/
 function refreshSwordOffsetPresentation() {
-  /*
-    Applies live Sword Offsets GUI values to the already-loaded prop.
-
-    This is the sword equivalent of mesh transform sliders:
-      - length/grip changes re-normalize the imported GLB model,
-      - X/Y/Z and pitch/yaw/roll change the wrapper held by rightPalm.
-
-    It is safe to call before the sword is loaded. In that case sync does
-    nothing; the loader will apply the same values when the asset arrives.
-  */
-  if (state.sword.model) {
-    normalizeSwordModel(state.sword.model);
-  }
-
-  syncSwordAttachment();
+  swordController.refreshOffsetPresentation();
 }
 
 function disposeSwordAsset() {
-  /*
-    Removes the current sword GLB from memory so a different path can be loaded.
-
-    This is intentionally separate from despawnSword():
-      despawnSword() hides the weapon but keeps the asset ready.
-      disposeSwordAsset() throws away the current asset because the workpiece
-      changed and the next equip/reload should load from swordAssetPath.
-  */
-  const swordGroup = state.sword.group;
-
-  if (swordGroup) {
-    swordGroup.parent?.remove(swordGroup);
-    disposeObjectTree(swordGroup);
-  }
-
-  state.sword.group = null;
-  state.sword.model = null;
-  state.sword.loading = false;
-  state.sword.loaded = false;
-  state.sword.loadedAssetPath = "";
+  swordController.disposeAsset();
 }
 
 function reloadSwordAsset() {
-  /*
-    GUI helper for changing to another sword GLB.
-
-    It disposes the old prop, then asks the normal loader path to load the
-    current swordAssetPath. If the player is already in combat stance, the new
-    sword appears in the same hand automatically after it loads.
-  */
-  disposeSwordAsset();
-  loadSwordIfNeeded();
-  updateGuiDisplays();
+  swordController.reloadAsset();
 }
 
 function resetSwordOffsets() {
-  /*
-    Restores the GUI-controlled sword numbers to their default values.
-
-    This does not touch enemy health, combat difficulty, arm pose, or mesh
-    rigging. It only resets the sword workholding setup.
-  */
-  Object.assign(rigTuning, {
-    swordAssetPath: SWORD_TWEAKS.assetPath,
-    swordTargetLength: SWORD_TWEAKS.targetLength,
-    swordGripFromLowerEnd: SWORD_TWEAKS.gripFromLowerEnd,
-    swordOffsetX: SWORD_TWEAKS.localPosition[0],
-    swordOffsetY: SWORD_TWEAKS.localPosition[1],
-    swordOffsetZ: SWORD_TWEAKS.localPosition[2],
-    swordPitch: SWORD_TWEAKS.localRotation[0],
-    swordYaw: SWORD_TWEAKS.localRotation[1],
-    swordRoll: SWORD_TWEAKS.localRotation[2],
-  });
-
-  if (state.sword.loadedAssetPath !== getSwordAssetPath()) {
-    reloadSwordAsset();
-  } else {
-    refreshSwordOffsetPresentation();
-  }
-
-  updateGuiDisplays();
+  swordController.resetOffsets();
 }
 
 function loadSwordIfNeeded() {
-  /*
-    Loads the configured sword GLB once.
-
-    GLTFLoader gives us a scene graph, not a single Mesh. We wrap the imported
-    scene in our own group so all future placement happens on the wrapper and
-    the GLB's internal mesh hierarchy can remain untouched.
-  */
-  const assetPath = getSwordAssetPath();
-
-  if (state.sword.loaded && state.sword.loadedAssetPath === assetPath) {
-    return;
-  }
-
-  if (state.sword.loaded && state.sword.loadedAssetPath !== assetPath) {
-    disposeSwordAsset();
-  }
-
-  if (state.sword.loading) {
-    return;
-  }
-
-  state.sword.loading = true;
-
-  const loader = new GLTFLoader();
-  loader.load(
-    assetPath,
-    (gltf) => {
-      const swordGroup = new THREE.Group();
-      swordGroup.name = "right-hand-sword";
-
-      const swordRoot = gltf.scene;
-      swordRoot.name = "right-hand-sword-model";
-      normalizeSwordModel(swordRoot);
-      swordGroup.add(swordRoot);
-
-      state.sword.group = swordGroup;
-      state.sword.model = swordRoot;
-      state.sword.loaded = true;
-      state.sword.loading = false;
-      state.sword.loadedAssetPath = assetPath;
-
-      syncSwordAttachment();
-      console.info("[sword] loaded", assetPath);
-    },
-    undefined,
-    (error) => {
-      state.sword.loading = false;
-      console.error("[sword] failed to load", assetPath, error);
-    },
-  );
-}
-
-function getSwordLocalBoundingBox(swordRoot) {
-  /*
-    Measures the sword in swordRoot-local coordinates.
-
-    Why not Box3().setFromObject(swordRoot)?
-      setFromObject measures in world space. Once the sword is parented to the
-      palm, world-space measurement includes the hand's rotation, which can make
-      repeated scale/grip tuning drift. This helper converts each mesh's bounds
-      back into swordRoot local space before unioning them.
-
-    Formula:
-      localMatrix = inverse(swordRoot.matrixWorld) * child.matrixWorld
-      childLocalBox = child.geometry.boundingBox transformed by localMatrix
-  */
-  swordRoot.updateMatrixWorld(true);
-
-  const rootInverse = swordRoot.matrixWorld.clone().invert();
-  const box = new THREE.Box3();
-  let foundMesh = false;
-
-  swordRoot.traverse((child) => {
-    if (!child.isMesh || !child.geometry) {
-      return;
-    }
-
-    child.geometry.computeBoundingBox();
-
-    if (!child.geometry.boundingBox) {
-      return;
-    }
-
-    const childBox = child.geometry.boundingBox.clone();
-    const localMatrix = rootInverse.clone().multiply(child.matrixWorld);
-
-    childBox.applyMatrix4(localMatrix);
-    box.union(childBox);
-    foundMesh = true;
-  });
-
-  return foundMesh ? box : null;
-}
-
-function rememberSwordImportTransform(swordRoot) {
-  /*
-    Stores the GLB scene root's authored transform the first time we normalize.
-
-    GUI tuning can call normalizeSwordModel() many times. Resetting to this
-    stored import transform before every measurement prevents scale and grip
-    changes from accumulating like repeated machine offsets.
-  */
-  if (swordRoot.userData.baseSwordTransform) {
-    return;
-  }
-
-  swordRoot.userData.baseSwordTransform = {
-    position: swordRoot.position.clone(),
-    quaternion: swordRoot.quaternion.clone(),
-    scale: swordRoot.scale.clone(),
-  };
-}
-
-function resetSwordToImportTransform(swordRoot) {
-  const base = swordRoot.userData.baseSwordTransform;
-
-  if (!base) {
-    return;
-  }
-
-  swordRoot.position.copy(base.position);
-  swordRoot.quaternion.copy(base.quaternion);
-  swordRoot.scale.copy(base.scale);
-}
-
-function getSwordMaterialList(material) {
-  return Array.isArray(material) ? material : [material].filter(Boolean);
-}
-
-function polishSwordMeshForVisibility(mesh) {
-  /*
-    Keeps imported swords visible in Empyrean's dark world.
-
-    Some GLBs import with very dark PBR textures. They can be technically
-    present but almost invisible against the black/green rooms. This does not
-    replace the authored material; it only adds a tiny emissive lift and renders
-    both sides so thin blade faces do not disappear at shallow camera angles.
-  */
-  mesh.frustumCulled = false;
-
-  getSwordMaterialList(mesh.material).forEach((material) => {
-    material.side = THREE.DoubleSide;
-
-    if (material.emissive) {
-      material.emissive.set("#1f1f1f");
-      material.emissiveIntensity = Math.max(
-        material.emissiveIntensity || 0,
-        0.12,
-      );
-    }
-
-    if ("envMapIntensity" in material) {
-      material.envMapIntensity = Math.max(material.envMapIntensity || 0, 0.7);
-    }
-
-    material.needsUpdate = true;
-  });
-}
-
-function normalizeSwordModel(swordRoot) {
-  /*
-    Fits an arbitrary sword GLB into Empyrean scene units.
-
-    Formula:
-      scale = targetLength / longestBoundingBoxSide
-
-    Where:
-      targetLength = rigTuning.swordTargetLength, in Three.js units
-      longestBoundingBoxSide = max(width, height, depth) from the GLB bounds
-
-    After scaling, we move the model so the wrapper group's origin sits near a
-    grip point instead of the dead center of the sword. That origin is what
-    rightPalm holds. The Sword Offsets X/Y/Z sliders then act like a small
-    handle-placement shim.
-  */
-  rememberSwordImportTransform(swordRoot);
-  resetSwordToImportTransform(swordRoot);
-  swordRoot.updateMatrixWorld(true);
-
-  const sourceBox = getSwordLocalBoundingBox(swordRoot);
-
-  if (!sourceBox) {
-    console.warn(
-      "[sword] could not find sword mesh bounds; leaving scale unchanged",
-    );
-    return;
-  }
-
-  const sourceSize = sourceBox.getSize(new THREE.Vector3());
-  const longestSide = Math.max(sourceSize.x, sourceSize.y, sourceSize.z);
-
-  if (!Number.isFinite(longestSide) || longestSide <= 0.0001) {
-    console.warn(
-      "[sword] could not measure sword asset; leaving scale unchanged",
-    );
-    return;
-  }
-
-  const targetLength = THREE.MathUtils.clamp(
-    rigTuning.swordTargetLength,
-    0.05,
-    4,
-  );
-  const gripFromLowerEnd = THREE.MathUtils.clamp(
-    rigTuning.swordGripFromLowerEnd,
-    0,
-    1,
-  );
-  const scale = targetLength / longestSide;
-  const basePosition = swordRoot.position.clone();
-  const longestAxis =
-    sourceSize.x >= sourceSize.y && sourceSize.x >= sourceSize.z
-      ? "x"
-      : sourceSize.y >= sourceSize.z
-        ? "y"
-        : "z";
-  const gripPoint = sourceBox.getCenter(new THREE.Vector3());
-
-  /*
-    Grip-point math:
-      gripPoint[axis] = sourceBox.min[axis] + sourceSize[axis] * gripFromLowerEnd
-
-    where:
-      axis = whichever local box dimension is longest after scaling
-
-    This is a practical prop heuristic. We do not know how every GLB author
-    oriented their sword, but the longest box dimension is almost always blade
-    length. Setting the wrapper origin close to one end makes the palm hold the
-    hilt area instead of the center of the blade.
-
-    Placement math:
-      gripOffset = gripPoint * swordRoot.scale, then rotated by swordRoot.quaternion
-      swordRoot.position = basePosition - gripOffset
-
-    This means the chosen grip point lands at the wrapper group's origin. The
-    wrapper is what gets attached to rightPalm. We intentionally calculate from
-    sourceBox, not from a remeasured "fitted" box, because this function can run
-    many times while sliders move. Starting from the saved import transform each
-    time prevents cumulative scale/offset drift.
-  */
-  gripPoint[longestAxis] =
-    sourceBox.min[longestAxis] + sourceSize[longestAxis] * gripFromLowerEnd;
-
-  swordRoot.scale.multiplyScalar(scale);
-
-  const gripOffset = gripPoint
-    .clone()
-    .multiply(swordRoot.scale)
-    .applyQuaternion(swordRoot.quaternion);
-
-  swordRoot.position.copy(basePosition).sub(gripOffset);
-  swordRoot.updateMatrixWorld(true);
-
-  swordRoot.traverse((child) => {
-    if (child.isMesh) {
-      polishSwordMeshForVisibility(child);
-    }
-  });
-}
-
-function syncSwordAttachment() {
-  /*
-    Parents the loaded sword to the current rightPalm joint.
-
-    Why this exists:
-      buildSkeletonWorkshop() destroys and recreates the skeleton when rig
-      dimensions change. A child object would be disposed with the old skeleton
-      unless we detach it first and reattach it to the new rightPalm here.
-  */
-  const swordGroup = state.sword.group;
-  const rightPalm = state.skeleton?.joints?.rightPalm;
-
-  if (!swordGroup || !rightPalm) {
-    return;
-  }
-
-  if (swordGroup.parent !== rightPalm) {
-    swordGroup.parent?.remove(swordGroup);
-    rightPalm.add(swordGroup);
-  }
-
-  swordGroup.position.set(
-    rigTuning.swordOffsetX,
-    rigTuning.swordOffsetY,
-    rigTuning.swordOffsetZ,
-  );
-  swordGroup.rotation.set(
-    rigTuning.swordPitch,
-    rigTuning.swordYaw,
-    rigTuning.swordRoll,
-  );
-  swordGroup.visible = controlState.weaponEquipped;
+  swordController.loadIfNeeded();
 }
 
 function detachSwordFromSkeleton() {
-  /*
-    Protects the loaded sword during a skeleton rebuild.
+  swordController.detachFromSkeleton();
+}
 
-    Removing the sword from its parent before disposeObjectTree(state.skeleton)
-    means the object is not disposed with the old rightPalm. The next rebuild
-    calls syncSwordAttachment() to attach it to the fresh rightPalm.
-  */
-  const swordGroup = state.sword.group;
-
-  if (!swordGroup) {
-    return;
-  }
-
-  swordGroup.parent?.remove(swordGroup);
+function syncSwordAttachment() {
+  swordController.syncAttachment();
 }
 
 function syncDevProbeAttachment() {
@@ -5978,7 +5793,7 @@ function updateWalkMotion(delta, elapsed, options = {}) {
 
       Amplitude is multiplied in here so the arm swing scales with walkAmplitude
       the same way leg swing does. The 0.22 factor is about 65% of the leg swing
-      amplitude â€” arms swing somewhat less dramatically than legs in most gaits.
+      amplitude — arms swing somewhat less dramatically than legs in most gaits.
   */
   const walkArmSwing = ensureWalkArmSwingState();
 
@@ -6794,13 +6609,13 @@ function updateJumpPose(delta) {
 
       1. ROOT MOVEMENT (in syncSkeletonRoot):
            root.position.y += jump.offsetY
-         This lifts the entire skeleton â€” every joint â€” upward.
+         This lifts the entire skeleton — every joint — upward.
          It is driven by real physics: launch velocity, gravity, arc.
 
       2. POSE SHAPE (this function):
          Body, legs, and arms change shape to look like a jump.
          These are LOCAL position and rotation offsets within the skeleton.
-         They do not move the root â€” they deform the pose around it.
+         They do not move the root — they deform the pose around it.
 
     This function only handles the pose shape.
 
@@ -7146,7 +6961,7 @@ function updateControlledArm(sideName, side, pose, delta, currentTime) {
       shoulder's forward/back rotation (X axis). This gives a natural gait
       where each arm swings opposite to the leg on the same side.
 
-      The swing only affects "down" pose â€” it would look wrong to counter-swing
+      The swing only affects "down" pose — it would look wrong to counter-swing
       while the arm is raised (up/half/wave) since those poses already dominate
       the shoulder rotation with a deliberate override.
 
@@ -7462,7 +7277,7 @@ function handleJointEditPointerDown(event) {
 
   /*
     Hit-test only the visible, editable joint markers. The `false` argument means
-    do not recurse into children â€” each marker is a flat mesh and we only want
+    do not recurse into children — each marker is a flat mesh and we only want
     the marker itself, not anything it might contain.
   */
   const intersections = mouseJointEditor.raycaster.intersectObjects(
@@ -7529,10 +7344,10 @@ function handleJointEditPointerDown(event) {
 
   /*
     Do an immediate first intersection to get the exact click point on the plane
-    (not the marker surface â€” the plane is coplanar with the joint, but the
+    (not the marker surface — the plane is coplanar with the joint, but the
     marker is a sphere that protrudes from it, so they differ slightly).
 
-    Converting this to parent-local space gives dragStartParentLocal â€” the
+    Converting this to parent-local space gives dragStartParentLocal — the
     reference origin for the delta calculation in pointermove.
   */
   mouseJointEditor.raycaster.ray.intersectPlane(
@@ -7736,45 +7551,45 @@ function applyG53PreservedDescendantRootLocals() {
 
 function handleJointEditPointerMove(event) {
   /*
-    THE BUG THAT WAS HERE â€” and why it broke parent-child relationships:
+    THE BUG THAT WAS HERE — and why it broke parent-child relationships:
 
     Every joint in the skeleton is a THREE.Group. Three.js stores two separate
     transforms on every object:
 
-      1. LOCAL matrix  â€” position/rotation/scale relative to the PARENT.
+      1. LOCAL matrix  — position/rotation/scale relative to the PARENT.
                          Updated immediately whenever you set .position or .quaternion.
 
-      2. WORLD matrix  â€” the accumulated transform from the scene root all the way
+      2. WORLD matrix  — the accumulated transform from the scene root all the way
                          down to this object. This is what converts a local point
                          into an actual position in 3D space.
 
     IMPORTANT: Three.js does NOT update the world matrix automatically every time
     you change a position. It only updates world matrices in two moments:
-      a) renderer.render() â€” the render loop calls scene.updateMatrixWorld() at
+      a) renderer.render() — the render loop calls scene.updateMatrixWorld() at
                              the start of every frame.
       b) An explicit call to object.updateMatrixWorld(true).
 
     The drag handler calls these functions on every pointermove event:
-      applyJointPointOffsets()  â€” changes joint.position for ALL joints
-      resetSkeletonToBindPose() â€” also changes joint.position for ALL joints
-      syncSkeletonRoot()        â€” moves the root joint to the player position
+      applyJointPointOffsets()  — changes joint.position for ALL joints
+      resetSkeletonToBindPose() — also changes joint.position for ALL joints
+      syncSkeletonRoot()        — moves the root joint to the player position
 
     After those calls, every joint's LOCAL transform is up to date.
-    But their WORLD matrices are now STALE â€” they still reflect positions from
+    But their WORLD matrices are now STALE — they still reflect positions from
     before this event fired.
 
     Then the handler calls:
       joint.parent.worldToLocal(someWorldPoint)
 
     worldToLocal() inverts joint.parent.matrixWorld to map a world-space point into
-    parent-local space. If matrixWorld is stale, this conversion is wrong â€” the
+    parent-local space. If matrixWorld is stale, this conversion is wrong — the
     parent's actual current position in the world is not accounted for. This is
     exactly what "parent-child relationships are not being followed" means: the
     parent has moved, but worldToLocal() doesn't know that yet.
 
     At normal speeds this is invisible because the render loop runs between events
     and refreshes all matrices. But at high mouse speeds, multiple pointermove
-    events fire within the same animation frame â€” so the second event arrives before
+    events fire within the same animation frame — so the second event arrives before
     renderer.render() has had a chance to update matrixWorld.
 
     THE FIX:
@@ -7889,7 +7704,7 @@ function handleJointEditPointerMove(event) {
 
     If another pointermove event arrives before the next render (common at high
     mouse speeds), joint.parent.worldToLocal() above will use the OLD matrixWorld
-    and calculate the wrong parent-local position â€” making the joint drift or jump
+    and calculate the wrong parent-local position — making the joint drift or jump
     instead of tracking the cursor smoothly.
 
     updateMatrixWorld(true) walks the entire tree starting from the skeleton root
@@ -7982,6 +7797,47 @@ function handleGameplayPointerDown(event) {
   }
 }
 
+function handleGameplayMouseDownBackup(event) {
+  /*
+    Backup LMB-swing handler that uses the legacy `mousedown` event instead of
+    `pointerdown`. Exists because of a Pointer-Lock-plus-Pointer-Capture quirk
+    in current browsers:
+
+    When RMB engages mouse-look, two things activate together:
+      1. sceneContainer.setPointerCapture(pointerId)
+      2. sceneContainer.requestPointerLock()
+    For a mouse, all buttons share one pointerId. With that pointer captured
+    AND locked, browsers (Chrome at least) frequently do not deliver the
+    `pointerdown(button=0)` event for LMB while RMB is still held. The
+    Enter-key swing path keeps working because keydown is a totally separate
+    pipeline; LMB looks like it's "tied to RMB" because pointerdown is the
+    one path that fails.
+
+    mousedown is the legacy event that pointer events were supposed to
+    supersede. It comes from a separate event pipeline and still fires
+    reliably for the second button in the captured+locked case.
+
+    Gating rule:
+      - Only fires when mouseLookActive is true (i.e., RMB is held).
+        Without this gate, this would double-fire alongside the working
+        pointerdown handler in the no-RMB case.
+      - Skips when any dev mode is active, for the same reason the pointer
+        handler does.
+      - startSwordSwing() already debounces via controlState.swordSwingUntil,
+        so even if both handlers fired in the same frame, only one swing
+        would actually trigger.
+  */
+  if (!controlState.mouseLookActive) {
+    return;
+  }
+  if (isAnyDevModeActive()) {
+    return;
+  }
+  if (event.button === 0) {
+    startSwordSwing();
+  }
+}
+
 function handleGameplayPointerMove(event) {
   /*
     Applies mouse-look deltas while RMB is held.
@@ -8016,7 +7872,8 @@ function handleGameplayPointerMove(event) {
 
   const pitchSign = SOLO_TWEAKS.camera.mouseInvertY ? -1 : 1;
   controlState.cameraPitch = THREE.MathUtils.clamp(
-    controlState.cameraPitch + dy * SOLO_TWEAKS.camera.mousePitchSensitivity * pitchSign,
+    controlState.cameraPitch +
+      dy * SOLO_TWEAKS.camera.mousePitchSensitivity * pitchSign,
     -SOLO_TWEAKS.camera.maxPitch,
     SOLO_TWEAKS.camera.maxPitch,
   );
@@ -8061,7 +7918,7 @@ function handleGameplayPointerCancel(event) {
 
 function handlePointerLockChange() {
   /*
-    Pointer lock can be lost without our pointerup handler firing — most
+    Pointer lock can be lost without our pointerup handler firing � most
     commonly when the user presses Esc to escape lock, or when the browser
     revokes it due to focus loss. If that happens while RMB is still believed
     to be held, clear mouseLookActive so the next pointermove does not whip
@@ -8162,7 +8019,7 @@ function handleWindowBlur() {
       our listener and the key stays "stuck" in the Set forever.
 
       Symptom in practice: hold W to walk, switch focus to dev tools mid-walk,
-      switch back — the player keeps walking with no key held. Pressing W
+      switch back � the player keeps walking with no key held. Pressing W
       again restores normal behavior because the next keyup fires.
 
       Confirming clue: Shift can still enter/exit the run cycle while in the
@@ -8183,6 +8040,72 @@ function handleWindowBlur() {
   }
 }
 
+function applyMoonSystemEnabled() {
+  /*
+    Day/night prototype, pass 1.
+
+    This is intentionally a blunt on/off switch:
+      visible moon group      -> skyMoon.visible
+      world moon key light    -> worldLighting.moonLight.visible
+      moon shell helper light -> worldLighting.moonPointLight.visible
+      ghost sphere groups     -> sphere.group.visible
+      sky color               -> night when enabled, day when disabled
+      day sun light           -> off when enabled, on when disabled
+      hemisphere fill         -> dim night fill or brighter day fill
+
+    We do not change material opacity here. The visible moon is a Group with
+    several child meshes/materials, the ghost spheres each have two child
+    meshes, and lights have no opacity at all. Toggling Object3D.visible plus
+    switching world-owned light intensities is the simplest reversible first
+    pass and keeps the future fade-based day/night cycle free to interpolate
+    these same values instead of jumping them.
+
+    G53 note:
+      Machine-home rigging mode owns temporary world visibility. If G53 is
+      active, keep the moon and ghost spheres hidden even when the sky system
+      flag is enabled. Exiting G53 calls this helper again so gameplay returns
+      to the current sky-system state.
+  */
+  const enabled = Boolean(state.moonSystemEnabled);
+  const visibleInGameplay = enabled && !state.g53RiggingMode.active;
+
+  skyMoon.visible = visibleInGameplay;
+
+  ghostSpheres.forEach((sphere) => {
+    sphere.group.visible = visibleInGameplay;
+  });
+
+  /*
+    Sky-mode proof of concept:
+
+      enabled  = night sky, moon, moonlight, ghost spheres
+      disabled = bright day sky, sun light, no moon, no ghost spheres
+
+    world.js owns the actual sky, sun, and hemisphere values. main.js only
+    chooses the state name because keyboard input belongs here.
+  */
+  applyWorldSkyMode(scene, renderer, {
+    lightingRig: worldLighting,
+    skyName: enabled ? "night" : "day",
+  });
+
+  if (worldLighting?.moonLight) {
+    worldLighting.moonLight.visible = enabled;
+  }
+
+  if (worldLighting?.moonPointLight) {
+    worldLighting.moonPointLight.visible = enabled;
+  }
+}
+
+function toggleMoonSystem() {
+  state.moonSystemEnabled = !state.moonSystemEnabled;
+  applyMoonSystemEnabled();
+  console.info(
+    `[sky] night-sky system ${state.moonSystemEnabled ? "enabled" : "disabled"}`,
+  );
+}
+
 function handleKeyDown(event) {
   /*
     Handles one-shot key actions and records held movement keys.
@@ -8196,6 +8119,7 @@ function handleKeyDown(event) {
       Z     = toggle left arm high
       X     = toggle right arm high
       H     = toggle both hands half high
+      G     = toggle moon / ghost-sphere sky system and day/night sky color
       Space = wave
       J     = jump
       1     = equip sword and enter combat stance
@@ -8254,6 +8178,8 @@ function handleKeyDown(event) {
 
     controlState.leftArm = bothHalf ? "down" : "half";
     controlState.rightArm = bothHalf ? "down" : "half";
+  } else if (event.code === "KeyG") {
+    toggleMoonSystem();
   } else if (event.code === "Space") {
     controlState.waveUntil = performance.now() + 1200;
     controlState.wasWaving = true;
@@ -8322,7 +8248,9 @@ console.info(
   "This is a development build. Expect bugs and incomplete features! Report issues on GitHub.",
 );
 
-buildLighting(scene);
+worldLighting = buildLighting(scene, { skyMoon });
+applyWorldAtmosphere(scene, renderer, { lightingRig: worldLighting });
+applyMoonSystemEnabled();
 initSkin({
   state,
   rigTuning,
@@ -8330,6 +8258,125 @@ initSkin({
   onAfterImportedMeshRigged: handleImportedMeshRigged,
 });
 buildSkeletonWorkshop();
+
+/*
+  Entity layer setup. The puppet workshop's skeleton + controlState are now
+  also accessible as state.player (the player entity). NPCs/enemies spawn into
+  state.entities via window.empyreanSpawnNPC / SpawnEnemy at the console.
+
+  Important: state.skeleton, state.importedSkin, and controlState are still
+  used by the 470+ existing references in main.js. The entity wrapper does not
+  rename or replace them. state.player.skeleton === state.skeleton, etc.
+
+  Phase deferred: skin.js currently binds the player mesh to state.skeleton via
+  initSkin's _ctx. Non-player entities spawn as skeleton-only debug visuals
+  this session; mesh binding lands in Step 2.5 when skin.js gets parameterized.
+*/
+state.player = createPlayerEntity({
+  skeleton: state.skeleton,
+  skin: state.importedSkin,
+  controlState,
+  rigTuning,
+});
+state.player.controller = createKeyboardController(controlState);
+state.entities = [state.player];
+
+const entityFactories = createEntityFactories({
+  scene,
+  createSkeleton,
+  applyJointPointOffsetsTo,
+  applyBindRotationOffsetsTo,
+  bindRiggedSkinFromPath,
+  updateIdleMotionTo,
+  syncSkinToSkeleton,
+});
+
+window.empyreanSpawnNPC = async function spawnNPCFromConsole(
+  rigName,
+  x = 0,
+  z = 0,
+  yaw = 0,
+) {
+  /*
+    Console-callable entity spawn. Looks up a saved rig package from the
+    puppet shop library by name and spawns an NPC at (x, y=0, z) with the
+    given yaw.
+
+    Async because mesh loading is async. In modern DevTools consoles you can
+    await it directly:
+      await empyreanSpawnNPC("Sigewynn player rig", 2, 0, Math.PI)
+
+    If you don't await, you'll get back a Promise; the entity still spawns
+    and appears in state.entities once the mesh resolves.
+
+    Returns the spawned entity.
+  */
+  const pkg = loadPuppetRigPackageFromLibrary(window.localStorage, rigName);
+  if (!pkg) {
+    console.warn(
+      `[entity] no saved rig named '${rigName}'. ` +
+        `Available rigs: ${getPuppetRigLibraryNames(window.localStorage).join(", ") || "(none)"}`,
+    );
+    return null;
+  }
+  const npc = await entityFactories.spawnNPC({
+    rigPackage: pkg,
+    position: { x, y: 0, z },
+    yaw,
+  });
+  npc.controller = createStaticController();
+  state.entities.push(npc);
+  console.info(
+    `[entity] spawned NPC '${rigName}' at (${x}, ${z}) yaw=${yaw.toFixed(2)}`,
+    { id: npc.id, hasMesh: Boolean(npc.skin) },
+  );
+  return npc;
+};
+
+window.empyreanSpawnEnemy = async function spawnEnemyFromConsole(
+  rigName,
+  x = 0,
+  z = 0,
+  yaw = 0,
+) {
+  const pkg = loadPuppetRigPackageFromLibrary(window.localStorage, rigName);
+  if (!pkg) {
+    console.warn(`[entity] no saved rig named '${rigName}'`);
+    return null;
+  }
+  const enemy = await entityFactories.spawnEnemy({
+    rigPackage: pkg,
+    position: { x, y: 0, z },
+    yaw,
+  });
+  enemy.controller = createStaticController();
+  state.entities.push(enemy);
+  console.info(`[entity] spawned enemy '${rigName}' at (${x}, ${z})`, {
+    id: enemy.id,
+    hasMesh: Boolean(enemy.skin),
+  });
+  return enemy;
+};
+
+window.empyreanListEntities = function listEntitiesFromConsole() {
+  /*
+    Quick console summary of currently spawned entities.
+  */
+  console.table(
+    state.entities.map((e, i) => ({
+      i,
+      id: e.id,
+      role: e.role,
+      controller: e.controller?.type || e.controller || "(none)",
+      x: e.skeleton?.root?.position?.x?.toFixed(2),
+      y: e.skeleton?.root?.position?.y?.toFixed(2),
+      z: e.skeleton?.root?.position?.z?.toFixed(2),
+      hasMesh: Boolean(e.skin),
+    })),
+  );
+  return state.entities;
+};
+
 buildGui();
 resizeRendererToContainer();
 settleStartupPoseBehindTitleCard();
@@ -8353,6 +8400,7 @@ sceneContainer.addEventListener("pointermove", handleGameplayPointerMove);
 sceneContainer.addEventListener("pointerup", handleGameplayPointerUp);
 sceneContainer.addEventListener("pointercancel", handleGameplayPointerCancel);
 sceneContainer.addEventListener("pointerleave", handleGameplayPointerCancel);
+sceneContainer.addEventListener("mousedown", handleGameplayMouseDownBackup);
 sceneContainer.addEventListener("contextmenu", handleSceneContextMenu);
 document.addEventListener("pointerlockchange", handlePointerLockChange);
 

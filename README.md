@@ -4,7 +4,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.57-alpha`
+- Empyrean build: `0.1.97-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -12,7 +12,7 @@ Clean skeleton workshop extracted from the avatar STL project.
 
 This project began as a clean skeleton workshop and is now becoming the exploration/rigging lab for Empyrean:
 
-- three connected Three.js rooms plus an outside enclosure
+- four connected Three.js rooms plus an outside enclosure
 - full puppet skeleton
 - joint markers and labels
 - local axis marker
@@ -28,6 +28,9 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - GLB import with generated skin weights for the Empyrean puppet skeleton
 - separate render, adjust, rig workflow for imported meshes
 - Puppet Shop module and GUI for named reusable complete rig packages
+- entity layer that wraps the player and supports spawned NPC/enemy rigs
+- entity controller scaffold for keyboard/static/future AI control
+- console helpers for spawning and listing saved-rig entities during development
 - keyboard movement and arm pose controls
 - mouse wheel camera zoom
 - browser save/load/export for tuning
@@ -36,6 +39,8 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - data-driven encounter trigger zones
 - combat d20 as a numbered rough-stone 3D object
 - separate `oracleD20.js` module for the physical d20/oracle object and roll state
+- passive screen-space oracle-roll HUD that fades in only during the visible d20 roll
+- placeholder oracle-roll HUD result messages mapped to d20 values 1 through 20
 - focused rig mesh mode
 - start-here runbook and verification helper
 - mouse drag joint point editing
@@ -56,10 +61,17 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - bind-pose-aware generated skin side selection for rotated meshes
 - Sigewynn default temp mesh, plainSword combat prop, post-rig visible arm relaxation, and a named arm pose resolver for easier stance/swing work
 - rig calibration / visible pose split so T/A reference arms can be preserved without leaving gameplay arms raised
-- saved `Sword Offsets` GUI controls for sword path, length, grip, position, pitch, yaw, and roll
+- saved `Sword Offsets` GUI controls for sword path, length, grip, grip trim, position, pitch, yaw, and roll
+- sword-only preset library for named weapon workholding setups
+- separate `sword.js` module for weapon GLB loading, grip math, attachment, presets, and future weapon-state setup
 - pure combat balance math module and Low Guard stance on sword draw
 - neutral body/knee facing correction so anatomical right/left and foot direction read correctly while the related Y bind-rotation sliders read zero
 - Empyrean room aesthetic pass with stone floor/wall textures, 80% room walls, dim torch props, and warm torch light sources
+- four-room stone block with a northwest room at X-24/Z-24 and full block dimensions documented for outside-shell asset work
+- authored `churchRough.glb` visual shell loaded in `world.js` at the CAD fixture zero and scaled from Tinkercad meters back to Empyrean scene units
+- expanded outside enclosure at `384 x 384 x 36` scene units, centered equally around gameplay X0/Z0
+- `cave.glb` rough-draft world prop near the moon with simple proxy rectangle colliders
+- seeded outside landmark scatter using extra `tree.glb`, `deadTree.glb`, `campfire.glb`, `skull.glb`, `rock1.glb`, and `rock2.glb` props
 - moon.glb sky focal point replacing the old planet sphere
 - world-owned sky moon setup in `world.js`
 - EMPYREAN stone-engraved title card with animated gradient and delayed reveal
@@ -115,6 +127,24 @@ combatPhysics.js    <- the combat math station
                       mass, stability margin, critical tipping angle, and
                       named stance profiles such as Low Guard. No scene
                       objects, no GUI, no animation frame side effects.
+
+sword.js            <- the weapon workholding station
+                      owns plainSword defaults, sword offset limits, sword
+                      preset storage, GLB loading/disposal, grip-anchor
+                      normalization math, and rightPalm attachment. main.js
+                      asks it to load, reload, hide, save, and reattach.
+
+entity.js           <- the actor wrapper station
+                      separates "a puppet rig" from "the player" by wrapping
+                      skeletons, skins, rig tuning, role, controller, and
+                      per-entity state into reusable Entity records. It can
+                      spawn NPC/enemy entities from saved Puppet Shop packages.
+
+entityControllers.js <- the intent station
+                      defines the controller interface for entities. The
+                      current build has keyboard and static controllers only;
+                      wander, patrol, and enemy-combat controllers are named
+                      future targets.
 
 physics.js          ← the math reference binder
                       pure formulas only — jump gravity, launch velocity,
@@ -177,9 +207,28 @@ encounters.js
 
 The rule: nothing imports from main.js. main.js is the only thing that pulls everything together. If world.js or skin.js needed something from main.js, that would be a circular dependency — like a parts station trying to call the floor supervisor to ask for a part the floor supervisor asked the parts station to make in the first place. Instead, main.js passes what each station needs as a parameter when it calls them.
 
+Entity note: the diagram above is intentionally conservative, but the active runtime now also imports `entity.js` and `entityControllers.js`. `entity.js` wraps player/NPC/enemy rigs as Entity records. `entityControllers.js` defines the controller interface and current keyboard/static controller stubs. These modules still follow the same rule: they do not import from `main.js`; `main.js` passes the skeleton, skinning, and update helpers they need.
+
 Combat has one extra internal helper now: `combat_updated.js` imports `oracleD20.js`. The encounter controller still decides when the roll starts, what the result means for enemy evasion, and when combat changes phase. `oracleD20.js` only owns the physical die and its roll state.
 
-Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, calls `updateCombatEncounter(delta)` once per animation frame, and calls `attemptCombatSwordHit()` only when the player swings. `main.js` owns the sword model and arm pose. `combat_updated.js` owns trigger state, enemy GLB fitting, hitbox, evasion, health, hiding, victory, and the decision to consume oracle/audio results. `oracleD20.js` owns the physical numbered d20 object and roll state. `audioManager.js` owns ambient and combat Audio elements, fades, one-shots, encounter audio actions, and pause/resume. `combatPhysics.js` owns the readable balance formulas and stance profiles, while `main.js` converts the live Three.js joint positions into the root-local numbers those formulas need.
+Combat follows the same station rule. `main.js` imports `combat_updated.js`, calls `initCombatEncounter()` once during startup, calls `updateCombatEncounter(delta)` once per animation frame, and calls `attemptCombatSwordHit()` only when the player swings. `main.js` owns player input, arm pose selection, and the decision to swing. `sword.js` owns the sword model, grip fitting, palm attachment, offsets, and presets. `combat_updated.js` owns trigger state, enemy GLB fitting, hitbox, evasion, health, hiding, victory, and the decision to consume oracle/audio results. `oracleD20.js` owns the physical numbered d20 object and roll state. `audioManager.js` owns ambient and combat Audio elements, fades, one-shots, encounter audio actions, and pause/resume. `combatPhysics.js` owns the readable balance formulas and stance profiles, while `main.js` converts the live Three.js joint positions into the root-local numbers those formulas need.
+
+The Entity layer is the newest boundary. `entity.js` does not replace the old player path yet; it wraps it. `state.player` points at the same skeleton, imported skin, `controlState`, and `rigTuning` that `main.js` already uses. Spawned NPC/enemy entities get their own skeleton, their own cloned rig tuning, optional mesh binding from a saved Puppet Shop package, and their own state record. `entityControllers.js` names how an entity decides what it wants to do, but only keyboard/static controllers are active right now.
+
+Current entity-refactor status:
+
+- Player gameplay still uses the legacy `state.skeleton` / `controlState` path.
+- `state.player` is a wrapper around that existing player, not a replacement.
+- `state.entities` contains the player plus any spawned NPC/enemy entities.
+- Non-player entities currently run idle motion and skin sync only.
+- Walk/run/combat/jump for non-player entities are future passes.
+- Puppet Shop creates and saves rig packages; gameplay consumes those packages.
+
+Development console helpers:
+
+- `await empyreanSpawnNPC("Rig Name", x, z, yaw)` spawns a saved rig package as an NPC.
+- `await empyreanSpawnEnemy("Rig Name", x, z, yaw)` spawns a saved rig package as an enemy.
+- `empyreanListEntities()` prints the active entity list with role, controller, position, and mesh status.
 
 ### Where to Make Common Changes
 
@@ -187,14 +236,20 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 | --------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | Movement speed, camera feel, colors                                         | `SOLO_TWEAKS` near the top of `main.js`                                 |
 | Ambient/combat audio paths, fade behavior, one-shots, pause/resume          | `audioManager.js`                                                       |
-| Sword asset path, scale, grip origin, hand offset, pitch/yaw/roll           | `Sword Offsets` in the GUI                                              |
-| Sword default values, swing timing, hit range                               | `SWORD_TWEAKS` near the top of `main.js`                                |
+| Sword asset path, scale, grip origin/trim, hand offset, pitch/yaw/roll      | `Sword Offsets` in the GUI                                              |
+| Sword default values, swing timing, hit range                               | `SWORD_TWEAKS` in `sword.js`                                            |
+| Sword offset slider/sanitizer travel limits                                 | `SWORD_OFFSET_LIMITS` in `sword.js`                                     |
+| Sword-only save/load preset behavior                                        | `Sword Offsets` GUI actions in `main.js`, implementation in `sword.js`  |
 | Arm stances and sword swing rotations                                       | `getControlledArmPoseTargets()` in `main.js`                            |
 | Combat balance formulas or Low Guard body/leg stance                        | `combatPhysics.js`                                                      |
 | Physical d20 look, roll timing, face numbers, result-facing quaternion math | `oracleD20.js`                                                          |
+| Oracle-roll HUD screen geometry, color, border, radius, fade timing         | `#oracle-roll-hud` in `styles.css`; timing in `combat_updated.js`       |
 | Neutral anatomical facing correction                                        | `RIG_BASE_BODY_YAW` near the top of `main.js`                           |
 | Complete rig package shape or local rig-library behavior                    | `puppetShop.js`                                                         |
-| Room size, wall colors, ghost sphere count                                  | `WORLD_TWEAKS` near the top of `world.js`                               |
+| Spawned NPC/enemy entity wrappers and entity update scaffold                | `entity.js`                                                             |
+| Entity controller interface and keyboard/static controller stubs            | `entityControllers.js`                                                  |
+| Room size, ghost sphere count, outside geometry                             | `WORLD_TWEAKS` near the top of `world.js`                               |
+| Sky/fog/grass/outside-wall/world-light atmosphere colors                    | `WORLD_TWEAKS.atmosphere.palettes` and `applyWorldAtmosphere()` in `world.js` |
 | Default body proportions                                                    | `DEFAULT_RIG_DIMENSIONS` in `rig.js`                                    |
 | Trigger zones (enter/exit events)                                           | `encounters.js`                                                         |
 | Enemy combat prototype                                                      | `combat_updated.js`                                                     |
@@ -204,11 +259,115 @@ Combat follows the same station rule. `main.js` imports `combat_updated.js`, cal
 
 ---
 
+### Current Room Block Dimensions
+
+The stone room cluster is now a `2 x 2` block:
+
+- central room center: `X0, Z0`
+- negative-X room center: `X-24, Z0`
+- negative-Z room center: `X0, Z-24`
+- negative-X/negative-Z room center: `X-24, Z-24`
+
+The current `roomSize` is `24` scene units and `wallThickness` is `0.1`.
+
+Nominal room-block envelope, ignoring surface thickness:
+
+```text
+width X  = 48
+length Z = 48
+height Y = 24
+```
+
+Asset-fitting envelope, including the current wall/floor/ceiling thickness:
+
+```text
+width X  = 48.1
+length Z = 48.1
+height Y = 24.1
+min X    = -36.05
+max X    =  12.05
+min Z    = -36.05
+max Z    =  12.05
+min Y    =  -0.05
+max Y    =  24.05
+```
+
+Use the nominal `48 x 48 x 24` if the outside shell should hug the intended
+room cube. Use `48.1 x 48.1 x 24.1` if the shell needs to cover the visible
+mesh thickness too.
+
+---
+
+### Current Outside World Dimensions
+
+The outside enclosure is centered on gameplay `X0/Z0`. In CAD floor terms, this
+is the same fixture-zero idea as the church shell.
+
+```text
+outside X width  = 384
+outside Z length = 384
+outside Y height = 36
+
+min X = -192
+max X =  192
+min Z = -192
+max Z =  192
+min Y =   -0.05
+max Y =   36.05
+```
+
+The X/Z size is `400%` of the previous `96 x 96` outside enclosure. The positive
+Y height is `150%` of the previous `24` scene-unit outside wall height. Interior
+rooms and `churchRough.glb` are not scaled by this; they stay at the proven door
+alignment.
+
+---
+
 ## Change Notes
 
+- `0.1.97-alpha`: Reduced active day-mode color saturation by 20% for a harsher, dustier daylight look: sky/fog/outside shell now use `#CEEAFA`, day fill uses `#DBE5CB`, and sun color uses `#FBF6D6`.
+- `0.1.96-alpha`: Unified the night sky/background/fog/renderer clear color around `#131862` so the night outside shell and the true scene background no longer split into black/purple bands at camera angles.
+- `0.1.95-alpha`: Converted the outside wall/ceiling sky shell from lit `MeshStandardMaterial` to opaque, double-sided, fog-free `MeshBasicMaterial` so day/night shell color is uniform instead of splitting into several light-dependent blue wall colors; the outside floor is also double-sided and fog-free for the shallow-angle floor diagnostic.
+- `0.1.94-alpha`: Reclassified the day-mode artifact as a fog/material blending problem instead of a light problem: day fog is now disabled, and the outside wall/ceiling sky shell is opaque and day/night-colored through `applyWorldSkyMode()` so the green floor no longer blends into the day sky at shallow camera angles.
+- `0.1.93-alpha`: Added a day-mode lighting diagnostic pass: `G` day mode now disables the central green accent PointLight and replaces the dark night fog with pale low-density day fog, while leaving room torches untouched so the remaining player-facing light patch can be isolated.
+- `0.1.92-alpha`: Added day-mode lighting to the `G` toggle: a warm `#FFF9D2` diagonal sun DirectionalLight plus brighter HemisphereLight fill now replace the moonlight when the sky switches to day, keeping ceilings and non-facing walls readable.
+- `0.1.91-alpha`: Added the next day/night prototype step: `G` now switches the Three.js sky/renderer clear color between the night sky and bright day `#C9EBFF`, using a world-owned `applyWorldSkyColor()` helper while leaving fog, grass, walls, and light tuning untouched.
+- `0.1.90-alpha`: Expanded the `G` day/night prototype toggle so it now hides/shows the floating ghost spheres with the visible moon and moon-owned lights, while still respecting G53 rigging visibility.
+- `0.1.89-alpha`: Moved world atmosphere ownership into `world.js` with a named `night` palette and `applyWorldAtmosphere()`, centralizing scene background, fog, renderer clear color, outside wall/floor colors, and world light colors/intensities for future day/night/weather transitions.
+- `0.1.88-alpha`: Added pass 1 of the day/night cycle control: `G` now toggles the visible `skyMoon` group plus its moon-owned directional and shell-helper lights on/off, while leaving torches, gameplay, rigging, and world geometry untouched.
+- `0.1.87-alpha`: Changed the visible `moon.glb` detail shell from a scene-lit material to a texture-preserving `MeshBasicMaterial`, so the moon keeps its crater detail but no longer receives a hard directional-light terminator from the world moonlight.
+- `0.1.86-alpha`: Restored the editor-lost moon shell opacity/glow settings and the scene-owned `sky-moon-shell-point-light` sync in `world.js`, then cache-busted the app so the restored moon lighting pass definitely loads.
+- `0.1.85-alpha`: Moved the experimental moon PointLight out of module scope and into the world lighting rig as `sky-moon-shell-point-light`, deriving its position from the visible `skyMoon` world position with a small target-facing bias so the church-facing moon shell can be tuned without creating a drifting hidden moon coordinate.
+- `0.1.84-alpha`: Reapplied the crash-lost moon shell `THREE.DoubleSide` material repair on disk, corrected the inner glow formula comment for the current `14.75` diameter, and cache-busted the app so the saved moon rendering pass definitely loads.
+- `0.1.83-alpha`: Forced the transparent `moon.glb` detail shell to render `THREE.DoubleSide` so the inner self-lit glow reads through from the church-facing side as well as the opposite side, while keeping `skyMoon` as the moonlight positional authority.
+- `0.1.82-alpha`: Reworked the moon glow to preserve `moon.glb` surface detail as a mostly opaque outer shell, with a separate 14.75-diameter self-lit inner glow sphere inside the same `skyMoon` group so the moon reads luminous without becoming a flat ping-pong ball.
+- `0.1.81-alpha`: Made the visible `moon.glb` read as luminous by applying cloned emissive/self-lit moon materials after load, while keeping the visible `skyMoon` group as the single positional authority for directional moonlight source and target sync.
+- `0.1.80-alpha`: Centralized moonlight direction in `syncMoonDirectionalLight()` so the visible `skyMoon` world position is the light source and `WORLD_TWEAKS.lighting.moonLightTarget` is the aim point, keeping future sky/day-night movement from drifting away from the actual moon asset.
+- `0.1.79-alpha`: Rebalanced outside lighting toward a moonlit target by setting the hemisphere fill to `0.12`, the directional moon key to `0.18`, and tying that directional light's position to the visible `skyMoon` world position every frame so a future day/night moon path automatically moves the light source with it.
+- `0.1.78-alpha`: Added a seeded outside landmark scatter that places extra live/dead trees plus small campfire, skull, and rock props in broad outside zones while avoiding the church, cave, existing trees, outside walls, and prior landmark colliders.
+- `0.1.77-alpha`: Added `assets/cave.glb` as a world-owned rough cave prop at X20/Z-90 using the same Tinkercad `1000x` fixture-zero loading path as the church shell, plus three simple top-down proxy rectangle colliders that leave the cave mouth approachable.
+- `0.1.76-alpha`: Expanded the outside enclosure to `384 x 384` scene units centered on gameplay X0/Z0, raised the outside ceiling/walls to `36` scene units, moved ghost-sphere wall/ceiling spawning to the new bounds, and kept the rooms/church shell fixed so the matched door alignment stays unchanged.
+- `0.1.75-alpha`: Added `assets/churchRough.glb` as a world-owned visual church shell around the four-room block, preserving the authored fixture zero, applying the required Tinkercad `1000x` millimeter-to-scene-unit scale, tagging the shell for G53 world visibility, and leaving existing procedural room collision unchanged.
+- `0.1.74-alpha`: Added the fourth northwest stone room at X-24/Z-24, connected it to the negative-X and negative-Z rooms with paired wall openings, kept the existing torch/stone/collider construction path, and documented the four-room block dimensions for outside asset fitting.
+- `0.1.73-alpha`: Extracted weapon workholding into `sword.js`, moving sword defaults, offset limits, preset storage, GLB loading/disposal, grip-anchor normalization math, and rightPalm attachment behind a heavily commented sword controller while keeping main.js responsible for player input, arm pose, and combat swing decisions.
+- `0.1.72-alpha`: Added backward-compatible 3D sword grip trim controls (`swordGripX/Y/Z`) so the wrapper origin can be placed across the handle thickness while the existing `grip point` still controls the sword's longest blade axis; full rig saves, sword presets, and Puppet Shop attachment snapshots now carry the new trim values.
+- `0.1.71-alpha`: Added a sword-only preset library under `Sword Offsets`, with preset name, save/load/delete/list/copy JSON actions, stored separately from full rig tuning so current and future weapon workholding setups can be reused without loading an entire rig.
+- `0.1.70-alpha`: Widened Sword Offsets travel for `plainSword.glb` fitting, shared those limits between GUI/sanitizer/normalization, and added a narrow legacy-default migration so old saved sword offsets no longer silently override the current built-in sword setup.
+- `0.1.69-alpha`: Made enemy spawn fade-in visual-only: enemies now enter active combat immediately on spawn while opacity still ramps in, so movement, prompts, and sword hits are no longer blocked by the materialization timer.
+- `0.1.68-alpha`: Decoupled cold-start combat from the oracle HUD: d20 result now rolls and applies enemy pressure immediately, combat enters active state immediately, and the HUD/d20 presentation starts 0.25 seconds later as a non-blocking 3.0 second omen.
+- `0.1.67-alpha`: Added placeholder oracle-roll result messages from `placeholder.md` to the HUD, centered at X88.9 mm / Y-57.15 mm, styled in Caesar Dressing with #F5F5F5 at 37% opacity, and calibrated the longest placeholder to the requested 105 mm proportional width.
+- `0.1.66-alpha`: Reduced the HUD-pinned oracle d20 radius from `0.5616` to `0.4493` so the corner-to-corner silhouette sits more comfortably inside the HUD.
+- `0.1.65-alpha`: Moved the real 3D oracle d20 onto the HUD center at X88.9 mm / Y-57.15 mm, aimed the settled numbered face toward the camera, and reduced the die radius by 22%.
+- `0.1.64-alpha`: Extended the oracle-roll HUD right edge from X101.6 mm to X152.4 mm while keeping the original X25.4 mm left edge anchored.
+- `0.1.63-alpha`: Added a passive screen-space oracle-roll HUD at the requested machinist-coordinate position, with #69966C at 45% opacity, an outside #999B9B border, 3.175 mm proportional corner radius, and 0.3 second fade in/out during the visible d20 roll only.
+- `0.1.62-alpha`: Synced runtime/cache/doc build numbers, added the entity layer to README architecture notes, documented the current player-vs-entity boundary and console spawn helpers, and added `entity.js` / `entityControllers.js` to verification.
+- `0.1.61-alpha`: Ability to call up additional rigs in DevTools Console successful. Simultaneous RMB/LMB bug being forced by browser is patched with `mousedown` listener.
+- `0.1.60-alpha`: patched bug where player animation was lost while loading in the Puppet Shop, `Ambeht` (Service) is now an independent entity from the Puppet Workshop. Name of main character has changed.
+- `0.1.59-alpha`: Bind rigging updated in Puppet Shop.
+- `0.1.58-alpha`: Cordoned off player from Puppet Workshop, created `Puppet Shop`, setting up for NPC and Enemy rigging.
 - `0.1.57-alpha`: repositioned camera view to 3rd person, added in mouse controls for player panning right left/looking up and down. These are only active when RMB is pressed to not interfere with dev mode. LMB now swings sword. All existing controls were preserved/
-- `0.1.56-alpha`: islolated enemy into a factory `enemy.js` Added second enemy encounter. Added logic for sound and d20 behavior upon additional encounters.
-- `0.1.55-alpha`: creates music module `audieManager.js` and d20 module `oricleD20.js`. Replace existing track for encounters with `combatIntro.ogg` and `cobatLoop.ogg`.
+- `0.1.56-alpha`: isolated enemy into a factory `enemy.js` Added second enemy encounter. Added logic for sound and d20 behavior upon additional encounters.
+- `0.1.55-alpha`: creates music module `audioManager.js` and d20 module `oracleD20.js`. Replace existing track for encounters with `combatIntro.ogg` and `combatLoop.ogg`.
 - `0.1.54-alpha`: Moved the moon/sky focal object into `world.js`, renamed the active runtime handle from the old `jupiter` name to `skyMoon`, moved current encounter data to `skyMoonColor`, and kept old `jupiterColor` / `jupiterScale` action names as compatibility aliases.
 - `0.1.53-alpha`: Extracted audio ownership into `audioManager.js`; main now creates one audio manager, combat delegates ambient/combat music fades to it, world encounter audio actions call it instead of mutating an Audio element, and verification now checks the audio module.
 - `0.1.52-alpha`: Extracted the physical d20/oracle mechanic into `oracleD20.js`; combat now delegates die config, mesh creation, face/value mapping, roll quaternions, roll value, settled state, and rolling updates to the oracle module while keeping enemy decisions, banners, and encounter phases in `combat_updated.js`.
@@ -279,6 +438,7 @@ Open this folder with VS Code Live Server and launch `index.html`.
 - `Z`: toggle left arm up.
 - `X`: toggle right arm up.
 - `H`: toggle both hands half high.
+- `G`: toggle the moon / ghost-sphere night-sky system, switch the sky between night and desaturated `#CEEAFA` day color, and swap moonlight for warm `#FBF6D6` sunlight plus day fill.
 - `J`: jump.
 - `Space`: wave both arms.
 - `1`: equip `assets/plainSword.glb` in the right hand and enter combat stance.
@@ -383,6 +543,12 @@ Tuning saves in browser `localStorage` under:
 
 ```text
 empyrean.puppetWorkshop.rigTuning.v1
+```
+
+Sword-only presets save in browser `localStorage` under:
+
+```text
+empyrean.swordPreset.library.v1
 ```
 
 Use `Rig Save > copy/log JSON` to copy a portable tuning snapshot into the console/clipboard.
