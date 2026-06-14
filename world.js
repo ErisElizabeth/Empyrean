@@ -77,8 +77,17 @@ const WORLD_TWEAKS = {
           around the shell. Matching them makes the night sky read as one field.
         */
         skyColor: "#131862",
-        fogColor: "#131862",
-        fogDensity: 0.018,
+        /*
+          Night distance haze.
+
+          This is deliberately darker and less dense than the visible sky color.
+          If fogColor matches skyColor too closely, far trees/rocks/cathedrals
+          blend toward purple-blue before their own material colors can read.
+          Keeping the sky color intact while darkening/thinning the fog preserves
+          the mood without painting every distant object the sky color.
+        */
+        fogColor: "#080A20",
+        fogDensity: 0.006,
         outsideShellColor: "#131862",
         outsideShellOpacity: 1,
         hemisphereSkyColor: "#91aa91",
@@ -146,8 +155,8 @@ const WORLD_TWEAKS = {
     palettes: {
       night: {
         sceneBackground: "#131862",
-        fogColor: "#131862",
-        fogDensity: 0.018,
+        fogColor: "#080A20",
+        fogDensity: 0.006,
         rendererClearColor: "#131862",
         rendererClearAlpha: 1,
         outsideWallColor: "#131862",
@@ -173,7 +182,7 @@ const WORLD_TWEAKS = {
     */
     assetPath: "assets/moon.glb",
     targetDiameter: 15,
-    position: [0, 7.5, 30],
+    position: [0, 30, 125],
     fallbackColor: 0x7a7979,
     /*
       Visual moon shell/glow.
@@ -274,41 +283,91 @@ const WORLD_TWEAKS = {
       move the rooms or church shell, so the matched church door stays matched.
     */
     outsideSize: 384,
-    outsideHeight: 36,
+    outsideHeight: 75,
     outsideCenterX: 0,
     outsideCenterZ: 0,
   },
   churchShell: {
     /*
-      churchRough.glb is the authored architectural wrapper for the four-room
-      block.
+      Cathedral_lowPoly2.glb is the staged replacement for the original rough
+      church wrapper around the four-room block.
+
+      Staging note:
+        Keep the existing "churchShell" config owner for now. The room collision,
+        G53 visibility tagging, docs, and later collider work still refer to this
+        as the church shell. A later cleanup pass can rename the system once the
+        cathedral visual, colliders, and torches have all settled.
 
       Tinkercad exports millimeters as meters inside GLB files. The raw mesh
-      dimensions inspect as roughly 0.048 x 0.048 x 0.050, even though the model
-      was built from the room-block millimeter dimensions. Scaling by 1000 makes:
+      dimensions inspect as meter-sized numbers even though the model was built
+      from millimeter dimensions. Scaling by 1000 puts the shell back in Empyrean
+      scene units:
 
-        0.04882 exported units * 1000 = 48.82 Empyrean scene units
+        exported GLB units * 1000 = Empyrean scene units
 
-      That puts the shell in the same unit language as roomSize = 24.
+      That keeps the shell in the same unit language as roomSize = 24.
 
-      Do not normalize or center this asset here. The model origin was authored
-      deliberately so CAD X0/Y0 maps to gameplay X0/Z0. The GLB already contains
-      a parent rotation from the Tinkercad exporter that maps:
+      Do not normalize or center this asset here. The low-poly cathedral's origin
+      and bounds are handled through the temporary calibration constants below,
+      giving the staged calibration passes one obvious place to tune placement.
 
-        model X -> gameplay X
-        model Y -> gameplay -Z
-        model Z -> gameplay Y
+      Current low-poly2 transformed source bounds before Empyrean scaling:
+        raw size ~= 84.951 x 51.497 x 67.514 GLB units
 
-      In other words: load, scale, place at origin. Let the model's own fixture
-      zero do the alignment work.
+      With sceneUnitScale 1000 and scaleMultiplier 0.00065:
+        effective scale = 0.65
+        approximate world size ~= 55.2 x 33.5 x 43.9 scene units
     */
-    assetPath: "assets/churchRough.glb",
+    assetPath: "assets/Cathedral_lowPoly2.glb",
+    texturePath: "assets/texture_0.png",
+    textureRepeat: [1, 1],
     sceneUnitScale: 1000,
+    /*
+      Temporary calibration transform constants for the staged cathedral swap.
+      The lowPoly2 export is already grounded through its Tinkercad axis
+      conversion parent, so Y can stay at 0. Keep future fit tweaks here instead
+      of scattering magic numbers through the loader.
+    */
+    scaleMultiplier: 0.00065,
     position: [0, 0, 0],
+    rotation: [0, 0, 0],
+    showTemporaryBoundsHelper: true,
+    temporaryBoundsHelperColor: "#e0dcdc",
+    proxyColliders: {
+      /*
+        Rough Pass 6 collision for the staged cathedral shell.
+
+        These are intentionally simple gameplay proxies, not mesh-accurate
+        collision. Rectangles stand in for the outer wall run, and circles reuse
+        the same collision shape as trees for column-like blockers.
+
+        The southern/front wall is split into two rectangles so the existing
+        outside approach has a usable opening near gameplay X0. These numbers
+        can be nudged later once the visual shell is final enough to tune by eye.
+      */
+      walls: [
+        { label: "cathedral-north-wall", center: [-5.54, -10.69], size: [55.2, 1.2] },
+        { label: "cathedral-west-wall", center: [-33.15, 11.25], size: [1.2, 43.9] },
+        { label: "cathedral-east-wall", center: [22.07, 11.25], size: [1.2, 43.9] },
+        { label: "cathedral-south-west-wall", center: [-20.08, 33.19], size: [26.14, 1.2] },
+        { label: "cathedral-south-east-wall", center: [14.53, 33.19], size: [15.06, 1.2] },
+      ],
+      columns: [
+        { label: "cathedral-column-west-1", center: [-24, 18], radius: 0.9 },
+        { label: "cathedral-column-west-2", center: [-24, 27], radius: 0.9 },
+        { label: "cathedral-column-midwest-1", center: [-12, 18], radius: 0.9 },
+        { label: "cathedral-column-midwest-2", center: [-12, 27], radius: 0.9 },
+        { label: "cathedral-column-mideast-1", center: [0, 18], radius: 0.9 },
+        { label: "cathedral-column-mideast-2", center: [0, 27], radius: 0.9 },
+        { label: "cathedral-column-east-1", center: [12, 18], radius: 0.9 },
+        { label: "cathedral-column-east-2", center: [12, 27], radius: 0.9 },
+      ],
+    },
   },
   cave: {
     /*
-      cave.glb uses the same Tinkercad export path as churchRough.glb.
+      cave.glb uses the same Tinkercad export path as the church/cathedral
+      shell assets.
 
       That means:
         - the GLB contains a parent matrix that maps CAD X/Y floor work into
@@ -352,6 +411,26 @@ const WORLD_TWEAKS = {
     floorDisplacement: "assets/stoneFloorDisp.png",
     wallDiffuse: "assets/stoneWallDiff.jpg",
     wallDisplacement: "assets/StoneWallDisp.png",
+  },
+  legacyRoomVisuals: {
+    /*
+      Pass 7 cathedral cleanup.
+
+      The procedural four-room block still provides useful collision, floors,
+      doors, and known layout math. Its old walls, ceilings, and torches now sit
+      inside the cathedral shell, so they are kept in the scene graph but marked
+      visible = false.
+
+      Why visible=false instead of opacity=0:
+        opacity=0 can still submit transparent draw work.
+        visible=false lets Three.js skip rendering the object.
+
+      Collision is unaffected because collision rectangles live separately in
+      worldCollision and are registered by addSolidRect().
+    */
+    hideWalls: true,
+    hideCeilings: true,
+    hideTorches: true,
   },
   torches: {
     assetPath: "assets/torch.glb",
@@ -681,6 +760,7 @@ export function getDefaultSkyMoonColor() {
 // ---------------------------------------------------------------------------
 const textureLoader = new THREE.TextureLoader();
 const gltfLoader = new GLTFLoader();
+let cathedralShellTexture = null;
 let torchPrototype = null;
 let torchIsLoading = false;
 const pendingTorchMounts = [];
@@ -1102,7 +1182,7 @@ export const worldCollision = {
 
     bounds:       Outside box that keeps the player inside the explorable area.
     solidRects:   Axis-aligned wall rectangles in top-down X/Z space.
-    solidCircles: Circular obstacles (trees).
+    solidCircles: Circular obstacles (trees, landmarks, rough columns).
   */
   bounds: null,
   solidRects: [],
@@ -1147,6 +1227,7 @@ export function buildExplorationWorld() {
 
   group.add(createOutsideEnclosure());
   group.add(createChurchShell());
+  addChurchShellProxyColliders();
   group.add(createCaveProp());
   addCaveProxyColliders();
 
@@ -1297,13 +1378,13 @@ function logCaveBounds(group) {
 
 function createChurchShell() {
   /*
-    Creates an immediately available placeholder for the authored church shell.
+    Creates an immediately available placeholder for the authored cathedral shell.
 
     Why a placeholder group:
       GLB loading is asynchronous. buildExplorationWorld() must return a complete
       world group right away so startup can continue. The placeholder lets the
-      scene graph keep a stable world-owned object while churchRough.glb loads in
-      the background.
+      scene graph keep a stable world-owned object while Cathedral_lowPoly.glb
+      loads in the background.
 
     Collision note:
       This is visual architecture only for this pass. The existing procedural
@@ -1313,25 +1394,30 @@ function createChurchShell() {
   */
   const group = new THREE.Group();
 
-  group.name = "church-rough-shell";
+  group.name = "cathedral-shell";
   group.userData.g53VisibilityRole = "wall";
   group.position.set(...WORLD_TWEAKS.churchShell.position);
+  group.rotation.set(...WORLD_TWEAKS.churchShell.rotation);
 
   gltfLoader.load(
     WORLD_TWEAKS.churchShell.assetPath,
     (gltf) => {
       const shell = gltf.scene;
 
-      shell.name = "church-rough-shell-model";
-      shell.scale.setScalar(WORLD_TWEAKS.churchShell.sceneUnitScale);
+      shell.name = "cathedral-shell-model";
+      shell.scale.setScalar(
+        WORLD_TWEAKS.churchShell.sceneUnitScale *
+          WORLD_TWEAKS.churchShell.scaleMultiplier,
+      );
       prepareChurchShellModel(shell);
       group.add(shell);
+      addTemporaryChurchShellBoundsHelper(group, shell);
       logChurchShellBounds(group);
     },
     undefined,
     (error) => {
       console.warn(
-        "[world] failed to load churchRough.glb; procedural rooms remain active",
+        "[world] failed to load cathedral shell asset; procedural rooms remain active",
         error,
       );
     },
@@ -1347,15 +1433,148 @@ function prepareChurchShellModel(model) {
     G53 rigging mode fades/hides world clutter by reading g53VisibilityRole on
     actual mesh objects. The placeholder group has no material of its own, so
     each child mesh also receives the "wall" role.
+
+    Texture note for Cathedral_lowPoly2:
+      The GLB has vertex positions/colors but no TEXCOORD_0 UV attribute, so the
+      external texture_0.png cannot map itself automatically. For this staged
+      pass, each mesh gets a simple generated box-projection UV set before the
+      texture is assigned. It is intentionally practical, not final art UV work.
   */
   model.traverse((child) => {
     child.userData.g53VisibilityRole = "wall";
 
     if (child.isMesh) {
+      prepareCathedralShellMaterial(child);
       child.castShadow = false;
       child.receiveShadow = true;
     }
   });
+}
+
+function prepareCathedralShellMaterial(mesh) {
+  /*
+    Applies the staged external cathedral texture.
+
+    The low-poly2 GLB is intentionally light, but it does not carry a texture
+    reference or UVs. This function keeps the workaround local:
+      1. create UVs if the geometry has none
+      2. reuse one loaded texture object for all shell meshes
+      3. clone the GLB material so other loaded assets are not affected
+  */
+  const texture = getCathedralShellTexture();
+
+  if (!mesh.geometry.attributes.uv) {
+    generateBoxProjectionUvs(mesh.geometry);
+  }
+
+  const material = mesh.material?.clone?.() || new THREE.MeshStandardMaterial();
+
+  material.map = texture;
+  material.color.set(0xffffff);
+  material.roughness = 0.88;
+  material.metalness = 0;
+  material.side = THREE.DoubleSide;
+  material.needsUpdate = true;
+  mesh.material = material;
+}
+
+function getCathedralShellTexture() {
+  if (!cathedralShellTexture) {
+    cathedralShellTexture = textureLoader.load(WORLD_TWEAKS.churchShell.texturePath);
+    cathedralShellTexture.colorSpace = THREE.SRGBColorSpace;
+    cathedralShellTexture.wrapS = THREE.RepeatWrapping;
+    cathedralShellTexture.wrapT = THREE.RepeatWrapping;
+    cathedralShellTexture.repeat.set(...WORLD_TWEAKS.churchShell.textureRepeat);
+  }
+
+  return cathedralShellTexture;
+}
+
+function generateBoxProjectionUvs(geometry) {
+  /*
+    Creates UVs from local geometry bounds.
+
+    For each vertex, the dominant normal axis chooses which face projection to
+    use:
+      mostly vertical normal -> X/Z projection
+      mostly X-facing normal -> Z/Y projection
+      mostly Z-facing normal -> X/Y projection
+
+    This is a compact stand-in for authored UVs. It gives the separate texture
+    stable coordinates while the cathedral model is still being iterated.
+  */
+  if (!geometry.attributes.normal) {
+    geometry.computeVertexNormals();
+  }
+
+  geometry.computeBoundingBox();
+
+  const box = geometry.boundingBox;
+  const position = geometry.attributes.position;
+  const normal = geometry.attributes.normal;
+  const uv = new Float32Array(position.count * 2);
+  const size = new THREE.Vector3();
+
+  box.getSize(size);
+  size.x = Math.max(size.x, 0.0001);
+  size.y = Math.max(size.y, 0.0001);
+  size.z = Math.max(size.z, 0.0001);
+
+  for (let index = 0; index < position.count; index += 1) {
+    const x = position.getX(index);
+    const y = position.getY(index);
+    const z = position.getZ(index);
+    const nx = Math.abs(normal.getX(index));
+    const ny = Math.abs(normal.getY(index));
+    const nz = Math.abs(normal.getZ(index));
+    let u = 0;
+    let v = 0;
+
+    if (ny >= nx && ny >= nz) {
+      u = (x - box.min.x) / size.x;
+      v = (z - box.min.z) / size.z;
+    } else if (nx >= nz) {
+      u = (z - box.min.z) / size.z;
+      v = (y - box.min.y) / size.y;
+    } else {
+      u = (x - box.min.x) / size.x;
+      v = (y - box.min.y) / size.y;
+    }
+
+    uv[index * 2] = u;
+    uv[index * 2 + 1] = v;
+  }
+
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+}
+
+function addTemporaryChurchShellBoundsHelper(group, shell) {
+  /*
+    Pass 1 calibration helper.
+
+    The old wall colliders are intentionally still active, so this line box is
+    only a visual check for the new cathedral's loaded envelope. It is tagged
+    with the same G53 role as architecture so rigging mode can hide/fade it with
+    the rest of the world clutter. Remove or fold this into the normal World
+    Debug overlay after the cathedral transform/colliders are finalized.
+  */
+  if (!WORLD_TWEAKS.churchShell.showTemporaryBoundsHelper) {
+    return;
+  }
+
+  const helper = new THREE.BoxHelper(
+    shell,
+    WORLD_TWEAKS.churchShell.temporaryBoundsHelperColor,
+  );
+
+  helper.name = "debug-cathedral-bounds-helper";
+  helper.userData.g53VisibilityRole = "wall";
+  helper.material.transparent = true;
+  helper.material.opacity = 0.72;
+  helper.material.depthTest = false;
+  helper.renderOrder = 58;
+  group.add(helper);
+  helper.update();
 }
 
 function logChurchShellBounds(group) {
@@ -1370,7 +1589,7 @@ function logChurchShellBounds(group) {
   const box = new THREE.Box3().setFromObject(group);
   const size = box.getSize(new THREE.Vector3());
 
-  console.info("[world] church shell loaded", {
+  console.info("[world] cathedral shell loaded", {
     assetPath: WORLD_TWEAKS.churchShell.assetPath,
     min: {
       x: Number(box.min.x.toFixed(3)),
@@ -1387,6 +1606,36 @@ function logChurchShellBounds(group) {
       y: Number(size.y.toFixed(3)),
       z: Number(size.z.toFixed(3)),
     },
+  });
+}
+
+function addChurchShellProxyColliders() {
+  /*
+    Registers rough cathedral blockers into the existing collision system.
+
+    Why this lives beside the shell config:
+      The cathedral visual is still being tuned, so its collision also belongs
+      in the staged churchShell block for now. Once the building is final, these
+      numbers can either stay as documented simple proxies or move into a more
+      permanent cathedral/world-structure section.
+
+    Shape ownership:
+      walls   -> addSolidRect(), same as room/outside/cave wall proxies
+      columns -> addSolidCircle(), same as tree/landmark circular blockers
+  */
+  const { proxyColliders } = WORLD_TWEAKS.churchShell;
+
+  proxyColliders.walls.forEach((wall) => {
+    const [centerX, centerZ] = wall.center;
+    const [width, depth] = wall.size;
+
+    addSolidRect(centerX, centerZ, width, depth);
+  });
+
+  proxyColliders.columns.forEach((column) => {
+    const [centerX, centerZ] = column.center;
+
+    addSolidCircle(centerX, centerZ, column.radius);
   });
 }
 
@@ -1481,6 +1730,7 @@ function createRoom({ name, center, doors = {} }) {
   ceiling.userData.g53VisibilityRole = "ceiling";
   floor.position.set(0, localFloorY, 0);
   ceiling.position.set(0, roomSize / 2, 0);
+  suppressLegacyRoomVisual(ceiling, "legacy-room-ceiling");
   roomGroup.add(floor, ceiling);
 
   addRoomWall(roomGroup, center, "north", doors.north);
@@ -1524,6 +1774,7 @@ function addRoomTorches(roomGroup) {
         y,
       );
 
+      suppressLegacyRoomVisual(mount, "legacy-room-torch");
       roomGroup.add(mount);
       attachTorchModelWhenReady(mount);
     });
@@ -1804,6 +2055,7 @@ function addWallSegment(
   mesh.userData.g53VisibilityRole = "wall";
   mesh.material.transparent = true;
   mesh.material.opacity = roomWallOpacity;
+  suppressLegacyRoomVisual(mesh, "legacy-room-wall");
   roomGroup.add(mesh);
 
   if (blocksMovement) {
@@ -1814,6 +2066,29 @@ function addWallSegment(
       isNorthSouth ? wallThickness : alongLength,
     );
   }
+}
+
+function suppressLegacyRoomVisual(object, reason) {
+  /*
+    Hides old procedural room shell pieces while preserving their construction
+    path and collision side effects.
+
+    The object still exists for future reactivation and for any code that expects
+    the room hierarchy to be present. It simply stops participating in rendering.
+  */
+  const shouldHide =
+    (reason === "legacy-room-wall" && WORLD_TWEAKS.legacyRoomVisuals.hideWalls) ||
+    (reason === "legacy-room-ceiling" &&
+      WORLD_TWEAKS.legacyRoomVisuals.hideCeilings) ||
+    (reason === "legacy-room-torch" &&
+      WORLD_TWEAKS.legacyRoomVisuals.hideTorches);
+
+  if (!shouldHide) {
+    return;
+  }
+
+  object.visible = false;
+  object.userData.cathedralSuppressedVisual = reason;
 }
 
 function addSolidRect(centerX, centerZ, width, depth) {

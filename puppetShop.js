@@ -151,14 +151,25 @@ export function createPuppetRigPackage({
     rigTuning: tuning,
     /*
       Readable skeleton snapshot:
-        dimensions describe body proportions
-        jointPointOffsets describe pivot placement
-        bindRotationOffsets describe rest-pose orientation corrections
+      dimensions describe body proportions
+      jointPointOffsets describe pivot placement
+      bindRotationOffsets describe rest-pose orientation corrections
 
       These are duplicated from rigTuning for clarity and future NPC reuse.
     */
     skeleton: {
       dimensions: pickFields(tuning, [
+        "headY",
+        "neckY",
+        "chestY",
+        "torsoY",
+        "pelvisY",
+        "shoulderX",
+        "hipX",
+        "upperArmLength",
+        "forearmLength",
+        "thighLength",
+        "shinLength",
         "totalHeight",
         "headHeight",
         "neckLength",
@@ -335,6 +346,62 @@ export function savePuppetRigPackageToLibrary(storage, packagePayload) {
   writePuppetRigLibrary(storage, library);
 
   return packageCopy;
+}
+
+export function getPuppetRigLibrarySnapshot(storage) {
+  /*
+    Returns a JSON-safe copy of the browser rig library.
+
+    This is for file backup/export only. Gameplay should still ask for one rig
+    by name through loadPuppetRigPackageFromLibrary().
+  */
+  return cloneJson(readPuppetRigLibrary(storage));
+}
+
+export function importPuppetRigLibrarySnapshot(
+  storage,
+  libraryPayload,
+  { merge = true } = {},
+) {
+  /*
+    Imports a rig-library backup into the browser's temporary local shelf.
+
+    Accepted shapes:
+      - full library backup: { schema, savedAt, rigs: { name: package } }
+      - single rig package:  { kind: empyrean.puppetRig.package, ... }
+
+    The import merges by default so a backup cannot accidentally wipe today's
+    browser shelf unless future UI intentionally asks for replace semantics.
+  */
+  const current = merge
+    ? readPuppetRigLibrary(storage)
+    : { schema: PUPPET_RIG_PACKAGE_SCHEMA, savedAt: "", rigs: {} };
+  let incomingRigs = null;
+
+  if (
+    libraryPayload?.rigs &&
+    typeof libraryPayload.rigs === "object" &&
+    !Array.isArray(libraryPayload.rigs)
+  ) {
+    incomingRigs = libraryPayload.rigs;
+  } else if (libraryPayload?.kind === PUPPET_RIG_PACKAGE_KIND) {
+    const name = normalizePuppetRigName(
+      libraryPayload?.metadata?.name ||
+        libraryPayload?.rigTuning?.puppetRigName,
+    );
+    incomingRigs = { [name]: libraryPayload };
+  }
+
+  if (!incomingRigs) {
+    throw new Error("[puppetShop] Import needs a rig library or rig package.");
+  }
+
+  current.rigs = {
+    ...(current.rigs || {}),
+    ...cloneJson(incomingRigs),
+  };
+
+  return writePuppetRigLibrary(storage, current);
 }
 
 export function loadPuppetRigPackageFromLibrary(storage, name) {

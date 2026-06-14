@@ -20,9 +20,15 @@ This is the shortest map for coming back to Empyrean after a break.
 
 If those three things work, the project is in a sane state.
 
+Important rig persistence rule:
+
+- The player default loads from `assets/rigs/player.default.rig.json`.
+- Browser `localStorage` is only a scratch shelf.
+- Use `Puppet Shop > save named rig + file` or `export selected rig` when a rig matters.
+
 ## Current Build
 
-Current build: `0.1.97-alpha`
+Current build: `0.1.109-alpha`
 
 The project currently has:
 
@@ -36,10 +42,14 @@ The project currently has:
 - EMPYREAN stone title card loader
 - puppet skeleton
 - mesh import and generated rigging
+- project-owned default player rig at `assets/rigs/player.default.rig.json`
+- guided Rigging Wizard opened by `F2`
 - Rig Mesh Mode
 - Puppet Shop named reusable rig packages
+- Puppet Shop file export/import for selected rigs and whole rig libraries
 - World Debug collision overlays
 - encounter trigger zones
+- cathedral replacement Pass 0: active encounters parked outside the room/church work area
 - sword combat prototype
 - actual rough-stone numbered 3D d20 for combat rolls
 - post-rig T/A reference arms visibly returning to relaxed gameplay rest without resetting rig calibration
@@ -67,9 +77,9 @@ The project currently has:
 - Low Guard stance on sword draw
 - Shift+W running cycle with tunable stride, bounce, lean, and arm pump
 - neutral body/knee facing correction so `rightPalm` reads as anatomical right and lower legs/feet face correctly
-- stone room textures and dim torch lighting for the interior rooms
+- stone room floors remain, while legacy room walls/ceilings/torches are render-suppressed behind the cathedral shell
 - four-room stone block footprint: nominal `48 x 48 x 24` scene units, or `48.1 x 48.1 x 24.1` including the current `0.1` wall/floor/ceiling thickness
-- churchRough.glb visual shell loaded around the four-room block from its authored CAD fixture zero
+- Cathedral_lowPoly2.glb visual shell loaded around the four-room block with temporary calibration constants
 - expanded outside enclosure: `384 x 384 x 36` scene units, centered on gameplay `X0/Z0`
 - cave.glb rough-draft world prop at `X20/Z-90` with simple proxy rectangle colliders
 - seeded outside landmark scatter using extra trees, dead trees, rocks, skulls, and campfires
@@ -130,22 +140,21 @@ This gives you design information without needing to touch complicated rig code.
 
 ## Best Rig Task Right Now
 
-Open:
+Press:
 
 ```text
-Rig Mesh Mode
+F2
 ```
 
 Recommended flow:
 
-1. Turn on `rig mesh mode`.
-2. Start with `keep current pose`.
-3. Click `1 render mesh`.
-4. Tune pivots with `Joint Point Offsets`.
-5. Try `A pose` only if the mesh shoulders need it.
-6. Use `T pose` when the source mesh is modeled straight out from the shoulders.
-7. Click `2 rig mesh`; preview rigging now commits your pivot setup and relaxes the visible arms after binding.
-8. Test walk, jump, arms, idle, `1` combat stance, and `Enter` sword swing.
+1. Press `F2`; the Rigging Wizard opens and starts G53 alignment mode.
+2. Choose a `.glb` file. The wizard saves an `assets/name.glb` path, so make sure reusable NPC/enemy meshes live in `assets/`.
+3. Pick `Current`, `A Pose`, or `T Pose`; the wizard applies the bind/reference pose immediately.
+4. Tune pivots with mouse joint editing, G53 axis locks, and Joint Point Offset sliders.
+5. Click `4 rig`; preview rigging commits your pivot setup and relaxes visible gameplay arms after binding.
+6. Use the wizard test buttons for idle, walk, run, jump, draw sword, and swing.
+7. Set a rig name in `Puppet Shop`, then click `6 save named rig` in the wizard.
 
 ## Good 15-Minute Tasks
 
@@ -163,7 +172,7 @@ Recommended flow:
 - Use `Sword Offsets > save preset` / `load preset` to preserve weapon-only setups without saving the entire rig.
 - Use `Mesh > relax visible arms` if a test pose or old saved arm command leaves the arms raised after rigging.
 - Press `Y`, move `devProbe`, and copy rig-local values for sword or hitbox experiments.
-- Press `F2`, tune a pivot at machine home, then press `F2` again to confirm gameplay restores cleanly.
+- Press `F2`, use the Rigging Wizard to tune a pivot at machine home, then close the wizard to confirm gameplay restores cleanly.
 
 ## Save These For A Longer Session
 

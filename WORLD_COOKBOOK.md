@@ -49,10 +49,27 @@ Including visible wall/floor/ceiling thickness:
 The northwest room is at negative X and negative Z. In `world.js` naming,
 negative X is the west direction and negative Z is the north direction.
 
-## Current Church Shell
+## Current Cathedral Shell
 
-`assets/churchRough.glb` is loaded by `world.js` as a visual shell around the
-four-room block.
+`assets/Cathedral_lowPoly2.glb` is loaded by `world.js` as the active visual
+shell around the four-room block. Its separate `assets/texture_0.png` is applied
+in `prepareChurchShellModel()` with generated box-projection UVs because the GLB
+does not include authored `TEXCOORD_0` texture coordinates.
+
+The older `assets/churchRough.glb`, high-poly `assets/Cathedral.glb`, and first
+low-poly `assets/Cathedral_lowPoly.glb` remain in the assets folder as archived
+references during the staged replacement, but they are no longer the active
+world shell.
+
+Pass 6 collision is deliberately rough: five rectangle wall proxies block the
+outer cathedral footprint while leaving a south/front opening, and eight circular
+column proxies reuse the existing tree-style collision path. Turn on World Debug
+wall/tree colliders to see them.
+
+Pass 7 keeps the old procedural room hierarchy and collision math, but hides the
+legacy room walls, ceilings, and torch mounts with `visible = false` while the
+cathedral shell is active. The floor surfaces remain visible as navigable ground
+reference, and the existing collider rectangles still work.
 
 The asset was authored in millimeters, but Tinkercad GLB export stores those
 numbers as meters. `WORLD_TWEAKS.churchShell.sceneUnitScale` is therefore set to

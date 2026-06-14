@@ -1,10 +1,10 @@
-# Empyrean Puppet Workshop
+# Empyrean
 
-Clean skeleton workshop extracted from the avatar STL project.
+A game extracted from a clean skeleton workshop, which in turn was extracted from the avatar STL project.
 
 ## Version
 
-- Empyrean build: `0.1.97-alpha`
+- Empyrean build: `0.1.109-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -28,12 +28,13 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - GLB import with generated skin weights for the Empyrean puppet skeleton
 - separate render, adjust, rig workflow for imported meshes
 - Puppet Shop module and GUI for named reusable complete rig packages
+- project-owned default player rig package at `assets/rigs/player.default.rig.json`
 - entity layer that wraps the player and supports spawned NPC/enemy rigs
 - entity controller scaffold for keyboard/static/future AI control
 - console helpers for spawning and listing saved-rig entities during development
 - keyboard movement and arm pose controls
 - mouse wheel camera zoom
-- browser save/load/export for tuning
+- browser scratch save/load/export for tuning plus real JSON rig-package backups
 - solo-builder docs and checkpoint helper
 - world collision debug overlay
 - data-driven encounter trigger zones
@@ -66,9 +67,9 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - separate `sword.js` module for weapon GLB loading, grip math, attachment, presets, and future weapon-state setup
 - pure combat balance math module and Low Guard stance on sword draw
 - neutral body/knee facing correction so anatomical right/left and foot direction read correctly while the related Y bind-rotation sliders read zero
-- Empyrean room aesthetic pass with stone floor/wall textures, 80% room walls, dim torch props, and warm torch light sources
+- Empyrean room aesthetic pass with stone floor/wall textures, with the old room walls/ceilings/torches now render-suppressed behind the cathedral shell
 - four-room stone block with a northwest room at X-24/Z-24 and full block dimensions documented for outside-shell asset work
-- authored `churchRough.glb` visual shell loaded in `world.js` at the CAD fixture zero and scaled from Tinkercad meters back to Empyrean scene units
+- staged `Cathedral_lowPoly2.glb` visual shell loaded in `world.js` with temporary scale/position calibration constants and a generated-UV pass for `texture_0.png`
 - expanded outside enclosure at `384 x 384 x 36` scene units, centered equally around gameplay X0/Z0
 - `cave.glb` rough-draft world prop near the moon with simple proxy rectangle colliders
 - seeded outside landmark scatter using extra `tree.glb`, `deadTree.glb`, `campfire.glb`, `skull.glb`, `rock1.glb`, and `rock2.glb` props
@@ -232,30 +233,30 @@ Development console helpers:
 
 ### Where to Make Common Changes
 
-| You want to change...                                                       | Go to...                                                                |
-| --------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| Movement speed, camera feel, colors                                         | `SOLO_TWEAKS` near the top of `main.js`                                 |
-| Ambient/combat audio paths, fade behavior, one-shots, pause/resume          | `audioManager.js`                                                       |
-| Sword asset path, scale, grip origin/trim, hand offset, pitch/yaw/roll      | `Sword Offsets` in the GUI                                              |
-| Sword default values, swing timing, hit range                               | `SWORD_TWEAKS` in `sword.js`                                            |
-| Sword offset slider/sanitizer travel limits                                 | `SWORD_OFFSET_LIMITS` in `sword.js`                                     |
-| Sword-only save/load preset behavior                                        | `Sword Offsets` GUI actions in `main.js`, implementation in `sword.js`  |
-| Arm stances and sword swing rotations                                       | `getControlledArmPoseTargets()` in `main.js`                            |
-| Combat balance formulas or Low Guard body/leg stance                        | `combatPhysics.js`                                                      |
-| Physical d20 look, roll timing, face numbers, result-facing quaternion math | `oracleD20.js`                                                          |
-| Oracle-roll HUD screen geometry, color, border, radius, fade timing         | `#oracle-roll-hud` in `styles.css`; timing in `combat_updated.js`       |
-| Neutral anatomical facing correction                                        | `RIG_BASE_BODY_YAW` near the top of `main.js`                           |
-| Complete rig package shape or local rig-library behavior                    | `puppetShop.js`                                                         |
-| Spawned NPC/enemy entity wrappers and entity update scaffold                | `entity.js`                                                             |
-| Entity controller interface and keyboard/static controller stubs            | `entityControllers.js`                                                  |
-| Room size, ghost sphere count, outside geometry                             | `WORLD_TWEAKS` near the top of `world.js`                               |
+| You want to change...                                                       | Go to...                                                                      |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Movement speed, camera feel, colors                                         | `SOLO_TWEAKS` near the top of `main.js`                                       |
+| Ambient/combat audio paths, fade behavior, one-shots, pause/resume          | `audioManager.js`                                                             |
+| Sword asset path, scale, grip origin/trim, hand offset, pitch/yaw/roll      | `Sword Offsets` in the GUI                                                    |
+| Sword default values, swing timing, hit range                               | `SWORD_TWEAKS` in `sword.js`                                                  |
+| Sword offset slider/sanitizer travel limits                                 | `SWORD_OFFSET_LIMITS` in `sword.js`                                           |
+| Sword-only save/load preset behavior                                        | `Sword Offsets` GUI actions in `main.js`, implementation in `sword.js`        |
+| Arm stances and sword swing rotations                                       | `getControlledArmPoseTargets()` in `main.js`                                  |
+| Combat balance formulas or Low Guard body/leg stance                        | `combatPhysics.js`                                                            |
+| Physical d20 look, roll timing, face numbers, result-facing quaternion math | `oracleD20.js`                                                                |
+| Oracle-roll HUD screen geometry, color, border, radius, fade timing         | `#oracle-roll-hud` in `styles.css`; timing in `combat_updated.js`             |
+| Neutral anatomical facing correction                                        | `RIG_BASE_BODY_YAW` near the top of `main.js`                                 |
+| Complete rig package shape or local rig-library behavior                    | `puppetShop.js`                                                               |
+| Spawned NPC/enemy entity wrappers and entity update scaffold                | `entity.js`                                                                   |
+| Entity controller interface and keyboard/static controller stubs            | `entityControllers.js`                                                        |
+| Room size, ghost sphere count, outside geometry                             | `WORLD_TWEAKS` near the top of `world.js`                                     |
 | Sky/fog/grass/outside-wall/world-light atmosphere colors                    | `WORLD_TWEAKS.atmosphere.palettes` and `applyWorldAtmosphere()` in `world.js` |
-| Default body proportions                                                    | `DEFAULT_RIG_DIMENSIONS` in `rig.js`                                    |
-| Trigger zones (enter/exit events)                                           | `encounters.js`                                                         |
-| Enemy combat prototype                                                      | `combat_updated.js`                                                     |
-| Jump feel (gravity, height, duration)                                       | `rigTuning` values in the GUI, or `getJumpGravityValue` in `physics.js` |
-| Walk cycle timing                                                           | `walkPhaseSpeed` in `SOLO_TWEAKS`, walk amplitude sliders in GUI        |
-| Run cycle timing/feel                                                       | `runSpeed` / `runPhaseSpeed` in `SOLO_TWEAKS`, run sliders in `Motion`  |
+| Default body proportions                                                    | `DEFAULT_RIG_DIMENSIONS` in `rig.js`                                          |
+| Trigger zones (enter/exit events)                                           | `encounters.js`                                                               |
+| Enemy combat prototype                                                      | `combat_updated.js`                                                           |
+| Jump feel (gravity, height, duration)                                       | `rigTuning` values in the GUI, or `getJumpGravityValue` in `physics.js`       |
+| Walk cycle timing                                                           | `walkPhaseSpeed` in `SOLO_TWEAKS`, walk amplitude sliders in GUI              |
+| Run cycle timing/feel                                                       | `runSpeed` / `runPhaseSpeed` in `SOLO_TWEAKS`, run sliders in `Motion`        |
 
 ---
 
@@ -318,13 +319,25 @@ max Y =   36.05
 
 The X/Z size is `400%` of the previous `96 x 96` outside enclosure. The positive
 Y height is `150%` of the previous `24` scene-unit outside wall height. Interior
-rooms and `churchRough.glb` are not scaled by this; they stay at the proven door
+rooms and the active cathedral shell are not scaled by this; they stay at the proven door
 alignment.
 
 ---
 
 ## Change Notes
 
+- `0.1.109-alpha`: Reduced night fog washout by decoupling the fog from the visible sky color: night sky remains `#131862`, while distance haze now uses darker, thinner fog (`#080A20`, density `0.006`) so distant props keep more of their material color.
+- `0.1.108-alpha`: Added `restoreSceneKeyboardFocus()` and routed World Debug GUI changes plus scene pointer entry through it so lil-gui checkbox focus does not strand movement keys after toggling debug overlays.
+- `0.1.107-alpha`: Pass 7 for the Cathedral replacement staged workflow: kept the legacy four-room structure and collision data but set old procedural room walls, ceilings, and torch mounts to `visible = false` behind the active cathedral shell, reducing render clutter without deleting the old construction path.
+- `0.1.106-alpha`: Pass 6 for the Cathedral replacement staged workflow: added rough cathedral proxy collision using five rectangle wall blockers with a south/front opening plus eight tree-style circular column blockers, all registered through the existing `worldCollision` rectangle/circle arrays and visible through the existing World Debug overlay.
+- `0.1.105-alpha`: Pass 5 for the Cathedral replacement staged workflow: scaled `assets/Cathedral_lowPoly2.glb` up from the one-room test size to `scaleMultiplier: 0.00065`, giving an approximate `55.2 x 33.5 x 43.9` scene-unit shell while keeping texture wiring, colliders, and torches untouched.
+- `0.1.104-alpha`: Pass 4 for the Cathedral replacement staged workflow: switched the active shell to `assets/Cathedral_lowPoly2.glb`, applied the separate `assets/texture_0.png` through generated box-projection UVs because the GLB has no authored texture coordinates, set the new starting scale to `scaleMultiplier: 0.00027205`, and kept colliders/torches untouched.
+- `0.1.103-alpha`: Pass 3 for the Cathedral replacement staged workflow: reduced the active low-poly cathedral to 25% of the previous calibration size with `scaleMultiplier: 0.012125`, lowered the centered export to `position: [0, 7.33, 0]`, and kept colliders/torches untouched while visual scale is evaluated.
+- `0.1.102-alpha`: Pass 2 for the Cathedral replacement staged workflow: switched the active shell to `assets/Cathedral_lowPoly.glb`, reduced the effective shell scale with `scaleMultiplier: 0.0485`, lifted the centered export to `position: [0, 29.33, 0]`, and kept old colliders/torches untouched for visual calibration.
+- `0.1.101-alpha`: Pass 1 for the Cathedral replacement staged workflow: swapped the active world-owned church shell visual path from `assets/churchRough.glb` to `assets/Cathedral.glb`, preserved the existing fixture-zero scale/position behavior, kept old room/church colliders and torches untouched, and added a temporary cathedral bounds helper for calibration.
+- `0.1.100-alpha`: Pass 0 for the Cathedral replacement staged workflow: moved combat trigger/enemy spawn zones and the data-driven example encounter zones out to the outer world so room/church/cathedral testing is not muddied by active encounters. No cathedral model, collider, torch, rigging, Puppet Shop, or combat behavior rewrite yet.
+- `0.1.99-alpha`: Moved the core player rig source of truth out of browser-only storage: startup now loads `assets/rigs/player.default.rig.json`, Puppet Shop named saves still use the browser shelf but also download a real `.json` backup, and new Export Selected Rig / Export Rig Library / Import Rig Library buttons make rig packages portable.
+- `0.1.98-alpha`: Added a guided Rigging Wizard workflow around the existing mesh/G53/Puppet Shop pipeline: F2 now opens the wizard, starts G53 alignment, offers GLB selection, auto-applies A/T/Current base poses, routes Rig through the current skinning engine, exposes quick motion/sword test buttons, and saves named rig packages while warning about session-only mesh paths.
 - `0.1.97-alpha`: Reduced active day-mode color saturation by 20% for a harsher, dustier daylight look: sky/fog/outside shell now use `#CEEAFA`, day fill uses `#DBE5CB`, and sun color uses `#FBF6D6`.
 - `0.1.96-alpha`: Unified the night sky/background/fog/renderer clear color around `#131862` so the night outside shell and the true scene background no longer split into black/purple bands at camera angles.
 - `0.1.95-alpha`: Converted the outside wall/ceiling sky shell from lit `MeshStandardMaterial` to opaque, double-sided, fog-free `MeshBasicMaterial` so day/night shell color is uniform instead of splitting into several light-dependent blue wall colors; the outside floor is also double-sided and fog-free for the shallow-angle floor diagnostic.
@@ -444,7 +457,7 @@ Open this folder with VS Code Live Server and launch `index.html`.
 - `1`: equip `assets/plainSword.glb` in the right hand and enter combat stance.
 - `2`: despawn the sword and return arms to idle.
 - `Enter`: swing the sword and attempt a combat hit.
-- `F2`: toggle G53-style machine-home rigging mode.
+- `F2`: open/close the Rigging Wizard, which wraps G53-style machine-home rigging mode.
 - `Y`: toggle the TEMP `devProbe` coordinate marker.
 - `Shift` + `J` / `L`: move `devProbe` local X left/right.
 - `Shift` + `U` / `O`: move `devProbe` local Y up/down.
@@ -478,6 +491,30 @@ skeletonRoot.worldToLocal(rigLocalPoint);
 
 Use `Skeleton Lab > guide opacity` when the rigged mesh needs to be visible without the skeleton guide dominating the view.
 
+## Rigging Wizard
+
+This is the preferred mesh-rigging workflow. It is a guided wrapper around the
+same Mesh, G53, skinning, and Puppet Shop functions that already worked.
+
+Step-by-step:
+
+1. Press `F2`, or open `Rigging Wizard > F2 start wizard`.
+2. The wizard opens G53 alignment mode automatically.
+3. Choose a `.glb` file, or type an `assets/name.glb` path and click `1b preview assets path`.
+4. Pick `Current`, `A Pose`, or `T Pose`; the selected base pose applies immediately.
+5. Align pivots using mouse joint editing, axis locks, and Joint Point Offset sliders.
+6. Click `4 rig`.
+7. Test idle, walk, run, jump, draw sword, and swing from the wizard test folder.
+8. Set a rig name in `Puppet Shop`.
+9. Click `6 save named rig`.
+
+Important save rule:
+
+The browser file picker previews a temporary session blob. Reusable NPC/enemy
+packages should save a path like `assets/enemyMage.glb`. The wizard sets that
+shape by default when a file is chosen, but the actual file still needs to live
+in the project `assets/` folder.
+
 ## G53 Rigging Mode
 
 This is the machine-home rigging workflow. It is a temporary setup mode, not gameplay.
@@ -485,7 +522,7 @@ This is the machine-home rigging workflow. It is a temporary setup mode, not gam
 Step-by-step:
 
 1. Load a mesh preview with `Mesh > 1 preview`.
-2. Press `F2`, or open `G53 Rigging Mode > enter / home`.
+2. Open `G53 Rigging Mode > enter / home`, or use the Rigging Wizard with `F2`.
 3. The rig moves to home position `X0 Z0` and `yaw 0`.
 4. Idle motion and walk preview turn off.
 5. Player movement/turning is locked, but camera orbit/zoom/height still works.
@@ -497,7 +534,7 @@ Step-by-step:
 11. Leave `G53 Rigging Mode > hold child points` enabled when you want already-placed limb points to stay put while moving their parent.
 12. Adjust pivots using the existing joint tools.
 13. Click `Mesh > 2 rig mesh`; if a preview is loaded, it rigs the mesh and restores gameplay state.
-14. Press `F2` again any time to exit/restore without undoing your pivot edits.
+14. Use `G53 Rigging Mode > exit / restore`, or close the Rigging Wizard, to exit without undoing your pivot edits.
 
 Axis lock formula:
 
@@ -539,7 +576,15 @@ where `bindPoseTransform` means the saved pivot offsets plus bind-pose rotations
 
 ## Notes
 
-Tuning saves in browser `localStorage` under:
+The default player rig loads from the project file:
+
+```text
+assets/rigs/player.default.rig.json
+```
+
+That file is the important copy. Keep it backed up or under version control.
+
+Scratch tuning can still be saved in browser `localStorage` under:
 
 ```text
 empyrean.puppetWorkshop.rigTuning.v1
@@ -551,7 +596,15 @@ Sword-only presets save in browser `localStorage` under:
 empyrean.swordPreset.library.v1
 ```
 
-Use `Rig Save > copy/log JSON` to copy a portable tuning snapshot into the console/clipboard.
+Use `Puppet Shop > save named rig + file` to save the named rig into the
+temporary browser library and download a real `.json` backup.
+
+Use `Puppet Shop > export selected rig` to download one rig package by name.
+
+Use `Puppet Shop > export rig library` and `Puppet Shop > import rig library`
+to move the whole browser rig shelf in or out as a JSON file.
+
+Use `Save > copy/log JSON` to copy a portable tuning snapshot into the console/clipboard.
 
 Use `Mesh > 1 preview` to load `assets/Sigewynn.glb` as the current default static reference. After placing pivots, use `Mesh > 2 rig mesh` to generate skin weights and drive the GLB from the visible Empyrean puppet rig. `export rig package` copies/logs both the rig tuning and imported mesh binding settings.
 
@@ -622,6 +675,9 @@ Encounters are non-blocking. They do not stop movement. They can run actions whe
 The title-card overlay remains in `index.html` and is revealed/hidden by the loader logic in `main.js`.
 
 ## Rig Mesh Mode
+
+The current preferred workflow is `F2` -> `Rigging Wizard`. This older section is
+kept as a reference for the lower-level mesh-binding controls.
 
 Use `Rig Mesh Mode > rig mesh mode` in the GUI when you want the interface to focus on mesh-binding tasks.
 
@@ -840,7 +896,7 @@ Imported meshes use a generated skin. The GLB is loaded, centered, scaled, optio
 
 Rig Mesh Mode is a GUI organization layer. It does not replace the rigging functions. It groups the render, start-pose, rig, rerig, clear, export, and import actions into one focused folder and hides duplicate manual folders while active.
 
-Puppet Shop is the reusable rig layer. It does not move the player, run combat, or solve collisions. It packages the current rig as an actor-ready setup: full `rigTuning`, joint point offsets, bind rotations, mesh transform, motion sliders, sword/dev attachment offsets, name, and notes. The `Puppet Shop` GUI folder can save that complete package into browser localStorage by name, load it later, delete it, list saved rigs, or copy/paste the JSON package. This is the first step toward using the same rigging skeleton for player bodies, NPCs, enemies, and deliberately "almost human" variants.
+Puppet Shop is the reusable rig layer. It does not move the player, run combat, or solve collisions. It packages the current rig as an actor-ready setup: full `rigTuning`, joint point offsets, bind rotations, mesh transform, motion sliders, sword/dev attachment offsets, name, and notes. The default player package now lives in `assets/rigs/player.default.rig.json` and loads at startup before the skeleton is built. The `Puppet Shop` GUI folder can still save complete packages into browser localStorage by name for quick work, but named saves also download real `.json` backups, and the full browser rig library can be exported/imported as a file. This is the first step toward using the same rigging skeleton for player bodies, NPCs, enemies, and deliberately "almost human" variants.
 
 World Debug is also visual only. It draws the invisible collision and encounter shapes so you can place things by sight. Turning it on does not change movement or collision.
 

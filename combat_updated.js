@@ -102,11 +102,13 @@ const COMBAT_CONFIG = {
   // does NOT cap at two — Step 2 sizes the runtime arrays to whatever you
   // configure here.
   //
-  // Default placements:
-  //   central-room    trigger at [0,4] (rig walks forward from spawn into it)
-  //                   enemy spawns at [0,-8] (north end of central room)
-  //   negative-x-room trigger at [-22,0] (player walks west through door)
-  //                   enemy spawns at [-28,0] (further west, into the room)
+  // Current Pass 0 placement:
+  //   Cathedral replacement work needs the room/church area quiet, so the
+  //   active combat triggers are parked in the south outer field.
+  //
+  // Previous room-area placements, kept here for easy restoration:
+  //   central-room    trigger [0, 4],    enemy [0, -8]
+  //   negative-x-room trigger [-22, 0],  enemy [-28, 0]
   //
   // Adjust the X/Z values to match where you actually want the encounters.
   // ─────────────────────────────────────────────────────────────
@@ -120,8 +122,16 @@ const COMBAT_CONFIG = {
       opacity: 0.25, // requirement #3: trigger visible at 25%
     },
     zones: [
-      { id: "central-room",    position: [0, 4],    spawnPosition: [0, -8] },
-      { id: "negative-x-room", position: [-22, 0],  spawnPosition: [-28, 0] },
+      {
+        id: "outer-southeast-field",
+        position: [132, 132],
+        spawnPosition: [142, 132],
+      },
+      {
+        id: "outer-southwest-field",
+        position: [-132, 132],
+        spawnPosition: [-142, 132],
+      },
     ],
   },
 

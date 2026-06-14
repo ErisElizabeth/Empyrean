@@ -40,7 +40,9 @@ import {
   createPuppetRigPackage,
   deletePuppetRigPackageFromLibrary,
   extractRigTuningFromPackage,
+  getPuppetRigLibrarySnapshot,
   getPuppetRigLibraryNames,
+  importPuppetRigLibrarySnapshot,
   loadPuppetRigPackageFromLibrary,
   normalizePuppetRigName,
   parsePuppetRigPackageText,
@@ -69,7 +71,7 @@ import {
   tickEncounterSystem,
   updateGhostSphereMotion,
   worldCollision,
-} from "./world.js?v=0.1.97-alpha";
+} from "./world.js?v=0.1.109-alpha";
 import {
   DEFAULT_IMPORTED_MESH_PATH,
   applyImportedMeshPresentation,
@@ -88,7 +90,7 @@ import {
   syncImportedSkinToPuppet,
   bindRiggedSkinFromPath,
   syncSkinToSkeleton,
-} from "./skin.js?v=0.1.97-alpha";
+} from "./skin.js?v=0.1.109-alpha";
 import {
   EntityRole,
   createPlayerEntity,
@@ -109,7 +111,7 @@ import {
   sanitizeSwordPresetValues,
 } from "./sword.js";
 
-const APP_VERSION = "0.1.97-alpha";
+const APP_VERSION = "0.1.109-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -232,8 +234,8 @@ const G53_RIGGING_HOME = {
     home. When the mode is active, the rig is put at a predictable position and
     yaw so pivot edits can be made without idle/walk motion drifting the target.
 
-    Pass 1 scope:
-      - enter/exit with F2
+    Current scope:
+      - entered directly by the Rigging Wizard/F2 wrapper or by manual GUI button
       - save/restore gameplay state
       - home the rig/player
       - freeze idle/walk drift
@@ -417,6 +419,8 @@ const sceneContainer = document.getElementById("scene-container");
 */
 sceneContainer.tabIndex = -1;
 const STORAGE_KEY = "empyrean.puppetWorkshop.rigTuning.v1";
+const PROJECT_DEFAULT_PLAYER_RIG_PATH =
+  "assets/rigs/player.default.rig.json";
 
 // Slider ranges. These are intentionally broad because the rig lab should be
 // able to accommodate strange proportions, not only "normal" humanoids.
@@ -703,7 +707,15 @@ sceneContainer.appendChild(renderer.domElement);
 applyWorldAtmosphere(scene, renderer);
 
 const clock = new THREE.Clock();
-const rigTuning = loadSavedRigTuning(makeDefaultRigTuning());
+/*
+  Core player rig persistence rule:
+    startup begins from the hardcoded defaults, then tries to apply the real
+    project-owned default package at PROJECT_DEFAULT_PLAYER_RIG_PATH.
+
+  Browser localStorage is still useful as a scratchpad, but it is no longer the
+  silent source of truth for the player rig on page load.
+*/
+const rigTuning = sanitizeRigTuning(makeDefaultRigTuning());
 
 const state = {
   /*
@@ -772,10 +784,27 @@ const state = {
       Gameplay asks "where is the player and what are they doing?"
       Puppet Shop asks "what reusable skeleton/mesh/motion setup is this?"
 
-      status is GUI-facing text only. The actual saved rig packages live in
-      browser localStorage through puppetShop.js.
+      status is GUI-facing text only. Important rigs should live as JSON files
+      in the project. Browser localStorage remains a temporary shelf through
+      puppetShop.js, not the only copy.
     */
-    status: "ready",
+    status: "startup will load project default rig",
+    readoutControllers: [],
+  },
+  riggingWizard: {
+    /*
+      Guided wrapper around the existing rigging pipeline.
+
+      This object does not own skinning, G53, saved packages, or NPC spawning.
+      It only tracks the operator-facing step/readouts so F2 can open a
+      machinist-friendly flow instead of making the user remember every folder.
+    */
+    active: false,
+    step: "idle",
+    status: "F2 opens the Rigging Wizard.",
+    meshPath: "",
+    persistence: "",
+    selectedFileName: "",
     readoutControllers: [],
   },
   importedPreview: null,
@@ -860,6 +889,8 @@ const state = {
   */
   moonSystemEnabled: true,
 };
+
+await loadProjectDefaultPlayerRig();
 
 const controlState = {
   /*
@@ -1095,10 +1126,12 @@ function makeDefaultBindRotationOffsets() {
 
 function loadSavedRigTuning(defaults) {
   /*
-    Reads browser localStorage.
+    Reads browser localStorage as an explicit scratchpad action.
 
-    localStorage survives page refreshes on the same browser/profile, which is
-    perfect for an experimental workshop where sliders are tuned over time.
+    Important:
+      Page startup no longer calls this function automatically. The default
+      player rig should come from PROJECT_DEFAULT_PLAYER_RIG_PATH so clearing
+      browser data cannot destroy the canonical player setup.
 
     If the saved JSON is missing, corrupt, or old, sanitizeRigTuning() fills in
     missing keys from defaults.
@@ -1115,6 +1148,66 @@ function loadSavedRigTuning(defaults) {
   } catch (error) {
     console.warn("Could not load Empyrean tuning.", error);
     return defaults;
+  }
+}
+
+async function loadProjectDefaultPlayerRig() {
+  /*
+    Loads the player rig from a real project JSON file before the skeleton is
+    created.
+
+    Formula:
+      startupRig = sanitize(defaults + package.rigTuning)
+
+    where:
+      defaults          = current hardcoded safety net
+      package.rigTuning = project-owned player.default.rig.json data
+
+    The function does not rebuild the skeleton because it runs before the first
+    buildSkeletonWorkshop() call. It only prepares rigTuning so the first build
+    already uses the file-backed player setup.
+  */
+  try {
+    const response = await fetch(
+      `${PROJECT_DEFAULT_PLAYER_RIG_PATH}?v=${APP_VERSION}`,
+      { cache: "no-store" },
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const values = extractRigTuningFromPackage(payload);
+    const packageName = normalizePuppetRigName(
+      payload?.metadata?.name || values?.puppetRigName,
+      rigTuning.puppetRigName,
+    );
+
+    assignRigTuningValues(
+      sanitizeRigTuning({
+        ...makeDefaultRigTuning(),
+        ...values,
+        puppetRigName: packageName,
+      }),
+    );
+
+    state.puppetShop.status =
+      `loaded project default ${summarizePuppetRigPackage(payload)}`;
+    console.info(
+      `[puppetShop] loaded project default rig from ${PROJECT_DEFAULT_PLAYER_RIG_PATH}`,
+      payload,
+    );
+    return payload;
+  } catch (error) {
+    state.puppetShop.status =
+      `project default rig missing; using hardcoded defaults (${PROJECT_DEFAULT_PLAYER_RIG_PATH})`;
+    console.warn(
+      `[puppetShop] Could not load ${PROJECT_DEFAULT_PLAYER_RIG_PATH}. ` +
+        "Using hardcoded defaults; save/export a new player rig package as soon as possible.",
+      error,
+    );
+    return null;
   }
 }
 
@@ -1805,6 +1898,56 @@ function updateRigColliderVisual() {
   applyVisibility();
 }
 
+function makeSafeJsonFileName(label, fallback = "empyrean-rig") {
+  /*
+    Browser downloads need a simple filename, not a human sentence with spaces
+    and punctuation. This keeps exported rigs easy to find and copy into
+    assets/rigs later.
+  */
+  const base =
+    (typeof label === "string" ? label : "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || fallback;
+
+  return `${base}.json`;
+}
+
+function downloadJsonFile(fileName, payload) {
+  /*
+    Downloads a real JSON file through the browser.
+
+    This is intentionally separate from localStorage. localStorage is a browser
+    scratch shelf; this is the "put the setup sheet in the project folder or a
+    backup drive" path.
+  */
+  const text =
+    typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function downloadPuppetRigPackageFile(packagePayload, prefix = "rig") {
+  const name = normalizePuppetRigName(
+    packagePayload?.metadata?.name || packagePayload?.rigTuning?.puppetRigName,
+    prefix,
+  );
+  const fileName = makeSafeJsonFileName(`${prefix}-${name}`, prefix);
+
+  downloadJsonFile(fileName, packagePayload);
+  return fileName;
+}
+
 function exportRigPackageToConsole() {
   /*
     Exports the current workshop state as a complete puppet rig package.
@@ -1818,6 +1961,14 @@ function exportRigPackageToConsole() {
   console.info("Empyrean rig package export:", payload);
   navigator.clipboard?.writeText?.(text).catch(() => null);
   updatePuppetShopStatus(`copied ${summarizePuppetRigPackage(payload)}`);
+}
+
+function exportCurrentRigPackageToFile() {
+  const payload = makeCurrentPuppetRigPackage();
+  const fileName = downloadPuppetRigPackageFile(payload, "current-rig");
+
+  updatePuppetShopStatus(`downloaded ${fileName}`);
+  console.info("[puppetShop] downloaded current rig package", payload);
 }
 
 function importRigPackageFromPrompt() {
@@ -1844,6 +1995,84 @@ function importRigPackageFromPrompt() {
     console.error("Could not import Empyrean rig package JSON.", error);
     updatePuppetShopStatus("import failed - see console");
   }
+}
+
+function exportSelectedPuppetRigToFile() {
+  /*
+    Exports the named library slot if it exists. If the slot has not been saved
+    to the temporary browser library yet, export the current live workshop
+    package instead so the button still gives the user a real backup file.
+  */
+  const name = normalizePuppetRigName(rigTuning.puppetRigName);
+  const saved = loadPuppetRigPackageFromLibrary(window.localStorage, name);
+  const payload = saved || makeCurrentPuppetRigPackage();
+  const fileName = downloadPuppetRigPackageFile(payload, "selected-rig");
+
+  updatePuppetShopStatus(
+    saved
+      ? `downloaded ${fileName}`
+      : `downloaded current rig as ${fileName}; no saved slot named ${name}`,
+  );
+  console.info("[puppetShop] downloaded selected rig package", payload);
+}
+
+function exportPuppetRigLibraryToFile() {
+  const library = getPuppetRigLibrarySnapshot(window.localStorage);
+  const fileName = `empyrean-rig-library-${new Date()
+    .toISOString()
+    .slice(0, 10)}.json`;
+
+  downloadJsonFile(fileName, library);
+  updatePuppetShopStatus(
+    `downloaded ${Object.keys(library.rigs || {}).length} rig(s) to ${fileName}`,
+  );
+  console.info("[puppetShop] downloaded rig library", library);
+}
+
+function importPuppetRigLibraryFromFile() {
+  /*
+    Imports a real JSON backup into the temporary browser library.
+
+    The chosen file can be either:
+      - an exported rig library
+      - a single rig package
+
+    It merges into localStorage instead of replacing the current shelf.
+  */
+  const input = document.createElement("input");
+
+  input.type = "file";
+  input.accept = ".json,application/json";
+  input.addEventListener(
+    "change",
+    async () => {
+      const file = input.files?.[0];
+
+      if (!file) {
+        return;
+      }
+
+      try {
+        const payload = JSON.parse(await file.text());
+        const library = importPuppetRigLibrarySnapshot(
+          window.localStorage,
+          payload,
+          { merge: true },
+        );
+        const names = Object.keys(library.rigs || {});
+
+        updatePuppetShopStatus(
+          `imported ${names.length} rig(s) into browser library`,
+        );
+        console.info("[puppetShop] imported rig library backup", library);
+      } catch (error) {
+        updatePuppetShopStatus("rig library import failed - see console");
+        console.error("[puppetShop] rig library import failed", error);
+      }
+    },
+    { once: true },
+  );
+  input.click();
 }
 
 function getImportedMeshPackageSnapshot() {
@@ -1958,11 +2187,18 @@ function saveCurrentPuppetRigToLibrary() {
       tune one skeleton carefully,
       save it by name,
       load it later as a base for another actor.
+
+    Persistence rule:
+      localStorage is only the fast browser shelf. Every named save also
+      downloads a real JSON backup so important rigs can leave the browser.
   */
   const payload = makeCurrentPuppetRigPackage();
   const saved = savePuppetRigPackageToLibrary(window.localStorage, payload);
+  const fileName = downloadPuppetRigPackageFile(saved, "saved-rig");
 
-  updatePuppetShopStatus(`saved ${summarizePuppetRigPackage(saved)}`);
+  updatePuppetShopStatus(
+    `saved ${summarizePuppetRigPackage(saved)}; downloaded ${fileName}`,
+  );
   console.info("[puppetShop] saved rig package", saved);
 }
 
@@ -2248,6 +2484,16 @@ function applyWorldDebugVisibility() {
     showEncounterZones: rigTuning.showEncounterZones,
     showEncounterLabels: rigTuning.showEncounterLabels,
   });
+}
+
+function handleWorldDebugGuiChange() {
+  /*
+    lil-gui checkboxes can retain keyboard focus after a click. World Debug is
+    often toggled while actively walking/testing, so hand focus back to the
+    scene after the visual overlay state changes.
+  */
+  applyWorldDebugVisibility();
+  restoreSceneKeyboardFocus();
 }
 
 function rebuildWorldDebugView() {
@@ -2976,6 +3222,9 @@ function handleImportedMeshRigged(details = {}) {
 
   state.runtimeArmBindRotationBackup = null;
   state.exitG53AfterImportedMeshRig = false;
+  if (state.player) {
+    state.player.skin = state.importedSkin;
+  }
 
   console.info("[rig] imported mesh rigging complete", {
     path: details.path || getActiveMeshPath(),
@@ -2983,6 +3232,13 @@ function handleImportedMeshRigged(details = {}) {
     relaxedVisibleGameplayArms: shouldRelaxVisibleGameplayArms,
     preservedRigCalibration: true,
   });
+
+  if (state.riggingWizard.active) {
+    setRiggingWizardStep(
+      "test",
+      "Rigged mesh is bound. Test idle/walk/run/jump/sword, then save.",
+    );
+  }
 }
 
 function applyFemaleMeshAPosePreset() {
@@ -3581,6 +3837,292 @@ function rigCurrentImportedMeshAndExitG53() {
   }
 }
 
+function normalizeAssetMeshPath(fileName = "") {
+  /*
+    Browser file inputs do not reveal the real folder path. For reusable rigs,
+    the most useful saved path is the project-relative asset path we expect
+    future reloads/NPCs/enemies to use.
+
+    Formula:
+      savedPath = "assets/" + selectedFileName
+
+    where selectedFileName is the name reported by the browser file picker.
+  */
+  const cleanName = String(fileName).replace(/^.*[\\/]/, "");
+  return cleanName ? `assets/${cleanName}` : "";
+}
+
+function isPersistentAssetMeshPath(path = rigTuning.importedMeshPath) {
+  return /^assets[\\/].+\.(glb|gltf)$/i.test(String(path || "").trim());
+}
+
+function getRiggingWizardPersistenceMessage() {
+  if (!state.meshBlobUrl && isPersistentAssetMeshPath()) {
+    return "OK: package will reload from project assets path.";
+  }
+
+  if (state.meshBlobUrl && isPersistentAssetMeshPath()) {
+    return "Warning: preview uses a session file; save stores this assets path.";
+  }
+
+  if (state.meshBlobUrl) {
+    return "Warning: session-only mesh. Set assets/name.glb before saving.";
+  }
+
+  return "Warning: mesh path should be assets/name.glb for NPC/enemy reuse.";
+}
+
+function updateRiggingWizardReadouts() {
+  const wizard = state.riggingWizard;
+  wizard.meshPath = rigTuning.importedMeshPath || "(no mesh path)";
+  wizard.persistence = getRiggingWizardPersistenceMessage();
+  wizard.readoutControllers.forEach((controller) => controller.updateDisplay());
+}
+
+function setRiggingWizardStep(step, status) {
+  state.riggingWizard.step = step;
+  state.riggingWizard.status = status;
+  updateRiggingWizardReadouts();
+}
+
+function openUsefulRiggingFolders() {
+  state.guiFolders.riggingWizard?.open?.();
+  state.guiFolders.mesh?.open?.();
+  state.guiFolders.dimensions?.open?.();
+  state.guiFolders.jointPointControls?.open?.();
+  state.guiFolders.g53RiggingMode?.open?.();
+}
+
+function restoreSceneFocusAfterFilePicker() {
+  /*
+    Hand keyboard focus back to the scene after the OS file picker.
+
+    Without this, function-key shortcuts can be swallowed by the browser/GUI
+    focus state after choosing a new local mesh. The capture-phase F2 handler is
+    still the main safety net; this just makes the rest of the workshop normal.
+  */
+  restoreSceneKeyboardFocus();
+}
+
+function restoreSceneKeyboardFocus() {
+  /*
+    Returns keyboard ownership to the 3D scene.
+
+    Why this exists:
+      Browser UI and lil-gui controls can keep focus after a checkbox/button is
+      clicked. When that happens, pointer/mouse commands can still work while
+      movement keys never reach handleKeyDown(), so controlState.keys never gets
+      the fresh KeyW/KeyA/etc. entry it needs.
+
+    The helper focuses immediately because this usually runs inside a trusted
+    user gesture, then repeats on the next animation frame in case the browser
+    applies its own focus update after the current event handler finishes.
+  */
+  const focusScene = () => {
+    window.focus();
+    sceneContainer.focus({ preventScroll: true });
+  };
+
+  focusScene();
+  requestAnimationFrame(focusScene);
+}
+
+function openImportedMeshFilePicker({
+  source = "mesh",
+  preferAssetsPath = false,
+} = {}) {
+  /*
+    Shared GLB picker for the old Mesh button and the new Rigging Wizard.
+
+    The file picker itself produces a temporary blob URL so the browser can read
+    the selected local file immediately. For wizard saves, we also store a
+    project-relative assets path because local blob URLs cannot be reused by
+    saved NPC/enemy rig packages.
+  */
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".glb,.gltf";
+  input.style.cssText =
+    "position:fixed;opacity:0;pointer-events:none;width:0;height:0";
+  document.body.appendChild(input);
+  input.addEventListener("change", () => {
+    document.body.removeChild(input);
+    const file = input.files[0];
+    if (!file) {
+      if (source === "wizard") {
+        setRiggingWizardStep("select mesh", "Mesh selection canceled.");
+      }
+      return;
+    }
+
+    if (state.meshBlobUrl) URL.revokeObjectURL(state.meshBlobUrl);
+    state.meshBlobUrl = URL.createObjectURL(file);
+    state.riggingWizard.selectedFileName = file.name;
+    rigTuning.importedMeshPath = preferAssetsPath
+      ? normalizeAssetMeshPath(file.name)
+      : file.name;
+
+    updateGuiDisplays();
+    loadImportedMeshPreviewFromPath(state.meshBlobUrl);
+
+    if (source === "wizard") {
+      setRiggingWizardStep(
+        "base pose",
+        `Previewing ${file.name}. Choose A, T, or Current base pose.`,
+      );
+      openUsefulRiggingFolders();
+    } else {
+      updateRiggingWizardReadouts();
+    }
+
+    restoreSceneFocusAfterFilePicker();
+  });
+  input.click();
+}
+
+function openRiggingWizardFilePicker() {
+  openImportedMeshFilePicker({
+    source: "wizard",
+    preferAssetsPath: true,
+  });
+}
+
+function previewRiggingWizardAssetsPath() {
+  /*
+    Loads the typed/saved path directly from the project, instead of using the
+    session blob URL. This is the quickest way to prove that a saved NPC/enemy
+    package will be able to reload the mesh later.
+  */
+  if (!rigTuning.importedMeshPath) {
+    setRiggingWizardStep("select mesh", "Enter an assets/name.glb path first.");
+    return;
+  }
+
+  if (state.meshBlobUrl) {
+    URL.revokeObjectURL(state.meshBlobUrl);
+    state.meshBlobUrl = null;
+  }
+
+  loadImportedMeshPreviewFromPath(rigTuning.importedMeshPath);
+  setRiggingWizardStep(
+    "base pose",
+    `Previewing persistent path ${rigTuning.importedMeshPath}.`,
+  );
+}
+
+function startRiggingWizard({ openPicker = true } = {}) {
+  state.riggingWizard.active = true;
+  openUsefulRiggingFolders();
+
+  if (!state.g53RiggingMode.active) {
+    enterG53RiggingMode();
+  } else {
+    resetSkeletonToBindPose();
+    syncSkeletonRoot();
+    state.skeleton?.root?.updateMatrixWorld(true);
+  }
+
+  setRiggingWizardStep(
+    "select mesh",
+    "G53 active. Select a GLB or preview an assets path.",
+  );
+
+  if (openPicker) {
+    openRiggingWizardFilePicker();
+  }
+}
+
+function cancelRiggingWizard() {
+  state.riggingWizard.active = false;
+  if (state.g53RiggingMode.active) {
+    exitG53RiggingMode();
+  }
+  setRiggingWizardStep("idle", "Rigging Wizard closed.");
+}
+
+function toggleRiggingWizardHotkey() {
+  if (state.riggingWizard.active) {
+    cancelRiggingWizard();
+    return;
+  }
+
+  startRiggingWizard({ openPicker: true });
+}
+
+function applyRiggingWizardBasePose() {
+  applyRigMeshStartPose();
+  setRiggingWizardStep(
+    "align",
+    "Base pose applied. Align joint points, then click Rig.",
+  );
+  openUsefulRiggingFolders();
+}
+
+function enterRiggingWizardAlignStep() {
+  if (!state.g53RiggingMode.active) {
+    enterG53RiggingMode();
+  }
+  rigTuning.mouseJointEditMode = true;
+  rigTuning.labEnabled = true;
+  rigTuning.skeletonVisible = true;
+  applyVisibility();
+  updateGuiDisplays();
+  setRiggingWizardStep("align", "Align pivots with mouse/sliders, then click Rig.");
+}
+
+function riggingWizardRigMesh() {
+  if (!state.importedPreview && !state.meshBlobUrl && !rigTuning.importedMeshPath) {
+    setRiggingWizardStep("select mesh", "No mesh selected yet.");
+    return;
+  }
+
+  setRiggingWizardStep("rigging", "Generating skin weights with existing rig engine.");
+  rigCurrentImportedMeshAndExitG53();
+}
+
+function setRiggingWizardTestIdle() {
+  rigTuning.idleMotion = true;
+  rigTuning.walkPreview = false;
+  controlState.keys.clear();
+  controlState.isWalking = false;
+  controlState.isRunning = false;
+  applyRelaxedVisiblePose();
+  updateGuiDisplays();
+  setRiggingWizardStep("test", "Idle test active.");
+}
+
+function holdRiggingWizardMovementTest({ run = false } = {}) {
+  if (state.g53RiggingMode.active) {
+    setRiggingWizardStep("align", "Rig first; movement tests run after G53 exits.");
+    return;
+  }
+
+  controlState.keys.add("KeyW");
+  if (run) {
+    controlState.keys.add("ShiftLeft");
+  } else {
+    controlState.keys.delete("ShiftLeft");
+    controlState.keys.delete("ShiftRight");
+  }
+
+  setRiggingWizardStep("test", run ? "Run test for 1 second." : "Walk test for 1 second.");
+  window.setTimeout(() => {
+    controlState.keys.delete("KeyW");
+    controlState.keys.delete("ShiftLeft");
+    controlState.keys.delete("ShiftRight");
+  }, 1000);
+}
+
+function riggingWizardSaveRig() {
+  commitRigCalibration();
+  saveCurrentPuppetRigToLibrary();
+
+  const status = isPersistentAssetMeshPath()
+    ? `Saved ${rigTuning.puppetRigName}.`
+    : `Saved ${rigTuning.puppetRigName}, but mesh path should be assets/name.glb.`;
+  setRiggingWizardStep("saved", status);
+}
+
 function buildGui() {
   /*
     GUI panel structure (top to bottom):
@@ -3633,40 +4175,7 @@ function buildGui() {
     .add(
       {
         openFile() {
-          const input = document.createElement("input");
-          input.type = "file";
-          input.accept = ".glb,.gltf";
-          // Keep the element invisible but in the DOM long enough for the
-          // browser to recognise the user gesture and open the file picker.
-          input.style.cssText =
-            "position:fixed;opacity:0;pointer-events:none;width:0;height:0";
-          document.body.appendChild(input);
-          input.addEventListener("change", () => {
-            document.body.removeChild(input);
-            const file = input.files[0];
-            if (!file) return;
-            // Release the previous blob before creating a new one so the
-            // browser can free the previous file's memory.
-            if (state.meshBlobUrl) URL.revokeObjectURL(state.meshBlobUrl);
-            state.meshBlobUrl = URL.createObjectURL(file);
-            rigTuning.importedMeshPath = file.name;
-            updateGuiDisplays();
-            // Auto-preview on pick so you see the mesh immediately.
-            loadImportedMeshPreviewFromPath(state.meshBlobUrl);
-            /*
-              Hand keyboard focus back to the scene after the OS file picker.
-
-              Without this, function-key shortcuts can be swallowed by the
-              browser/GUI focus state after choosing a new local mesh. The
-              capture-phase F2 handler below is the main safety net; this focus
-              restore makes the rest of the workshop feel normal too.
-            */
-            requestAnimationFrame(() => {
-              window.focus();
-              sceneContainer.focus({ preventScroll: true });
-            });
-          });
-          input.click();
+          openImportedMeshFilePicker({ source: "mesh" });
         },
       },
       "openFile",
@@ -3707,6 +4216,52 @@ function buildGui() {
   meshFolder.add({ fn: loadDefaultImportedMesh }, "fn").name("quick rig");
   meshFolder.add({ fn: rerigImportedMesh }, "fn").name("re-rig");
   meshFolder.add({ fn: clearImportedMesh }, "fn").name("clear mesh");
+
+  // =============================================================
+  // RIGGING WIZARD
+  // Guided operator flow that wraps the existing Mesh/G53/Puppet Shop tools.
+  // =============================================================
+  const wizardFolder = state.gui.addFolder("Rigging Wizard");
+  state.guiFolders.riggingWizard = wizardFolder;
+  state.riggingWizard.readoutControllers.push(
+    wizardFolder.add(state.riggingWizard, "step").name("step"),
+    wizardFolder.add(state.riggingWizard, "status").name("status"),
+    wizardFolder.add(state.riggingWizard, "meshPath").name("mesh path"),
+    wizardFolder.add(state.riggingWizard, "persistence").name("save check"),
+  );
+  wizardFolder.add({ fn: startRiggingWizard }, "fn").name("F2 start wizard");
+  wizardFolder.add({ fn: openRiggingWizardFilePicker }, "fn").name("1 choose GLB");
+  wizardFolder
+    .add({ fn: previewRiggingWizardAssetsPath }, "fn")
+    .name("1b preview assets path");
+  addGuiController(wizardFolder, rigTuning, "rigMeshStartPose", {
+    Current: "current",
+    "A Pose": "aPose",
+    "T Pose": "tPose",
+  })
+    .name("2 base pose")
+    .onChange(applyRiggingWizardBasePose);
+  wizardFolder
+    .add({ fn: enterRiggingWizardAlignStep }, "fn")
+    .name("3 align points");
+  wizardFolder.add({ fn: riggingWizardRigMesh }, "fn").name("4 rig");
+  const wizardTestFolder = wizardFolder.addFolder("5 test");
+  wizardTestFolder.add({ fn: setRiggingWizardTestIdle }, "fn").name("idle");
+  wizardTestFolder
+    .add({ fn: () => holdRiggingWizardMovementTest({ run: false }) }, "fn")
+    .name("walk 1 sec");
+  wizardTestFolder
+    .add({ fn: () => holdRiggingWizardMovementTest({ run: true }) }, "fn")
+    .name("run 1 sec");
+  wizardTestFolder.add({ fn: startJump }, "fn").name("jump");
+  wizardTestFolder.add({ fn: equipSword }, "fn").name("draw sword");
+  wizardTestFolder.add({ fn: startSwordSwing }, "fn").name("swing");
+  wizardTestFolder.add({ fn: despawnSword }, "fn").name("stow sword");
+  wizardTestFolder.close();
+  wizardFolder.add({ fn: riggingWizardSaveRig }, "fn").name("6 save named rig");
+  wizardFolder.add({ fn: cancelRiggingWizard }, "fn").name("close wizard");
+  updateRiggingWizardReadouts();
+  wizardFolder.close();
 
   // ── APPEARANCE ────────────────────────────────────────────────────────────────
   // Controls how the mesh looks while you are placing pivots.
@@ -3813,6 +4368,9 @@ function buildGui() {
     .add({ fn: exportRigPackageToConsole }, "fn")
     .name("export rig package");
   meshFolder
+    .add({ fn: exportCurrentRigPackageToFile }, "fn")
+    .name("download rig package");
+  meshFolder
     .add({ fn: importRigPackageFromPrompt }, "fn")
     .name("import rig package");
 
@@ -3841,7 +4399,7 @@ function buildGui() {
   );
   puppetShopFolder
     .add({ fn: saveCurrentPuppetRigToLibrary }, "fn")
-    .name("save named rig");
+    .name("save named rig + file");
   puppetShopFolder
     .add({ fn: loadNamedPuppetRigFromLibrary }, "fn")
     .name("load named rig");
@@ -3849,6 +4407,15 @@ function buildGui() {
     .add({ fn: deleteNamedPuppetRigFromLibrary }, "fn")
     .name("delete named rig");
   puppetShopFolder.add({ fn: listPuppetRigLibrary }, "fn").name("list rigs");
+  puppetShopFolder
+    .add({ fn: exportSelectedPuppetRigToFile }, "fn")
+    .name("export selected rig");
+  puppetShopFolder
+    .add({ fn: exportPuppetRigLibraryToFile }, "fn")
+    .name("export rig library");
+  puppetShopFolder
+    .add({ fn: importPuppetRigLibraryFromFile }, "fn")
+    .name("import rig library");
   puppetShopFolder
     .add({ fn: exportRigPackageToConsole }, "fn")
     .name("copy complete rig");
@@ -4148,7 +4715,7 @@ function buildGui() {
 
   // ==============================================================
   // TEMP / DEV PRECISION RIGGING MODE: G53-style machine home
-  // F2 homes the rig, hides measuring clutter, and enables precise pivot edits.
+  // Manual G53 controls. F2 now opens the guided Rigging Wizard wrapper.
   // ==============================================================
   const g53Folder = state.gui.addFolder("G53 Rigging Mode");
   state.guiFolders.g53RiggingMode = g53Folder;
@@ -4157,7 +4724,7 @@ function buildGui() {
   );
   g53Folder.add({ fn: enterG53RiggingMode }, "fn").name("enter / home");
   g53Folder.add({ fn: exitG53RiggingMode }, "fn").name("exit / restore");
-  g53Folder.add({ fn: toggleG53RiggingMode }, "fn").name("F2 toggle");
+  g53Folder.add({ fn: toggleG53RiggingMode }, "fn").name("manual toggle");
   addGuiController(g53Folder, rigTuning, "g53AllowX").name("allow X");
   addGuiController(g53Folder, rigTuning, "g53AllowY").name("allow Y");
   addGuiController(g53Folder, rigTuning, "g53AllowZ").name("allow Z");
@@ -4223,17 +4790,22 @@ function buildGui() {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // SAVE
-  // Browser save/load and JSON export. Tuning is auto-loaded on page refresh.
+  // Browser scratch save/load for quick experiments. The project default player
+  // rig is loaded from assets/rigs/player.default.rig.json instead.
   // ─────────────────────────────────────────────────────────────────────────────
   const saveFolder = state.gui.addFolder("Save");
   state.guiFolders.save = saveFolder;
-  saveFolder.add({ fn: saveRigTuningToBrowser }, "fn").name("save tuning");
-  saveFolder.add({ fn: loadRigTuningFromBrowser }, "fn").name("load saved");
+  saveFolder
+    .add({ fn: saveRigTuningToBrowser }, "fn")
+    .name("save scratch tuning");
+  saveFolder
+    .add({ fn: loadRigTuningFromBrowser }, "fn")
+    .name("load scratch tuning");
   saveFolder.add({ fn: resetRigTuningToDefaults }, "fn").name("reset defaults");
   saveFolder
     .add({ fn: exportRigTuningToConsole }, "fn")
     .name("copy / log JSON");
-  saveFolder.add({ fn: clearSavedRigTuning }, "fn").name("clear saved");
+  saveFolder.add({ fn: clearSavedRigTuning }, "fn").name("clear scratch");
   saveFolder.close();
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -4245,22 +4817,22 @@ function buildGui() {
   state.guiFolders.worldDebug = worldDebugFolder;
   addGuiController(worldDebugFolder, rigTuning, "showWorldDebug")
     .name("world debug")
-    .onChange(applyWorldDebugVisibility);
+    .onChange(handleWorldDebugGuiChange);
   addGuiController(worldDebugFolder, rigTuning, "showWallColliders")
     .name("wall colliders")
-    .onChange(applyWorldDebugVisibility);
+    .onChange(handleWorldDebugGuiChange);
   addGuiController(worldDebugFolder, rigTuning, "showTreeColliders")
     .name("tree colliders")
-    .onChange(applyWorldDebugVisibility);
+    .onChange(handleWorldDebugGuiChange);
   addGuiController(worldDebugFolder, rigTuning, "showOutsideBounds")
     .name("outside bounds")
-    .onChange(applyWorldDebugVisibility);
+    .onChange(handleWorldDebugGuiChange);
   addGuiController(worldDebugFolder, rigTuning, "showEncounterZones")
     .name("encounter zones")
-    .onChange(applyWorldDebugVisibility);
+    .onChange(handleWorldDebugGuiChange);
   addGuiController(worldDebugFolder, rigTuning, "showEncounterLabels")
     .name("encounter labels")
-    .onChange(applyWorldDebugVisibility);
+    .onChange(handleWorldDebugGuiChange);
   addGuiController(worldDebugFolder, rigTuning, "encounterSystemEnabled")
     .name("encounters active")
     .onChange(() => {
@@ -4268,6 +4840,7 @@ function buildGui() {
         state.encounterRuntime?.activeIds.clear();
         state.worldDebugView?.syncEncounterActivity?.(new Set());
       }
+      restoreSceneKeyboardFocus();
     });
   worldDebugFolder.close();
 
@@ -7748,6 +8321,16 @@ function isAnyDevModeActive() {
   );
 }
 
+function handleScenePointerFocus() {
+  /*
+    A plain canvas click should recover keyboard movement after the user has
+    interacted with browser/UI controls. This listener is attached in capture
+    phase so it runs before gameplay/dev pointer handlers decide whether the
+    click swings, drags, edits, or does nothing.
+  */
+  restoreSceneKeyboardFocus();
+}
+
 function handleGameplayPointerDown(event) {
   /*
     Routes gameplay mouse buttons:
@@ -7982,7 +8565,7 @@ function handleG53HotkeyCapture(event) {
       lil-gui controls, the focused UI element/browser layer may intercept
       function keys before the bubbling listener receives them.
 
-    F2 is important enough to treat like an emergency machine-home switch:
+    F2 is important enough to treat like an emergency rigging switch:
       - catch it early in the capture phase
       - prevent browser/default UI behavior
       - stop it from reaching the bubbling handleKeyDown() and toggling twice
@@ -7998,7 +8581,7 @@ function handleG53HotkeyCapture(event) {
   event.stopImmediatePropagation();
 
   if (!event.repeat) {
-    toggleG53RiggingMode();
+    toggleRiggingWizardHotkey();
   }
 }
 
@@ -8125,7 +8708,7 @@ function handleKeyDown(event) {
       1     = equip sword and enter combat stance
       2     = despawn sword and return arms to idle
       Enter = sword swing / combat hit attempt   (backup; LMB also works)
-      F2    = toggle G53 machine-home rigging mode
+      F2    = open/close Rigging Wizard, which wraps G53 rigging mode
       Y     = toggle TEMP devProbe marker
       Shift + J/L = move devProbe local X
       Shift + U/O = move devProbe local Y
@@ -8144,7 +8727,7 @@ function handleKeyDown(event) {
     event.preventDefault();
 
     if (!event.repeat) {
-      toggleG53RiggingMode();
+      toggleRiggingWizardHotkey();
     }
 
     return;
@@ -8258,6 +8841,17 @@ initSkin({
   onAfterImportedMeshRigged: handleImportedMeshRigged,
 });
 buildSkeletonWorkshop();
+if (rigTuning.importedMeshPath) {
+  /*
+    Startup mirrors the package-load path:
+      JSON file supplies rigTuning before buildSkeletonWorkshop()
+      skin.js then binds the referenced GLB to the newly built skeleton.
+
+    This keeps the default player rig file meaningful as a complete rig package,
+    not only a set of sliders.
+  */
+  loadImportedMeshFromPath(rigTuning.importedMeshPath);
+}
 
 /*
   Entity layer setup. The puppet workshop's skeleton + controlState are now
@@ -8387,6 +8981,9 @@ window.addEventListener("keyup", handleKeyUp);
 window.addEventListener("blur", handleWindowBlur);
 window.addEventListener("resize", resizeRendererToContainer);
 sceneContainer.addEventListener("wheel", handleWheelZoom, { passive: false });
+sceneContainer.addEventListener("pointerdown", handleScenePointerFocus, {
+  capture: true,
+});
 sceneContainer.addEventListener("pointerdown", handleDevProbePointerDown);
 sceneContainer.addEventListener("pointermove", handleDevProbePointerMove);
 sceneContainer.addEventListener("pointerup", handleDevProbePointerUp);

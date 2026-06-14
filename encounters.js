@@ -49,6 +49,11 @@ export const ENCOUNTER_DEFINITIONS = [
       Example 1:
         A soft moon-themed audio zone outside.
 
+      Pass 0 cathedral-replacement note:
+        This used to sit at [0, -20], close to the room/church work area.
+        It is parked in the north outer field while the cathedral swap is
+        staged so audio/sky actions do not muddy visual/collider testing.
+
       Why circle:
         Planet/moon/sky-focus zones usually feel natural as circles.
     */
@@ -58,7 +63,7 @@ export const ENCOUNTER_DEFINITIONS = [
     debugColor: "#f0c36a",
     shape: {
       type: "circle",
-      center: [0, -20],
+      center: [0, -150],
       radius: 9,
     },
     onEnter: [
@@ -107,7 +112,11 @@ export const ENCOUNTER_DEFINITIONS = [
   {
     /*
       Example 2:
-        A rectangular "threshold" just outside the south doorway.
+        A rectangular "threshold" in the south outer field.
+
+      Pass 0 cathedral-replacement note:
+        This used to sit at [0, 15], just outside the south doorway. It stays
+        enabled, but far from the current building replacement test area.
 
       Why rectangle:
         Doorways, hallways, room tiles, and region boundaries are usually easier
@@ -119,7 +128,7 @@ export const ENCOUNTER_DEFINITIONS = [
     debugColor: "#7bb369",
     shape: {
       type: "rect",
-      center: [0, 15],
+      center: [0, 150],
       size: [9, 5],
     },
     onEnter: [
