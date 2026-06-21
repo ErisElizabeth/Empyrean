@@ -159,8 +159,8 @@ Use this when you are matching a mesh to the skeleton.
 1. Run a checkpoint.
 2. Click `Mesh Import / Export > 1 render mesh`.
 3. Turn on joint labels if they help.
-4. Use `Rig Dimensions` for large body proportions.
-5. Use `Joint Point Offsets` for exact pivot placement.
+4. Use `Base Rig Proportions` for large body proportions.
+5. Use `Mesh Calibration Offsets` for exact pivot placement.
 6. Use `Bind Pose Rotations` if the mesh is modeled in an A-pose or odd rest pose.
 7. Click `Mesh Import / Export > 2 rig rendered mesh`.
 8. Test idle, walk, jump, and arms.

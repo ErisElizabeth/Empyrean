@@ -21,6 +21,7 @@
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { Lensflare, LensflareElement } from "three/addons/objects/Lensflare.js";
 
 // =============================================================
 // WORLD TWEAK ZONE
@@ -152,6 +153,51 @@ const WORLD_TWEAKS = {
         localAccentIntensity: 0,
       },
     },
+    /*
+      Three-stop visible sky gradients.
+
+      These records own only the color of the outside wall/ceiling sky shell.
+      Lighting, fog, the moon, and the sun remain in skyModes above. Keeping the
+      color stops separate gives a later day/night controller one clean set of
+      values to interpolate without entangling that work with world lighting.
+
+      The sky-cycle controller below now blends these records through the shared
+      shader uniforms. Both automatic cycling and `G` use the same authored
+      night -> transition -> day path.
+    */
+    skyGradients: {
+      night: {
+        horizon: "#091833",
+        mid: "#102B5E",
+        zenith: "#051545",
+      },
+      day: {
+        horizon: "#A0E7FB",
+        mid: "#85E0FA",
+        zenith: "#78DDFA",
+      },
+      transition: {
+        horizon: "#FAB48C",
+        mid: "#170266",
+        zenith: "#051545",
+      },
+    },
+    skyCycle: {
+      /*
+        Automatic and manual day/night phase durations, in milliseconds.
+
+        Both paths use the same sequence:
+          stable sky -> transition palette -> target stable sky
+
+        `G` only changes the requested target. It does not own separate timers
+        or a second transition implementation.
+      */
+      holdNight: 120000,
+      holdDay: 120000,
+      transitionToTransition: 1000,
+      holdTransition: 5000,
+      transitionToTarget: 1000,
+    },
     palettes: {
       night: {
         sceneBackground: "#131862",
@@ -174,15 +220,16 @@ const WORLD_TWEAKS = {
   },
   skyMoon: {
     /*
-      Replaces the old procedural planet sphere with moon.glb.
+      Camera-facing sky moon disc.
 
-      These values preserve the current visual behavior exactly. The sky object
-      is a world/environment prop now, so the config lives beside trees, torches,
-      rooms, and ghost spheres instead of in main.js.
+      position is the authored startup sightline and the fixed gameplay-lighting
+      anchor. On the first rendered frame, the visual moon captures its exact
+      normalized direction and distance from the active camera; later frames
+      keep that direction/distance while translating with the camera.
     */
-    assetPath: "assets/moon.glb",
+    assetPath: "/assets/moon_2K.jpg",
     targetDiameter: 15,
-    position: [0, 30, 125],
+    position: [0, 30, 149],
     fallbackColor: 0x7a7979,
     /*
       Visual moon shell/glow.
@@ -198,6 +245,62 @@ const WORLD_TWEAKS = {
     surfaceOpacity: 0.9,
     innerGlowDiameter: 14.75,
     innerGlowOpacity: 0.46,
+    /*
+      Standalone lunar-phase shadow presentation.
+
+      Pass 3 keeps the runtime default at full moon so existing gameplay does
+      not begin following real-world lunar data before the later integration
+      pass. The shadow sphere is slightly larger than the detailed GLB shell to
+      avoid z-fighting while remaining visually coincident at sky distance.
+    */
+    defaultLunarPhase: 0.5,
+    defaultLunarHemisphere: "northern",
+    phaseShadowDiameter: 15.06,
+    phaseShadowColor: 0x02040a,
+    /* 6.5% retained detail gives the dark side restrained earthshine. */
+    phaseShadowOpacity: 0.935,
+    /* Narrow enough to read at sky scale without becoming a jagged hard seam. */
+    phaseTerminatorSoftness: 0.014,
+    /*
+      Moon-flare presentation follows illuminated fraction only. The minimum
+      keeps a trace of atmospheric presence at new moon; gamma preserves useful
+      crescent visibility without letting it compete with a full moon.
+    */
+    phaseFlareMinimum: 0.02,
+    phaseFlareGamma: 0.65,
+  },
+  lensflare: {
+    /*
+      Camera-facing sky glints.
+
+      These flares are visual-only presentation objects. They do not affect
+      scene lighting, collision, fog, or moon/sun direction math.
+
+      Implementation notes:
+        - Textures are generated at runtime from canvas gradients, so no extra
+          image assets are required.
+        - Moon flare attaches to the visible skyMoon group. If the moon moves,
+          hides for G53, or toggles off with `G`, the flare follows.
+        - Sun flare attaches to the day DirectionalLight. If a future day/night
+          cycle moves that light, the flare follows its source position.
+    */
+    moon: {
+      enabled: true,
+      color: "#d2f5d2",
+      coreAlpha: 0.16,
+      haloAlpha: 0.055,
+      coreSize: 72,
+      haloSize: 128,
+    },
+    sun: {
+      enabled: true,
+      color: "#FFF9D2",
+      coreAlpha: 0.62,
+      haloAlpha: 0.24,
+      coreSize: 360,
+      haloSize: 760,
+      ghostSize: 96,
+    },
   },
   lighting: {
     /*
@@ -210,10 +313,10 @@ const WORLD_TWEAKS = {
       because those need to change together during future day/night/weather
       transitions.
 
-      Future day/night cycle note:
-        The moon directional light is tied to skyMoon's world position in
-        syncMoonLights(). If a future sky cycle moves the moon group
-        across the sky, the light source direction follows automatically.
+      Camera-relative moon note:
+        The visible skyMoon group moves with the active camera. syncMoonLights()
+        deliberately keeps these gameplay lights on the authored fixed anchor,
+        so player/camera movement cannot alter world illumination.
     */
     moonLightTarget: [0, 7.5, 7.5],
     /*
@@ -223,9 +326,9 @@ const WORLD_TWEAKS = {
       used to make the visible moon shell read consistently from the dark,
       church-facing side.
 
-      It is still derived from the visible skyMoon group:
+      It is derived from the fixed skyMoon lighting anchor:
 
-        base position = skyMoon.getWorldPosition()
+        base position = skyMoon.userData.lightingAnchorPosition
         bias direction = moonLightTarget - base position
         final position = base position + bias direction * offsetTowardTarget
 
@@ -346,11 +449,31 @@ const WORLD_TWEAKS = {
         can be nudged later once the visual shell is final enough to tune by eye.
       */
       walls: [
-        { label: "cathedral-north-wall", center: [-5.54, -10.69], size: [55.2, 1.2] },
-        { label: "cathedral-west-wall", center: [-33.15, 11.25], size: [1.2, 43.9] },
-        { label: "cathedral-east-wall", center: [22.07, 11.25], size: [1.2, 43.9] },
-        { label: "cathedral-south-west-wall", center: [-20.08, 33.19], size: [26.14, 1.2] },
-        { label: "cathedral-south-east-wall", center: [14.53, 33.19], size: [15.06, 1.2] },
+        {
+          label: "cathedral-north-wall",
+          center: [-5.54, -10.69],
+          size: [55.2, 1.2],
+        },
+        {
+          label: "cathedral-west-wall",
+          center: [-33.15, 11.25],
+          size: [1.2, 43.9],
+        },
+        {
+          label: "cathedral-east-wall",
+          center: [22.07, 11.25],
+          size: [1.2, 43.9],
+        },
+        {
+          label: "cathedral-south-west-wall",
+          center: [-20.08, 33.19],
+          size: [26.14, 1.2],
+        },
+        {
+          label: "cathedral-south-east-wall",
+          center: [14.53, 33.19],
+          size: [15.06, 1.2],
+        },
       ],
       columns: [
         { label: "cathedral-column-west-1", center: [-24, 18], radius: 0.9 },
@@ -633,6 +756,56 @@ function getWorldSkyMode(name = WORLD_TWEAKS.atmosphere.defaultPalette) {
   );
 }
 
+function getWorldSkyGradient(name = WORLD_TWEAKS.atmosphere.defaultPalette) {
+  /*
+    Returns the requested three-stop sky color record.
+
+    Unknown names fall back to the default night gradient so a typo in a future
+    weather/cycle experiment cannot leave the shader with undefined colors.
+  */
+  return (
+    WORLD_TWEAKS.atmosphere.skyGradients[name] ||
+    WORLD_TWEAKS.atmosphere.skyGradients[WORLD_TWEAKS.atmosphere.defaultPalette]
+  );
+}
+
+function applyOutsideSkyGradient(
+  skyName = WORLD_TWEAKS.atmosphere.defaultPalette,
+  opacity = 1,
+) {
+  /*
+    Writes one named gradient into the shared outside-shell ShaderMaterial.
+
+    Every outside wall and the ceiling share this material, so one uniform
+    update changes the complete visible sky enclosure without rebuilding any
+    geometry. The fragment shader converts each pixel's camera-relative viewing
+    elevation into a normalized sky height and blends horizon -> mid -> zenith.
+  */
+  const gradient = getWorldSkyGradient(skyName);
+
+  applyOutsideSkyGradientColors(gradient, opacity);
+  return gradient;
+}
+
+function applyOutsideSkyGradientColors(gradient, opacity = 1) {
+  /*
+    Low-level gradient writer used by both named static modes and the cycle.
+
+    A gradient color may be a CSS hex string or a THREE.Color. Color.set()
+    accepts either form, which lets static configuration and interpolated
+    runtime colors share one shader-uniform path.
+  */
+  const uniforms = outsideWallMaterial.uniforms;
+
+  uniforms.uHorizonColor.value.set(gradient.horizon);
+  uniforms.uMidColor.value.set(gradient.mid);
+  uniforms.uZenithColor.value.set(gradient.zenith);
+  uniforms.uOpacity.value = opacity;
+  outsideWallMaterial.transparent = opacity < 0.99;
+  outsideWallMaterial.depthWrite = opacity >= 0.99;
+  outsideWallMaterial.needsUpdate = true;
+}
+
 export function applyWorldSkyColor(
   scene,
   renderer,
@@ -649,8 +822,8 @@ export function applyWorldSkyColor(
       applyWorldSkyColor()   = sky background + renderer clear color only
 
     Formula:
-      mode  = skyModes[skyName] or skyModes.night
-      color = mode.skyColor
+      gradient = skyGradients[skyName] or skyGradients.night
+      color    = gradient.zenith
 
     where:
       scene.background controls the visible Three.js sky/backdrop.
@@ -659,8 +832,8 @@ export function applyWorldSkyColor(
     This helper still writes only color. applyWorldSkyMode() is the fuller
     day/night helper that also writes fog and lights.
   */
-  const mode = getWorldSkyMode(skyName);
-  const color = mode.skyColor;
+  const gradient = applyOutsideSkyGradient(skyName);
+  const color = gradient.zenith;
 
   if (scene) {
     scene.background = new THREE.Color(color);
@@ -688,6 +861,7 @@ export function applyWorldSkyMode(
       outside shell color and opacity
       HemisphereLight fill color and intensity
       sun DirectionalLight color, intensity, visibility, position, target
+      sun lensflare visibility
       central accent PointLight intensity/visibility
 
     What this deliberately does not write:
@@ -713,11 +887,7 @@ export function applyWorldSkyMode(
     scene.fog = new THREE.FogExp2(mode.fogColor, mode.fogDensity);
   }
 
-  outsideWallMaterial.color.set(mode.outsideShellColor);
-  outsideWallMaterial.opacity = mode.outsideShellOpacity;
-  outsideWallMaterial.transparent = mode.outsideShellOpacity < 0.99;
-  outsideWallMaterial.depthWrite = mode.outsideShellOpacity >= 0.99;
-  outsideWallMaterial.needsUpdate = true;
+  applyOutsideSkyGradient(skyName, mode.outsideShellOpacity);
 
   if (lightingRig?.hemisphereLight) {
     lightingRig.hemisphereLight.color.set(mode.hemisphereSkyColor);
@@ -735,6 +905,13 @@ export function applyWorldSkyMode(
     lightingRig.sunLight.updateMatrixWorld(true);
   }
 
+  if (lightingRig?.sunLensflare) {
+    setLensflareFade(
+      lightingRig.sunLensflare,
+      mode.sunLightIntensity > 0 ? 1 : 0,
+    );
+  }
+
   if (lightingRig?.sunLightTarget) {
     lightingRig.sunLightTarget.position.set(
       ...WORLD_TWEAKS.lighting.sunLightTarget,
@@ -749,6 +926,540 @@ export function applyWorldSkyMode(
   }
 
   return mode;
+}
+
+function makeRuntimeSkyGradient(source) {
+  /* Converts configured hex strings into mutable runtime THREE.Color values. */
+  return {
+    horizon: new THREE.Color(source.horizon),
+    mid: new THREE.Color(source.mid),
+    zenith: new THREE.Color(source.zenith),
+  };
+}
+
+function cloneRuntimeSkyGradient(source) {
+  return {
+    horizon: source.horizon.clone(),
+    mid: source.mid.clone(),
+    zenith: source.zenith.clone(),
+  };
+}
+
+function lerpRuntimeSkyGradient(target, start, end, amount) {
+  target.horizon.copy(start.horizon).lerp(end.horizon, amount);
+  target.mid.copy(start.mid).lerp(end.mid, amount);
+  target.zenith.copy(start.zenith).lerp(end.zenith, amount);
+  return target;
+}
+
+function smoothSkyStep(amount) {
+  /* Smoothstep without overshoot: t^2 * (3 - 2t), where t is clamped 0..1. */
+  const t = THREE.MathUtils.clamp(amount, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+const skyColorLerpScratch = new THREE.Color();
+
+function lerpSkyColor(target, start, end, amount) {
+  /* Reuse one scratch color so the every-frame light blend creates no garbage. */
+  target.set(start).lerp(skyColorLerpScratch.set(end), amount);
+}
+
+function setLensflareFade(lensflare, amount) {
+  /*
+    LensflareElement has RGB color but no separate opacity property.
+
+    Lensflare uses additive blending, so scaling each element's color toward
+    black produces a true visual fade:
+
+      visibleColor = authoredColor * fadeAmount
+
+    Base colors are captured once when elements are created. Every frame starts
+    from those immutable bases, preventing repeated day/night cycles from
+    multiplying already-dimmed values.
+  */
+  if (!lensflare) {
+    return;
+  }
+
+  const fade = THREE.MathUtils.clamp(amount, 0, 1);
+  const elements = lensflare.userData.skyCycleElements || [];
+
+  lensflare.userData.lastAppliedFade = fade;
+
+  elements.forEach(({ element, baseColor }) => {
+    element.color.copy(baseColor).multiplyScalar(fade);
+  });
+  lensflare.visible =
+    Boolean(lensflare.userData.skyCycleEnabled) && fade > 0.001;
+}
+
+function getSkyMoonPhaseFlareFactor(skyMoon) {
+  /*
+    Converts physical illuminated fraction into a restrained visual response.
+
+      factor = lerp(minimum, 1, illumination ^ gamma)
+
+    This affects only LensflareElement color. Directional and PointLight
+    intensities remain under the existing day/night controller.
+  */
+  const illumination = THREE.MathUtils.clamp(
+    skyMoon?.userData?.lunarPhasePresentation?.illumination ?? 1,
+    0,
+    1,
+  );
+  const shapedIllumination = Math.pow(
+    illumination,
+    WORLD_TWEAKS.skyMoon.phaseFlareGamma,
+  );
+
+  return THREE.MathUtils.lerp(
+    WORLD_TWEAKS.skyMoon.phaseFlareMinimum,
+    1,
+    shapedIllumination,
+  );
+}
+
+function applySkyMoonLensflareFade(skyMoon, nightInfluence = null) {
+  if (!skyMoon) {
+    return;
+  }
+
+  const rememberedNightInfluence = skyMoon.userData.skyCycleNightInfluence ?? 1;
+  const normalizedNightInfluence = THREE.MathUtils.clamp(
+    Number.isFinite(nightInfluence) ? nightInfluence : rememberedNightInfluence,
+    0,
+    1,
+  );
+  const phaseFactor = getSkyMoonPhaseFlareFactor(skyMoon);
+
+  skyMoon.userData.skyCycleNightInfluence = normalizedNightInfluence;
+  skyMoon.userData.lunarPhaseFlareFactor = phaseFactor;
+  setLensflareFade(
+    skyMoon.userData.skyCycleLensflare,
+    normalizedNightInfluence * phaseFactor,
+  );
+}
+
+function registerLensflareElement(lensflare, element) {
+  /* Adds one element and remembers the exact color its fade must restore. */
+  lensflare.addElement(element);
+  lensflare.userData.skyCycleElements ||= [];
+  lensflare.userData.skyCycleElements.push({
+    element,
+    baseColor: element.color.clone(),
+  });
+}
+
+function setObjectMaterialFade(root, amount) {
+  /*
+    Multiplies every mesh material below root by a stable base opacity.
+
+    Imported moon materials can arrive asynchronously, so registration is lazy:
+    the first frame that sees a material stores material.opacity as its authored
+    base, enables transparency once, and then uses:
+
+      visibleOpacity = authoredBaseOpacity * fadeAmount
+
+    Lensflare objects are skipped because their brightness is handled through
+    LensflareElement colors above.
+  */
+  if (!root) {
+    return;
+  }
+
+  const fade = THREE.MathUtils.clamp(amount, 0, 1);
+
+  root.traverse((object) => {
+    if (!object.isMesh || object.isLensflare || object.type === "Lensflare") {
+      return;
+    }
+
+    const materials = Array.isArray(object.material)
+      ? object.material
+      : [object.material];
+
+    materials.forEach((material) => {
+      if (!material) {
+        return;
+      }
+
+      if (!Number.isFinite(material.userData.skyCycleBaseOpacity)) {
+        material.userData.skyCycleBaseOpacity = material.opacity;
+        material.transparent = true;
+        material.needsUpdate = true;
+      }
+
+      material.opacity = material.userData.skyCycleBaseOpacity * fade;
+    });
+  });
+}
+
+function setGhostSphereFade(ghostSpheres, amount) {
+  /* Uses direct mesh references; no per-frame scene traversal is required. */
+  const fade = THREE.MathUtils.clamp(amount, 0, 1);
+
+  ghostSpheres.forEach((sphere) => {
+    if (sphere.wire?.material) {
+      sphere.wire.material.opacity = sphere.wireBaseOpacity * fade;
+    }
+
+    if (sphere.glow?.material) {
+      sphere.glow.material.opacity = sphere.glowBaseOpacity * fade;
+    }
+  });
+}
+
+function applyInterpolatedWorldSky(
+  scene,
+  renderer,
+  lightingRig,
+  gradient,
+  dayBlend,
+  { skyMoon = null, ghostSpheres = [] } = {},
+) {
+  /*
+    Applies one fully interpolated sky frame.
+
+    dayBlend is the common crossfade datum:
+      0.0 = complete night lighting
+      0.5 = twilight/transition lighting
+      1.0 = complete day lighting
+
+    The three sky colors are interpolated independently because the authored
+    transition palette is not simply the mathematical midpoint between day and
+    night. Lights and fog, however, can use the shared dayBlend value.
+  */
+  const nightMode = getWorldSkyMode("night");
+  const dayMode = getWorldSkyMode("day");
+  const nightPalette = getWorldAtmospherePalette("night");
+  const t = THREE.MathUtils.clamp(dayBlend, 0, 1);
+  const nightBlend = 1 - t;
+  const shellOpacity = THREE.MathUtils.lerp(
+    nightMode.outsideShellOpacity,
+    dayMode.outsideShellOpacity,
+    t,
+  );
+
+  applyOutsideSkyGradientColors(gradient, shellOpacity);
+
+  if (scene) {
+    if (!scene.background?.isColor) {
+      scene.background = gradient.zenith.clone();
+    } else {
+      scene.background.copy(gradient.zenith);
+    }
+
+    if (!scene.fog?.isFogExp2) {
+      scene.fog = new THREE.FogExp2(nightMode.fogColor, nightMode.fogDensity);
+    }
+
+    lerpSkyColor(scene.fog.color, nightMode.fogColor, dayMode.fogColor, t);
+    scene.fog.density = THREE.MathUtils.lerp(
+      nightMode.fogDensity,
+      dayMode.fogDensity,
+      t,
+    );
+  }
+
+  renderer?.setClearColor?.(gradient.zenith, 1);
+
+  if (lightingRig?.hemisphereLight) {
+    lerpSkyColor(
+      lightingRig.hemisphereLight.color,
+      nightMode.hemisphereSkyColor,
+      dayMode.hemisphereSkyColor,
+      t,
+    );
+    lerpSkyColor(
+      lightingRig.hemisphereLight.groundColor,
+      nightMode.hemisphereGroundColor,
+      dayMode.hemisphereGroundColor,
+      t,
+    );
+    lightingRig.hemisphereLight.intensity = THREE.MathUtils.lerp(
+      nightMode.hemisphereIntensity,
+      dayMode.hemisphereIntensity,
+      t,
+    );
+  }
+
+  if (lightingRig?.sunLight) {
+    lerpSkyColor(
+      lightingRig.sunLight.color,
+      nightMode.sunLightColor,
+      dayMode.sunLightColor,
+      t,
+    );
+    lightingRig.sunLight.intensity = THREE.MathUtils.lerp(
+      nightMode.sunLightIntensity,
+      dayMode.sunLightIntensity,
+      t,
+    );
+    lightingRig.sunLight.visible = lightingRig.sunLight.intensity > 0.001;
+  }
+
+  if (lightingRig?.sunLensflare) {
+    setLensflareFade(lightingRig.sunLensflare, t);
+  }
+
+  if (skyMoon) {
+    applySkyMoonLensflareFade(skyMoon, nightBlend);
+  } else if (lightingRig?.moonLensflare) {
+    setLensflareFade(lightingRig.moonLensflare, nightBlend);
+  }
+
+  if (lightingRig?.moonLight) {
+    lightingRig.moonLight.intensity =
+      nightPalette.moonLightIntensity * nightBlend;
+    lightingRig.moonLight.visible = lightingRig.moonLight.intensity > 0.001;
+  }
+
+  if (lightingRig?.moonPointLight) {
+    lightingRig.moonPointLight.intensity =
+      nightPalette.moonPointLightIntensity * nightBlend;
+    lightingRig.moonPointLight.visible =
+      lightingRig.moonPointLight.intensity > 0.001;
+  }
+
+  if (lightingRig?.pointLight) {
+    lerpSkyColor(
+      lightingRig.pointLight.color,
+      nightMode.localAccentColor,
+      dayMode.localAccentColor,
+      t,
+    );
+    lightingRig.pointLight.intensity = THREE.MathUtils.lerp(
+      nightMode.localAccentIntensity,
+      dayMode.localAccentIntensity,
+      t,
+    );
+    lightingRig.pointLight.visible = lightingRig.pointLight.intensity > 0.001;
+  }
+
+  setObjectMaterialFade(skyMoon, nightBlend);
+  setGhostSphereFade(ghostSpheres, nightBlend);
+}
+
+export function createWorldSkyCycleController(
+  scene,
+  renderer,
+  {
+    lightingRig = null,
+    skyMoon = null,
+    ghostSpheres = [],
+    onStateChange = null,
+  } = {},
+) {
+  /*
+    World-owned, frame-driven day/night state machine.
+
+    Why a state machine instead of chained setTimeout() calls:
+      - one update path owns automatic and manual transitions
+      - `G` can interrupt any phase without orphaned timers
+      - the current visible colors become the next transition's true start
+      - G53 can pause update calls without reconstructing timer state
+
+    Phase sequence:
+      holdStable
+        -> toTransition (1 second)
+        -> holdTransition (5 seconds)
+        -> toTarget (1 second)
+        -> holdStable (120 seconds)
+
+    Runtime dayBlend crossfades the lighting rig while the authored gradient
+    colors move through their independent transition palette.
+  */
+  const timing = WORLD_TWEAKS.atmosphere.skyCycle;
+  const configuredGradients = {
+    night: makeRuntimeSkyGradient(getWorldSkyGradient("night")),
+    day: makeRuntimeSkyGradient(getWorldSkyGradient("day")),
+    transition: makeRuntimeSkyGradient(getWorldSkyGradient("transition")),
+  };
+  const runtime = {
+    phase: "holdStable",
+    stableState: "night",
+    targetState: "night",
+    phaseElapsed: 0,
+    phaseDuration: timing.holdNight,
+    currentGradient: cloneRuntimeSkyGradient(configuredGradients.night),
+    startGradient: cloneRuntimeSkyGradient(configuredGradients.night),
+    endGradient: cloneRuntimeSkyGradient(configuredGradients.night),
+    currentDayBlend: 0,
+    startDayBlend: 0,
+    endDayBlend: 0,
+    transitionSource: "startup",
+  };
+
+  function getSnapshot() {
+    return {
+      phase: runtime.phase,
+      stableState: runtime.stableState,
+      targetState: runtime.targetState,
+      phaseElapsed: runtime.phaseElapsed,
+      phaseDuration: runtime.phaseDuration,
+      dayBlend: runtime.currentDayBlend,
+      nightInfluence: 1 - runtime.currentDayBlend,
+      transitionSource: runtime.transitionSource,
+    };
+  }
+
+  function notify() {
+    onStateChange?.(getSnapshot());
+  }
+
+  function applyCurrent() {
+    applyInterpolatedWorldSky(
+      scene,
+      renderer,
+      lightingRig,
+      runtime.currentGradient,
+      runtime.currentDayBlend,
+      { skyMoon, ghostSpheres },
+    );
+    notify();
+    return getSnapshot();
+  }
+
+  function configureBlendPhase(phase, duration, endGradient, endDayBlend) {
+    runtime.phase = phase;
+    runtime.phaseElapsed = 0;
+    runtime.phaseDuration = duration;
+    runtime.startGradient = cloneRuntimeSkyGradient(runtime.currentGradient);
+    runtime.endGradient = cloneRuntimeSkyGradient(endGradient);
+    runtime.startDayBlend = runtime.currentDayBlend;
+    runtime.endDayBlend = endDayBlend;
+  }
+
+  function beginTransition(targetState, source = "automatic") {
+    runtime.targetState = targetState;
+    runtime.transitionSource = source;
+    configureBlendPhase(
+      "toTransition",
+      timing.transitionToTransition,
+      configuredGradients.transition,
+      0.5,
+    );
+    console.info(`[sky] ${source} transition toward ${targetState}`);
+    return applyCurrent();
+  }
+
+  function enterStableState(stateName) {
+    runtime.phase = "holdStable";
+    runtime.stableState = stateName;
+    runtime.targetState = stateName;
+    runtime.phaseElapsed = 0;
+    runtime.phaseDuration =
+      stateName === "night" ? timing.holdNight : timing.holdDay;
+    runtime.currentGradient = cloneRuntimeSkyGradient(
+      configuredGradients[stateName],
+    );
+    runtime.currentDayBlend = stateName === "day" ? 1 : 0;
+    console.info(
+      `[sky] reached ${stateName}; automatic hold ${runtime.phaseDuration / 1000}s`,
+    );
+  }
+
+  function completeCurrentPhase() {
+    if (runtime.phase === "holdStable") {
+      beginTransition(
+        runtime.stableState === "night" ? "day" : "night",
+        "automatic",
+      );
+      return;
+    }
+
+    if (runtime.phase === "toTransition") {
+      runtime.currentGradient = cloneRuntimeSkyGradient(
+        configuredGradients.transition,
+      );
+      runtime.currentDayBlend = 0.5;
+      runtime.phase = "holdTransition";
+      runtime.phaseElapsed = 0;
+      runtime.phaseDuration = timing.holdTransition;
+      return;
+    }
+
+    if (runtime.phase === "holdTransition") {
+      configureBlendPhase(
+        "toTarget",
+        timing.transitionToTarget,
+        configuredGradients[runtime.targetState],
+        runtime.targetState === "day" ? 1 : 0,
+      );
+      return;
+    }
+
+    if (runtime.phase === "toTarget") {
+      enterStableState(runtime.targetState);
+    }
+  }
+
+  function update(deltaMilliseconds) {
+    let remaining = Math.max(0, deltaMilliseconds);
+    let safetyCount = 0;
+
+    /*
+      Consume all supplied time, including a frame that crosses a phase edge.
+      The safety limit prevents a malformed zero-duration configuration from
+      producing an infinite loop.
+    */
+    while (remaining > 0 && safetyCount < 8) {
+      safetyCount += 1;
+      const timeLeft = Math.max(
+        0,
+        runtime.phaseDuration - runtime.phaseElapsed,
+      );
+      const consumed = Math.min(remaining, timeLeft);
+
+      runtime.phaseElapsed += consumed;
+      remaining -= consumed;
+
+      if (runtime.phase === "toTransition" || runtime.phase === "toTarget") {
+        const rawProgress =
+          runtime.phaseDuration > 0
+            ? runtime.phaseElapsed / runtime.phaseDuration
+            : 1;
+        const easedProgress = smoothSkyStep(rawProgress);
+
+        lerpRuntimeSkyGradient(
+          runtime.currentGradient,
+          runtime.startGradient,
+          runtime.endGradient,
+          easedProgress,
+        );
+        runtime.currentDayBlend = THREE.MathUtils.lerp(
+          runtime.startDayBlend,
+          runtime.endDayBlend,
+          easedProgress,
+        );
+      }
+
+      if (runtime.phaseElapsed >= runtime.phaseDuration) {
+        completeCurrentPhase();
+      }
+
+      if (consumed <= 0 && runtime.phaseDuration > 0) {
+        break;
+      }
+    }
+
+    return applyCurrent();
+  }
+
+  function toggleTarget() {
+    const nextTarget = runtime.targetState === "night" ? "day" : "night";
+    return beginTransition(nextTarget, "manual");
+  }
+
+  applyCurrent();
+
+  return {
+    applyCurrent,
+    getSnapshot,
+    toggleTarget,
+    update,
+  };
 }
 
 export function getDefaultSkyMoonColor() {
@@ -779,6 +1490,9 @@ const treeAssetState = {
 const landmarkAssetState = {};
 const moonLightWorldPosition = new THREE.Vector3();
 const moonPointLightDirection = new THREE.Vector3();
+const skyMoonCameraWorldPosition = new THREE.Vector3();
+const skyMoonAnchorWorldPosition = new THREE.Vector3();
+const skyMoonAnchorOffset = new THREE.Vector3();
 
 // =============================================================
 // SKY MOON
@@ -788,47 +1502,238 @@ export function buildSkyMoon() {
   /*
     Builds the moon/sky focal point as a world-owned object.
 
-    The group is available immediately with a fallback sphere so the scene has
-    the same visible sky focal point while moon.glb is loading. Once moon.glb
-    arrives, the fallback hides and the normalized GLB takes over.
+    The visible surface is a flat textured disc. Its local onBeforeRender keeps
+    it aligned to the active camera. updateSkyMoonCameraAnchor() moves the full
+    presentation group with the camera at a constant distance, while a separate
+    fixed anchor preserves the authored gameplay-lighting direction.
   */
   const group = new THREE.Group();
-  const fallback = new THREE.Mesh(
-    new THREE.SphereGeometry(WORLD_TWEAKS.skyMoon.targetDiameter * 0.5, 24, 14),
-    new THREE.MeshBasicMaterial({
-      color: defaultAtmospherePalette.moonLightColor,
-      toneMapped: false,
-    }),
+  const surfaceMaterial = new THREE.MeshBasicMaterial({
+    name: "sky-moon-billboard-surface",
+    color: WORLD_TWEAKS.skyMoon.fallbackColor,
+    transparent: true,
+    opacity: WORLD_TWEAKS.skyMoon.surfaceOpacity,
+    depthTest: false,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    toneMapped: false,
+  });
+  const surface = new THREE.Mesh(
+    new THREE.CircleGeometry(WORLD_TWEAKS.skyMoon.targetDiameter * 0.5, 64),
+    surfaceMaterial,
   );
 
-  group.name = "sky-moon";
-  group.userData.g53VisibilityRole = "sky";
-  group.userData.fallback = fallback;
-  group.position.set(...WORLD_TWEAKS.skyMoon.position);
-  group.add(fallback);
-  group.add(createSkyMoonInnerGlowSphere());
+  surface.name = "sky-moon-billboard-disc";
+  surface.userData.g53VisibilityRole = "sky";
+  surface.frustumCulled = false;
+  surface.renderOrder = 3;
+  surface.onBeforeRender = (_renderer, _scene, camera) => {
+    surface.quaternion.copy(camera.quaternion);
+    surface.updateMatrixWorld(true);
+  };
 
-  gltfLoader.load(
+  textureLoader.load(
     WORLD_TWEAKS.skyMoon.assetPath,
-    (gltf) => {
-      const moon = gltf.scene;
-
-      moon.name = "sky-moon-model";
-      normalizeSkyMoonModel(moon);
-      fallback.visible = false;
-      group.add(moon);
-      console.info("[sky] moon loaded", WORLD_TWEAKS.skyMoon.assetPath);
+    (texture) => {
+      /*
+        moon_2K.jpg is a 2:1 equirectangular map. The middle half of U spans the
+        camera-facing hemisphere (-90 to +90 degrees longitude); mapping that
+        interval across the disc avoids wrapping the far side onto the front.
+      */
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.wrapS = THREE.ClampToEdgeWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+      texture.repeat.set(0.5, 1);
+      texture.offset.set(0.25, 0);
+      texture.needsUpdate = true;
+      surfaceMaterial.map = texture;
+      surfaceMaterial.needsUpdate = true;
+      console.info("[sky] moon texture loaded", WORLD_TWEAKS.skyMoon.assetPath);
     },
     undefined,
     (error) => {
       console.warn(
-        "[sky] failed to load moon.glb; using fallback sphere",
+        "[sky] failed to load moon_2K.jpg; using fallback moon disc",
         error,
       );
     },
   );
 
+  group.name = "sky-moon";
+  group.userData.g53VisibilityRole = "sky";
+  group.userData.fallback = surface;
+  group.position.set(...WORLD_TWEAKS.skyMoon.position);
+  group.userData.lightingAnchorPosition = Object.freeze(group.position.clone());
+  group.add(surface);
+  group.add(createSkyMoonInnerGlowSphere());
+  const phaseShadow = createSkyMoonPhaseShadow();
+  group.userData.lunarPhaseShadow = phaseShadow;
+  group.add(phaseShadow);
+  const moonLensflare = createSkyMoonLensflare();
+  group.userData.skyCycleLensflare = moonLensflare;
+  group.add(moonLensflare);
+  applySkyMoonPhasePresentation(group);
+
   return group;
+}
+
+export function updateSkyMoonCameraAnchor(skyMoon, camera) {
+  /*
+    Keeps the rendered moon at a constant distance from the active camera.
+
+    The first call captures the authored sightline exactly:
+
+      offset = initialMoonWorldPosition - cameraWorldPosition
+      direction = normalize(offset)
+      distance = length(offset)
+
+    Every later frame applies:
+
+      moonWorldPosition = cameraWorldPosition + direction * distance
+
+    direction and distance never change after capture. Player translation can
+    therefore never approach the moon or change its apparent diameter. Camera
+    rotation does not rotate the sky direction; the moon remains fixed in the
+    world's sky while the billboard surface continues to face the camera.
+  */
+  if (!skyMoon || !camera) {
+    return null;
+  }
+
+  camera.updateMatrixWorld(true);
+  camera.getWorldPosition(skyMoonCameraWorldPosition);
+
+  let anchor = skyMoon.userData.cameraAnchor;
+
+  if (!anchor) {
+    skyMoon.updateMatrixWorld(true);
+    skyMoon.getWorldPosition(skyMoonAnchorWorldPosition);
+    skyMoonAnchorOffset.subVectors(
+      skyMoonAnchorWorldPosition,
+      skyMoonCameraWorldPosition,
+    );
+
+    const distance = skyMoonAnchorOffset.length();
+
+    if (!(distance > 0)) {
+      return null;
+    }
+
+    anchor = Object.freeze({
+      direction: Object.freeze(skyMoonAnchorOffset.clone().normalize()),
+      distance,
+    });
+    skyMoon.userData.cameraAnchor = anchor;
+  }
+
+  skyMoonAnchorWorldPosition
+    .copy(skyMoonCameraWorldPosition)
+    .addScaledVector(anchor.direction, anchor.distance);
+
+  if (skyMoon.parent) {
+    skyMoon.parent.updateMatrixWorld(true);
+    skyMoon.parent.worldToLocal(skyMoonAnchorWorldPosition);
+  }
+
+  skyMoon.position.copy(skyMoonAnchorWorldPosition);
+  skyMoon.updateMatrixWorld(true);
+  return anchor.distance;
+}
+
+export function applySkyMoonPhasePresentation(
+  skyMoon,
+  {
+    phase = WORLD_TWEAKS.skyMoon.defaultLunarPhase,
+    hemisphere = WORLD_TWEAKS.skyMoon.defaultLunarHemisphere,
+  } = {},
+) {
+  /*
+    Updates only the visual phase layer. It does not alter moon/world lights,
+    the day/night controller, visibility, encounter state, or the source data.
+
+    phase is normalized into [0, 1):
+      0.00 = new moon
+      0.25 = first quarter
+      0.50 = full moon
+      0.75 = last quarter
+
+    The shader interprets orientation in view space, so "right" and "left"
+    remain screen-relative while the player camera moves through the world.
+  */
+  if (!skyMoon) {
+    return null;
+  }
+
+  const normalizedPhase = Number.isFinite(phase)
+    ? ((phase % 1) + 1) % 1
+    : WORLD_TWEAKS.skyMoon.defaultLunarPhase;
+  const normalizedHemisphere =
+    hemisphere === "southern" ? "southern" : "northern";
+  const illumination = 0.5 * (1 - Math.cos(2 * Math.PI * normalizedPhase));
+  const shadow = skyMoon.userData?.lunarPhaseShadow || null;
+  const uniforms = shadow?.material?.userData?.lunarPhaseUniforms || null;
+
+  if (uniforms) {
+    uniforms.uLunarPhase.value = normalizedPhase;
+    uniforms.uOrientationSign.value =
+      normalizedHemisphere === "southern" ? -1 : 1;
+  }
+
+  skyMoon.userData.lunarPhasePresentation = Object.freeze({
+    phase: normalizedPhase,
+    illumination,
+    hemisphere: normalizedHemisphere,
+  });
+  applySkyMoonLensflareFade(skyMoon);
+
+  return skyMoon.userData.lunarPhasePresentation;
+}
+
+function createSkyMoonLensflare() {
+  /*
+    Creates a very subtle lensflare at the visible moon datum.
+
+    Because the returned Lensflare is a child of the skyMoon group, its local
+    position is [0, 0, 0]. The group supplies the final world position:
+
+      flareWorldPosition = skyMoon.matrixWorld * localOrigin
+
+    where localOrigin is [0, 0, 0].
+
+    That keeps the flare tied to the same visible moon object that already owns
+    moonlight direction, G53 visibility, and the `G` day/night toggle.
+  */
+  const settings = WORLD_TWEAKS.lensflare.moon;
+  const flare = new Lensflare();
+  flare.name = "sky-moon-subtle-lensflare";
+  flare.userData.g53VisibilityRole = "sky";
+  flare.userData.skyCycleEnabled = Boolean(settings.enabled);
+  flare.visible = Boolean(settings.enabled);
+
+  if (!settings.enabled) {
+    return flare;
+  }
+
+  registerLensflareElement(
+    flare,
+    new LensflareElement(
+      createRadialLensflareTexture(settings.color, settings.coreAlpha, 0.0),
+      settings.coreSize,
+      0,
+      new THREE.Color(settings.color),
+    ),
+  );
+  registerLensflareElement(
+    flare,
+    new LensflareElement(
+      createRadialLensflareTexture(settings.color, settings.haloAlpha, 0.0),
+      settings.haloSize,
+      0,
+      new THREE.Color(settings.color),
+    ),
+  );
+
+  return flare;
 }
 
 function normalizeSkyMoonModel(model) {
@@ -890,6 +1795,7 @@ function createSkyMoonInnerGlowSphere() {
       color: defaultAtmospherePalette.moonLightColor,
       transparent: true,
       opacity: WORLD_TWEAKS.skyMoon.innerGlowOpacity,
+      depthTest: false,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       toneMapped: false,
@@ -898,8 +1804,109 @@ function createSkyMoonInnerGlowSphere() {
 
   glow.name = "sky-moon-inner-glow";
   glow.userData.g53VisibilityRole = "sky";
+  glow.frustumCulled = false;
   glow.renderOrder = 2;
   return glow;
+}
+
+function createSkyMoonPhaseShadow() {
+  /*
+    A view-space terminator painted over the existing self-lit moon stack.
+
+    Keeping this as a separate transparent sphere preserves:
+      - the embedded moon.glb crater texture
+      - the self-lit detail material
+      - the additive inner glow
+      - asynchronous GLB/fallback swapping
+      - encounter scale behavior on the parent skyMoon group
+
+    MeshBasicMaterial is intentional. Its standard opacity uniform continues to
+    participate in setObjectMaterialFade(), while onBeforeCompile adds only the
+    phase-shaped alpha mask. A standalone ShaderMaterial would require a second
+    custom opacity bridge for every day/night fade frame.
+  */
+  const uniforms = {
+    uLunarPhase: {
+      value: WORLD_TWEAKS.skyMoon.defaultLunarPhase,
+    },
+    uOrientationSign: {
+      value:
+        WORLD_TWEAKS.skyMoon.defaultLunarHemisphere === "southern" ? -1 : 1,
+    },
+    uTerminatorSoftness: {
+      value: WORLD_TWEAKS.skyMoon.phaseTerminatorSoftness,
+    },
+  };
+  const material = new THREE.MeshBasicMaterial({
+    name: "sky-moon-lunar-phase-shadow",
+    color: WORLD_TWEAKS.skyMoon.phaseShadowColor,
+    transparent: true,
+    opacity: WORLD_TWEAKS.skyMoon.phaseShadowOpacity,
+    depthTest: false,
+    depthWrite: false,
+    side: THREE.FrontSide,
+    toneMapped: false,
+  });
+
+  material.userData.lunarPhaseUniforms = uniforms;
+  material.userData.ignoreSkyMoonTint = true;
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+varying vec3 vMoonPhaseViewNormal;`,
+      )
+      .replace(
+        "#include <begin_vertex>",
+        `#include <begin_vertex>
+vMoonPhaseViewNormal = normalize(normalMatrix * normal);`,
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+uniform float uLunarPhase;
+uniform float uOrientationSign;
+uniform float uTerminatorSoftness;
+varying vec3 vMoonPhaseViewNormal;`,
+      )
+      .replace(
+        "#include <opaque_fragment>",
+        `const float MOON_PHASE_TAU = 6.283185307179586;
+float moonPhaseAngle = uLunarPhase * MOON_PHASE_TAU;
+vec3 moonSunDirection = normalize(vec3(
+  uOrientationSign * sin(moonPhaseAngle),
+  0.0,
+  -cos(moonPhaseAngle)
+));
+float moonLightFacing = dot(normalize(vMoonPhaseViewNormal), moonSunDirection);
+float moonLitMask = smoothstep(
+  -uTerminatorSoftness,
+  uTerminatorSoftness,
+  moonLightFacing
+);
+diffuseColor.a *= 1.0 - moonLitMask;
+#include <opaque_fragment>`,
+      );
+  };
+  material.customProgramCacheKey = () => "empyrean-moon-phase-shadow-v1";
+
+  const shadow = new THREE.Mesh(
+    new THREE.SphereGeometry(
+      WORLD_TWEAKS.skyMoon.phaseShadowDiameter * 0.5,
+      64,
+      32,
+    ),
+    material,
+  );
+
+  shadow.name = "sky-moon-lunar-phase-shadow";
+  shadow.userData.g53VisibilityRole = "sky";
+  shadow.frustumCulled = false;
+  shadow.renderOrder = 4;
+  return shadow;
 }
 
 function prepareSkyMoonSurfaceMaterial(sourceMaterial) {
@@ -1109,9 +2116,10 @@ const roomSurfaceMaterials = {
   ),
 };
 
-const outsideWallMaterial = new THREE.MeshBasicMaterial({
+const defaultSkyGradient = getWorldSkyGradient();
+const outsideWallMaterial = new THREE.ShaderMaterial({
   /*
-    Outside wall/ceiling sky shell.
+    Outside wall/ceiling three-stop sky shell.
 
     This material intentionally ignores scene lighting.
 
@@ -1127,16 +2135,64 @@ const outsideWallMaterial = new THREE.MeshBasicMaterial({
         the camera is allowed to orbit beyond the player movement bounds.
       fog: false prevents night/day fog from creating another distance-based
         blue blend on the shell itself.
-      toneMapped: false keeps #CEEAFA and #131862 closer to their authored
-        values instead of being pushed around by renderer tone mapping.
+      ShaderMaterial outputs the authored colors directly, so scene lights and
+        renderer tone mapping cannot turn different shell faces into different
+        shades again.
+
+    Gradient formula:
+      viewDirection = normalize(worldPosition - cameraPosition)
+      skyHeight     = clamp(viewDirection.y, 0, 1)
+
+      lower half: mix(horizonColor, midColor, smoothstep(0, 0.5, skyHeight))
+      upper half: mix(midColor, zenithColor, smoothstep(0.5, 1, skyHeight))
+
+    where:
+      viewDirection.y = 0 when looking horizontally toward the horizon
+      viewDirection.y = 1 when looking straight up toward the zenith
+
+    Why this is camera-relative:
+      A previous world-height version painted fixed horizontal color bands onto
+      the enclosure walls. Perspective made the brighter band visibly contract
+      as the player approached a wall. Basing the blend on viewing elevation
+      makes the finite enclosure behave like a distant sky instead of a painted
+      box, while remaining continuous across wall/ceiling geometry.
   */
-  color: defaultAtmospherePalette.outsideWallColor,
+  uniforms: {
+    uHorizonColor: { value: new THREE.Color(defaultSkyGradient.horizon) },
+    uMidColor: { value: new THREE.Color(defaultSkyGradient.mid) },
+    uZenithColor: { value: new THREE.Color(defaultSkyGradient.zenith) },
+    uOpacity: { value: 1 },
+  },
+  vertexShader: /* glsl */ `
+    varying vec3 vWorldPosition;
+
+    void main() {
+      vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+      vWorldPosition = worldPosition.xyz;
+      gl_Position = projectionMatrix * viewMatrix * worldPosition;
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform vec3 uHorizonColor;
+    uniform vec3 uMidColor;
+    uniform vec3 uZenithColor;
+    uniform float uOpacity;
+    varying vec3 vWorldPosition;
+
+    void main() {
+      vec3 viewDirection = normalize(vWorldPosition - cameraPosition);
+      float skyHeight = clamp(viewDirection.y, 0.0, 1.0);
+      float lowerBlend = smoothstep(0.0, 0.5, skyHeight);
+      float upperBlend = smoothstep(0.5, 1.0, skyHeight);
+      vec3 lowerColor = mix(uHorizonColor, uMidColor, lowerBlend);
+      vec3 skyColor = mix(lowerColor, uZenithColor, upperBlend);
+
+      gl_FragColor = vec4(skyColor, uOpacity);
+    }
+  `,
   side: THREE.DoubleSide,
   transparent: false,
-  opacity: 1,
   depthWrite: true,
-  fog: false,
-  toneMapped: false,
 });
 const outsideFloorMaterial = new THREE.MeshStandardMaterial({
   color: defaultAtmospherePalette.outsideFloorColor,
@@ -1162,17 +2218,6 @@ const ghostGlowMaterial = new THREE.MeshBasicMaterial({
   depthWrite: false,
   blending: THREE.AdditiveBlending,
 });
-const treeLeafMaterial = new THREE.MeshStandardMaterial({
-  color: "#457543",
-  roughness: 0.85,
-  metalness: 0,
-});
-const treeTrunkMaterial = new THREE.MeshStandardMaterial({
-  color: "#cc9029",
-  roughness: 0.82,
-  metalness: 0,
-});
-
 // =============================================================
 // COLLISION DATA
 // =============================================================
@@ -1480,7 +2525,9 @@ function prepareCathedralShellMaterial(mesh) {
 
 function getCathedralShellTexture() {
   if (!cathedralShellTexture) {
-    cathedralShellTexture = textureLoader.load(WORLD_TWEAKS.churchShell.texturePath);
+    cathedralShellTexture = textureLoader.load(
+      WORLD_TWEAKS.churchShell.texturePath,
+    );
     cathedralShellTexture.colorSpace = THREE.SRGBColorSpace;
     cathedralShellTexture.wrapS = THREE.RepeatWrapping;
     cathedralShellTexture.wrapT = THREE.RepeatWrapping;
@@ -2077,7 +3124,8 @@ function suppressLegacyRoomVisual(object, reason) {
     the room hierarchy to be present. It simply stops participating in rendering.
   */
   const shouldHide =
-    (reason === "legacy-room-wall" && WORLD_TWEAKS.legacyRoomVisuals.hideWalls) ||
+    (reason === "legacy-room-wall" &&
+      WORLD_TWEAKS.legacyRoomVisuals.hideWalls) ||
     (reason === "legacy-room-ceiling" &&
       WORLD_TWEAKS.legacyRoomVisuals.hideCeilings) ||
     (reason === "legacy-room-torch" &&
@@ -2592,6 +3640,10 @@ export function buildGhostSpheres() {
 
     spheres.push({
       group,
+      wire,
+      glow,
+      wireBaseOpacity: wire.material.opacity,
+      glowBaseOpacity: glow.material.opacity,
       basePosition,
       drift: new THREE.Vector3(
         (Math.random() - 0.5) * 0.7,
@@ -2735,8 +3787,7 @@ export function applyWorldAtmosphere(
     palette.rendererClearAlpha ?? 1,
   );
 
-  outsideWallMaterial.color.set(palette.outsideWallColor);
-  outsideWallMaterial.needsUpdate = true;
+  applyOutsideSkyGradient(paletteName);
   outsideFloorMaterial.color.set(palette.outsideFloorColor);
   outsideFloorMaterial.needsUpdate = true;
 
@@ -2768,9 +3819,11 @@ export function buildLighting(scene, { skyMoon = null } = {}) {
   /*
     Lighting stack:
       HemisphereLight = low ambient moonlit fill, just enough to keep shapes readable
-      DirectionalLight = moon-aligned key light tied to skyMoon's world position
+      DirectionalLight = moon-aligned key light tied to the fixed moon lighting anchor
       Sun DirectionalLight = warm day key light used when `G` switches to day
-      Moon PointLight = local moon-shell helper tied to skyMoon's world position
+      Sun Lensflare = stronger day-mode screen glint attached to that sun light
+      Moon PointLight = local moon-shell helper tied to the fixed moon lighting anchor
+      Moon Lensflare = subtle night-mode glint attached to the visible skyMoon
       PointLight = small green character/world accent
       Room torches = warm local point lights created by addTorchLight()
 
@@ -2779,8 +3832,8 @@ export function buildLighting(scene, { skyMoon = null } = {}) {
     a separate inner self-lit glow sphere.
 
     Returns a small lighting rig instead of just mutating the scene. main.js
-    calls rig.update() every frame so the moon light keeps following skyMoon if
-    a future day/night cycle animates the moon across the sky.
+    calls rig.update() every frame so atmosphere intensity/visibility ownership
+    stays unchanged while the moon visual follows the camera independently.
   */
   const atmosphere = getWorldAtmospherePalette();
   const hemisphereLight = new THREE.HemisphereLight(
@@ -2812,6 +3865,9 @@ export function buildLighting(scene, { skyMoon = null } = {}) {
     ...WORLD_TWEAKS.lighting.sunLightTarget,
   );
   sunDirectionalLight.visible = skyMode.sunLightIntensity > 0;
+  const sunLensflare = createSunLensflare();
+  sunLensflare.visible = sunDirectionalLight.visible;
+  sunDirectionalLight.add(sunLensflare);
   scene.add(sunDirectionalLight);
   scene.add(sunDirectionalLight.target);
 
@@ -2839,6 +3895,8 @@ export function buildLighting(scene, { skyMoon = null } = {}) {
     moonLightTarget: moonDirectionalLight.target,
     sunLight: sunDirectionalLight,
     sunLightTarget: sunDirectionalLight.target,
+    sunLensflare,
+    moonLensflare: skyMoon?.userData.skyCycleLensflare || null,
     moonPointLight,
     pointLight,
     update() {
@@ -2850,12 +3908,147 @@ export function buildLighting(scene, { skyMoon = null } = {}) {
   return lightingRig;
 }
 
+function createSunLensflare() {
+  /*
+    Creates the stronger day-mode lensflare for the sun DirectionalLight.
+
+    The flare is attached directly to sunDirectionalLight in buildLighting().
+    That means its world position is inherited from the light source:
+
+      flareWorldPosition = sunDirectionalLight.matrixWorld * localOrigin
+
+    where localOrigin is [0, 0, 0].
+
+    This keeps the flare ready for a future day/night cycle. Future code only
+    has to move sunDirectionalLight; the flare, light direction, and any sun
+    animation can all share that same source transform.
+  */
+  const settings = WORLD_TWEAKS.lensflare.sun;
+  const flare = new Lensflare();
+  flare.name = "day-sun-lensflare";
+  flare.userData.g53VisibilityRole = "sky";
+  flare.userData.skyCycleEnabled = Boolean(settings.enabled);
+  flare.visible = Boolean(settings.enabled);
+
+  if (!settings.enabled) {
+    return flare;
+  }
+
+  const color = new THREE.Color(settings.color);
+  const coreTexture = createRadialLensflareTexture(
+    settings.color,
+    settings.coreAlpha,
+    0.0,
+  );
+  const haloTexture = createRadialLensflareTexture(
+    settings.color,
+    settings.haloAlpha,
+    0.0,
+  );
+  const ghostTexture = createRadialLensflareTexture(
+    settings.color,
+    settings.haloAlpha * 0.34,
+    0.0,
+  );
+
+  registerLensflareElement(
+    flare,
+    new LensflareElement(coreTexture, settings.coreSize, 0, color.clone()),
+  );
+  registerLensflareElement(
+    flare,
+    new LensflareElement(haloTexture, settings.haloSize, 0, color.clone()),
+  );
+  registerLensflareElement(
+    flare,
+    new LensflareElement(ghostTexture, settings.ghostSize, 0.34, color.clone()),
+  );
+  registerLensflareElement(
+    flare,
+    new LensflareElement(
+      ghostTexture,
+      settings.ghostSize * 0.58,
+      0.62,
+      color.clone(),
+    ),
+  );
+
+  return flare;
+}
+
+const lensflareTextureCache = new Map();
+
+function createRadialLensflareTexture(color, centerAlpha, edgeAlpha) {
+  /*
+    Builds a soft circular alpha texture for LensflareElement.
+
+    Formula:
+      normalizedColor = THREE.Color(color)
+      rgb             = normalizedColor * 255
+      alpha(r)        = radial gradient from centerAlpha at r=0
+                         to edgeAlpha at r=1
+
+    where:
+      r = distance from canvas center / canvas radius
+
+    The same requested color/alpha pair is cached so moon and sun flares do not
+    create new canvas textures every time the world builds.
+  */
+  const key = `${color}|${centerAlpha}|${edgeAlpha}`;
+  const cached = lensflareTextureCache.get(key);
+  if (cached) {
+    return cached;
+  }
+
+  const textureSize = 128;
+  const parsedColor = new THREE.Color(color);
+  const red = Math.round(parsedColor.r * 255);
+  const green = Math.round(parsedColor.g * 255);
+  const blue = Math.round(parsedColor.b * 255);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = textureSize;
+  canvas.height = textureSize;
+
+  const context = canvas.getContext("2d");
+  const center = textureSize * 0.5;
+  const gradient = context.createRadialGradient(
+    center,
+    center,
+    0,
+    center,
+    center,
+    center,
+  );
+
+  gradient.addColorStop(0, `rgba(${red}, ${green}, ${blue}, ${centerAlpha})`);
+  gradient.addColorStop(
+    0.35,
+    `rgba(${red}, ${green}, ${blue}, ${centerAlpha * 0.48})`,
+  );
+  gradient.addColorStop(
+    0.72,
+    `rgba(${red}, ${green}, ${blue}, ${centerAlpha * 0.12})`,
+  );
+  gradient.addColorStop(1, `rgba(${red}, ${green}, ${blue}, ${edgeAlpha})`);
+
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, textureSize, textureSize);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.name = `procedural-lensflare-${color}`;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  lensflareTextureCache.set(key, texture);
+  return texture;
+}
+
 function syncMoonLights(moonDirectionalLight, moonPointLight, skyMoon) {
   /*
     Single source of truth for moonlight placement.
 
     Source:
-      The visible skyMoon object's actual world position.
+      The authored fixed lighting anchor captured by buildSkyMoon().
 
     Target:
       WORLD_TWEAKS.lighting.moonLightTarget.
@@ -2866,16 +4059,12 @@ function syncMoonLights(moonDirectionalLight, moonPointLight, skyMoon) {
       lightDirection = moonDirectionalLight.target.position - moonDirectionalLight.position
 
     In plain terms:
-      - moonDirectionalLight.position follows skyMoon's world position.
+      - moonDirectionalLight.position stays at the authored lighting anchor.
       - moonDirectionalLight.target stays at the configured aim point.
-      - the resulting light appears to come from the visible moon.
-      - moonPointLight is also derived from skyMoon's world position, then nudged
+      - moving the visual moon with the camera cannot change gameplay lighting.
+      - moonPointLight is also derived from the fixed anchor, then nudged
         toward the target only to illuminate the visible moon shell from the
         gameplay/church side.
-
-    getWorldPosition() is deliberate. If a future sky-cycle parents the moon
-    under an orbit rig, or moves a larger sky group instead of skyMoon directly,
-    this still reads the actual rendered moon position.
   */
   moonDirectionalLight.target.position.set(
     ...WORLD_TWEAKS.lighting.moonLightTarget,
@@ -2896,8 +4085,16 @@ function syncMoonLights(moonDirectionalLight, moonPointLight, skyMoon) {
     return;
   }
 
-  skyMoon.updateMatrixWorld(true);
-  skyMoon.getWorldPosition(moonLightWorldPosition);
+  const lightingAnchorPosition = skyMoon.userData?.lightingAnchorPosition;
+
+  if (lightingAnchorPosition?.isVector3) {
+    moonLightWorldPosition.copy(lightingAnchorPosition);
+  } else {
+    /* Compatibility fallback for a caller-provided skyMoon built elsewhere. */
+    skyMoon.updateMatrixWorld(true);
+    skyMoon.getWorldPosition(moonLightWorldPosition);
+  }
+
   moonDirectionalLight.position.copy(moonLightWorldPosition);
   moonDirectionalLight.updateMatrixWorld(true);
   syncMoonShellPointLight(moonPointLight, moonLightWorldPosition);
@@ -2916,7 +4113,7 @@ function syncMoonShellPointLight(moonPointLight, moonWorldPosition) {
       direction  = normalize(target - moonWorldPosition)
       pointLight = moonWorldPosition + direction * moonPointLightOffsetTowardTarget
 
-    If offset is 0, the light sits exactly at the visible moon's world position.
+    If offset is 0, the light sits exactly at the fixed moon lighting anchor.
   */
   if (!moonPointLight) return;
 
@@ -3332,7 +4529,7 @@ function applySkyObjectColor(skyObject, color) {
         : [];
 
     materials.forEach((material) => {
-      if (material.color) {
+      if (material.color && !material.userData.ignoreSkyMoonTint) {
         material.color.copy(nextColor);
         material.needsUpdate = true;
       }

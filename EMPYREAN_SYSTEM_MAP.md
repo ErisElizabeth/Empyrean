@@ -8,9 +8,26 @@ README/runtime version alignment pass added the current Entity layer notes. This
 map still preserves the original audit structure, but now includes `entity.js`
 and `entityControllers.js` so the newer NPC/enemy rig boundary is visible.
 
+6/20/2026 update:
+Lunar-phase Pass 1 mapped the current moon, sky-cycle, timing, location, and
+presentation boundaries before implementation. Pass 2 added the pure lunar data
+contract and deterministic verification. Pass 3 added the standalone Three.js
+phase-shadow renderer. Pass 4 tuned earthshine, terminator readability, and
+phase-aware flare composition. Pass 5 connected the real-world clock, automatic
+hemisphere resolution, and hourly refresh directly to the world-owned moon. The
+strict moon asset-replacement pass then moved the visible surface from
+`moon.glb` to a camera-facing `moon_2K.jpg` disc without changing lunar math or
+sky behavior. Pass 6 validated the combined runtime and made the active moon
+texture a required verification asset. Pass 7 made the visual moon
+camera-relative at a constant distance while preserving the authored fixed
+gameplay-lighting anchor. Build `0.2.1-alpha` presents the live lunar phase while
+gameplay moonlight remains unchanged. The same build removes the unused primitive
+tree material declarations while retaining the GLB tree placeholders, positions,
+colliders, caching, normalization, and visibility ownership.
+
 Generated: 2026-05-27  
-Updated: 2026-05-31
-Scope: analysis-only audit plus documentation alignment notes. No gameplay behavior changes.
+Updated: 2026-06-20
+Scope: architecture audit plus documentation alignment notes. No gameplay behavior changes.
 
 This document maps the current Empyrean prototype as it exists now: a browser-based Three.js game/workshop hybrid with an active puppet rig, imported mesh skinning, dev rigging tools, a dark exploratory world, sword stance work, combat encounter logic, a d20/oracle presentation, and several older experimental systems still present.
 
@@ -41,10 +58,11 @@ Map first. Surgery later.
 | `world.js`          | World/environment/collision | Builds rooms, outside area, stone materials, torches, GLB trees, ghost spheres, lighting, collision, encounter triggers, debug overlays, dispose utilities, label sprites.               | `worldCollision`, world materials, world object creation, world debug view, encounter trigger processing.                                          | Three.js, GLTFLoader.                                                                                                                                    | `main.js`, `skin.js` for `disposeObjectTree`.                    | KEEP. Good module boundary.                              |
 | `skin.js`           | Asset loading/puppet skin   | Loads GLB meshes, shows static previews, generates bones/weights, rigs imported meshes to puppet skeleton, syncs generated bones every frame, applies mesh opacity/wireframe.            | Imported mesh preview/skin pipeline.                                                                                                               | Three.js, GLTFLoader, `disposeObjectTree` from `world.js`. Gets app context by `initSkin()`.                                                             | `main.js`.                                                       | KEEP. Important but heuristic/fragile for production.    |
 | `physics.js`        | Body mechanics/math         | Pure formulas for jump state, jump pose weights, stride phase, pelvis walk/run values, interpolation helpers.                                                                            | Pure math only. No Three.js objects.                                                                                                               | None.                                                                                                                                                    | `main.js`.                                                       | KEEP. Good extraction.                                   |
+| `moonPhase.js`      | Lunar date/presentation math | Calculates average moon age, normalized phase, illumination, phase name, waxing state, normalized hemisphere, and light-side orientation from an explicit real-world date.               | Pure lunar constants and functions. No DOM, geolocation request, Three.js, storage, or gameplay state.                                             | None.                                                                                                                                                    | `main.js` lunar runtime; deterministic contract test.           | KEEP. Pure contract, runtime-wired in Pass 5.            |
 | `combatPhysics.js`  | Combat stance/math          | Pure math/data for low guard stance, combined center of mass, support box, stability margin, tipping angle.                                                                              | Combat stance profile and balance formulas.                                                                                                        | None.                                                                                                                                                    | `main.js`.                                                       | KEEP. Good extraction.                                   |
 | `combat_updated.js` | Combat encounter controller | Multi-encounter combat state machine, trigger cylinders, session pressure/evasion tier, public sword-hit API, oracle roll orchestration, combat audio refcount calls, and enemy lifecycle coordination. | Private `combat` session state, trigger zones, active-enemy set, roll/evasion bookkeeping.                                                          | Three.js, `oracleD20.js`, `enemy.js`. Audio manager is passed in by `main.js`.                                                                            | `main.js`.                                                       | KEEP, but rename/split further after entity work.        |
 | `encounters.js`     | Encounter data              | Data-driven non-blocking trigger definitions for world events.                                                                                                                           | `ENCOUNTER_DEFINITIONS`.                                                                                                                           | None.                                                                                                                                                    | `main.js` passes it to `world.js`.                               | KEEP. Uses current sky-moon action names.                |
-| `rig.js`            | Rig defaults                | Default body proportions and GUI slider ranges.                                                                                                                                          | `DEFAULT_RIG_DIMENSIONS`, `DEFAULT_RIG_HEIGHT`, `RIG_DIMENSION_CONTROLS`, `getRigStats()`.                                                         | None.                                                                                                                                                    | `main.js`, `puppetShop.js` indirectly through package data.      | KEEP.                                                    |
+| `rig.js`            | Rig defaults                | Default body proportions and GUI slider ranges.                                                                                                                                          | `DEFAULT_RIG_DIMENSIONS`, `DEFAULT_RIG_HEIGHT`, `RIG_DIMENSION_CONTROLS`.                                                                          | None.                                                                                                                                                    | `main.js`, `puppetShop.js` indirectly through package data.      | KEEP.                                                    |
 | `puppetShop.js`     | Puppet workshop/storage     | Pure data module for creating, serializing, validating, saving, loading, listing, and deleting complete rig packages in localStorage.                                                    | Puppet package schema and local rig library.                                                                                                       | Browser `localStorage` passed by caller. No Three.js.                                                                                                    | `main.js`.                                                       | KEEP as dev/workshop support. Schema needs future split. |
 | `entity.js`         | Entity runtime scaffold     | Wraps player/NPC/enemy rigs as Entity records and creates spawned NPC/enemy skeletons from saved Puppet Shop rig packages.                                                               | Entity role names, entity descriptors, spawn factories, per-entity state, per-entity idle/skin update hook.                                         | Three.js. Receives skeleton, calibration, idle, and skin helpers by dependency injection from `main.js`.                                                  | `main.js`.                                                       | KEEP. New boundary; good next extraction target.         |
 | `entityControllers.js` | Entity control scaffold  | Defines controller types and controller dispatch shape for keyboard, static, and future AI-driven entities.                                                                               | Controller type names, keyboard/static controller stubs, `runController()`.                                                                         | None.                                                                                                                                                    | `main.js`, future entity update loop.                            | KEEP. Scaffold only; behavior mostly future work.        |
@@ -63,6 +81,7 @@ Map first. Surgery later.
 | `runCycle.md`       | Research/reference      | Run-cycle math notes.                                                                     | ARCHIVE/REFERENCE. Runtime now uses `physics.js` plus `main.js`. |
 | `verify.ps1`        | Verification script     | Checks expected files/assets and likely does source sanity checks.                        | KEEP, but asset list includes old optional assets.               |
 | `checkpoint.ps1`    | Utility                 | Project checkpoint/copy helper.                                                           | KEEP.                                                            |
+| `moonPhase.test.mjs` | Verification           | Runs deterministic landmark, wrapping, validation, hemisphere, and contract-shape checks for `moonPhase.js`.               | KEEP. Runs from `verify.ps1`.                                    |
 
 ### Assets
 
@@ -74,7 +93,9 @@ Map first. Surgery later.
 | Older sword           | `assets/sword.glb`                                                                       | Old default in docs/verify. Not current if `plainSword.glb` is set.                                                                   | ARCHIVE or DO NOT TOUCH YET.                           |
 | World stone           | `stoneFloorDiff.jpg`, `stoneFloorDisp.png`, `stoneWallDiff.jpg`, `stoneWallDisp.png`     | Used by `world.js:55-58` and d20 config in `combat_updated.js:191-192`.                                                               | KEEP.                                                  |
 | Older texture set     | `diffuse.jpg`, `normal.jpg`, `ao.jpg`, `displacement.jpg`, `opacity.jpg`, `specular.jpg` | Not referenced by runtime search except docs/verify for some.                                                                         | ARCHIVE/REMOVE CANDIDATE after verify update.          |
-| Environment GLBs      | `tree.glb`, `deadTree.glb`, `torch.glb`, `moon.glb`                                      | Used by `world.js` and `main.js`.                                                                                                     | KEEP.                                                  |
+| Environment GLBs      | `tree.glb`, `deadTree.glb`, `torch.glb`                                                  | Used by `world.js` and `main.js`.                                                                                                     | KEEP.                                                  |
+| Active moon texture   | `assets/moon_2K.jpg`                                                                     | Camera-facing visible moon surface loaded by `buildSkyMoon()` in `world.js`.                                                          | KEEP. Required by `verify.ps1`.                        |
+| Retained moon model   | `assets/moon.glb`                                                                        | Preserved on disk for history/possible reference; no longer loaded as the visible moon surface.                                       | DO NOT TOUCH YET.                                      |
 | Audio                 | `ambient.ogg`, `battle.mp3`, possibly `background.mp3`                                   | Battle is active in combat. Ambient/background depends on current `main.js` audio setup. `background.mp3` appears old in docs/verify. | KEEP active audio, ARCHIVE old audio after confirming. |
 | Old/default mesh      | `femaleMesh.glb`, `T.glb`                                                                | Older rigging test assets. Runtime default is now Sigewynn.                                                                           | ARCHIVE/REFERENCE.                                     |
 | Old sky image         | `Jupiter.jpg`                                                                            | Replaced by `moon.glb`; only docs/verify references found.                                                                            | ARCHIVE/REMOVE CANDIDATE after verify update.          |
@@ -195,8 +216,8 @@ Risk note:
 ### Moon, Trees, Torches, Stone Atmosphere
 
 - Moon now lives in `world.js`.
-- `WORLD_TWEAKS.skyMoon` owns the current moon asset, size, position, and fallback color.
-- Moon GLB loading/fallback is owned by `buildSkyMoon()` in `world.js`.
+- `WORLD_TWEAKS.skyMoon` owns the current moon texture, size, authored startup position/lighting anchor, and fallback color.
+- Moon texture loading, fallback disc, and camera-facing orientation are owned by `buildSkyMoon()` in `world.js`; `updateSkyMoonCameraAnchor()` owns camera-relative visual placement.
 - Trees live in `world.js` using `treeAssetState` at `world.js:123-134`.
 - Active tree assets are configured at `world.js:83-89`.
 - Torch asset and lights are configured at `world.js:60-71`; loading starts around `world.js:557`.
@@ -210,7 +231,7 @@ State:
 
 Update loop:
 
-- Moon/trees/torches are mostly static.
+- The moon visual position updates after the active camera each frame; trees and torches remain mostly static.
 - G53 visibility can hide the sky object, trees, walls, and ghost spheres.
 
 Should not own:
@@ -220,6 +241,129 @@ Should not own:
 Risk note:
 
 - Old `jupiterColor` / `jupiterScale` encounter action names remain as compatibility aliases, but new encounter definitions should use `skyMoonColor` / `skyMoonScale`.
+
+#### Lunar Phase Program — Pass 7 Accuracy And Distance Stability
+
+Pass 1 established ownership and compatibility. Pass 2 adds pure lunar
+calculation and contract verification. Pass 3 adds the visual renderer but does
+not yet runtime-wire the real-world date or browser geolocation result. Pass 4
+tunes that renderer and composes the existing moon flare with lunar illumination.
+Pass 5 connects those layers to the browser runtime. The strict moon
+asset-replacement pass changes only the visible surface to a camera-facing
+`moon_2K.jpg` disc. Pass 6 validates the combined runtime. Pass 7 prevents
+player translation from changing apparent moon size.
+
+- The lunar clock will use the player's real-world device date. It is separate
+  from the accelerated, frame-driven Empyrean day/night sky cycle. This is now
+  active through `refreshMoonPhasePresentation()` in `main.js`.
+- Hemisphere orientation will derive from the sign of browser-geolocation
+  latitude. Exact coordinates will not be stored. Denied, unavailable, or
+  failed geolocation defaults to northern orientation.
+- Lunar calculation state must be namespaced (`moonState` / `lunarPhase01`)
+  rather than adding another ambiguous top-level `phase`; sky, combat, movement,
+  and other systems already use that term.
+- Pure lunar date math now lives in `moonPhase.js`, independent of Three.js and
+  DOM state. `moonPhase.test.mjs` verifies landmark phases, negative-date
+  wrapping, invalid inputs, hemisphere fallback, orientation, and contract shape.
+- `getMoonPhase()` returns a frozen record with `referenceDate`, `currentDate`,
+  `moonAge`, `phase`, `illumination`, `phaseName`, `waxing`, `hemisphere`, and
+  `lightSide`. Supplied dates are cloned so caller mutation cannot change the
+  calculation after the fact.
+- `getMoonHemisphereFromLatitude()` returns only `northern` or `southern`; no
+  latitude is copied into lunar state. Zero, invalid, or unavailable latitude
+  uses the northern fallback.
+- `world.js` remains the owner of visible moon construction and phase
+  presentation. `main.js` should only coordinate startup/runtime inputs that
+  genuinely require browser services.
+- The current textured moon surface is a `CircleGeometry` disc using
+  `/assets/moon_2K.jpg`. Its local `onBeforeRender` copies the active camera
+  quaternion. `updateSkyMoonCameraAnchor()` captures the initial camera-to-moon
+  offset as a normalized world-sky direction and fixed distance, then translates
+  the parent `skyMoon` group after every camera update. The disc, inner glow,
+  phase shadow, and lensflare therefore retain one apparent scale regardless of
+  player movement. `createSkyMoonPhaseShadow()` remains inside that group; no
+  separate HUD Canvas copy is used.
+- `buildSkyMoon()` stores the original `[0, 30, 149]` position separately as
+  `lightingAnchorPosition`. `syncMoonLights()` uses that fixed anchor rather than
+  the moving visual group, preserving the existing directional moonlight and
+  moon-shell PointLight behavior.
+- `applySkyMoonPhasePresentation()` normalizes phase and hemisphere inputs and
+  updates stable shader-uniform objects. Invalid phase falls back to full moon;
+  any non-southern hemisphere value uses northern orientation.
+- The phase shader uses view-space surface normals. Phase `0.25` lights the
+  screen-right half in northern presentation, phase `0.75` lights screen-left,
+  and southern presentation mirrors those results without depending on camera
+  yaw or world coordinates.
+- The shadow material extends `MeshBasicMaterial` through `onBeforeCompile`, so
+  ordinary material opacity continues to obey the existing per-frame sky-cycle
+  fade. Its slightly oversized sphere avoids z-fighting with the textured disc.
+- The shadow renders after the inner glow and textured disc, allowing it to cover
+  both. Shadow opacity `0.935` preserves 6.5% of the authored texture/glow stack
+  as faint earthshine; terminator softness `0.014` keeps small crescents and
+  quarter seams readable without a visibly blurred boundary.
+- Encounter tint traversal explicitly skips the neutral phase-shadow material.
+  Parent `skyMoon` scale actions, G53 visibility, texture fallback behavior, and
+  day/night group ownership continue to apply normally.
+- The phase presentation must preserve asynchronous `moon_2K.jpg` loading and
+  its fallback disc, sky-cycle opacity fades, G53 visibility, encounter moon
+  tint/scale actions, inner glow, and moon lensflare ownership.
+- The visible moon and its flare may respond to lunar illumination. Gameplay
+  moonlight intensity remains controlled only by the existing day/night system
+  so moon phase cannot reduce world readability.
+- Geolocation is an optional orientation enhancement, not a startup dependency:
+  moon calculation and rendering must remain usable immediately with the
+  northern fallback.
+
+Runtime lifecycle:
+
+- `initMoonPhaseRuntime()` immediately calculates and applies the current phase
+  with northern fallback, before geolocation is needed.
+- The location request starts only after the title card completes, runs at most
+  once per page lifetime, uses `enableHighAccuracy: false`, an 8-second timeout,
+  and a 24-hour browser cache allowance.
+- The success callback reads `position.coords.latitude` only long enough to call
+  `getMoonHemisphereFromLatitude()`. It retains the resulting hemisphere string
+  and discards the position object; longitude is never read.
+- Missing API, permission denial, timeout, invalid latitude, synchronous browser
+  rejection, and insecure-context failure all preserve northern orientation.
+- The phase is recalculated hourly. Returning to a visible tab also refreshes it
+  immediately if the previous calculation is at least one hour old.
+- The runtime applies one moon-state record directly to
+  `applySkyMoonPhasePresentation()`. It does not recompute per frame or create a
+  separate DOM presentation.
+
+Pass 4 established that the existing moon lensflare uses a phase factor calculated as
+`lerp(0.02, 1, illumination^0.65)`. That factor multiplies, rather than replaces,
+the sky controller's `nightBlend`, so daylight still removes the flare and a
+full moon still restores the authored base colors without cumulative dimming.
+New, quarter, and full values are approximately `0.02`, `0.6445`, and `1.0`.
+The current pale-green authored flare tint is preserved. Directional moonlight
+and the moon shell-helper PointLight do not consume lunar illumination.
+
+All eight silhouettes, small apparent-size readability, and flare progression
+were visually verified against the real `moon.glb`.
+
+Pass 5 status: live startup resolved 2026-06-20 as Waxing Crescent at 28%
+illumination. Browser permission denial retained northern fallback; a temporary
+southern-location harness verified the success branch and was removed. Repeated
+manual `G` transitions left the lunar phase unchanged. Directional moonlight and
+the moon shell-helper PointLight still do not consume lunar illumination.
+
+Pass 6 status: `verify.ps1` passes and now treats `assets/moon_2K.jpg` as a
+required runtime asset. Browser startup on 2026-06-20 resolved Waxing Crescent
+at 29% with northern fallback and loaded the texture without shader/WebGL
+failure. The title card started the production sky clock at `0ms`; `G` completed
+day and night transitions without recalculating lunar state; and G53 hid the
+world moon, paused at `17703/120000ms`, then restored the same frame. No HUD,
+UI, diagnostic display, or keybind was added.
+
+Pass 7 status: the moon's visual group now follows
+`cameraWorldPosition + fixedDirection * fixedDistance` once per rendered frame.
+The direction is normalized once and the distance is captured once, so walking
+toward the authored moon direction cannot change its apparent diameter. The
+fixed lighting anchor remains independent. No lunar calculation, phase shader,
+sky timing, `G`, G53, title, fog, ghost, diagnostic, HUD/UI, or control path was
+changed. Final lunar-program version: `0.2.0-alpha`.
 
 ### Ghostly Wireframe Spheres
 
@@ -662,7 +806,7 @@ Labels used here:
 | Combat encounter/d20       | `combat_updated.js`                                                           | Active combat prototype.                                |
 | Puppet rig package storage | `puppetShop.js`                                                               | Active dev workflow and future NPC reuse seed.          |
 | Encounter data             | `encounters.js`                                                               | Active non-blocking world triggers.                     |
-| Active world assets        | `moon.glb`, `tree.glb`, `deadTree.glb`, `torch.glb`, stone textures           | Runtime referenced.                                     |
+| Active world assets        | `moon_2K.jpg`, `tree.glb`, `deadTree.glb`, `torch.glb`, stone textures        | Runtime referenced.                                     |
 | Active gameplay assets     | `Sigewynn.glb`, `enemy.glb`, `plainSword.glb`, `battle.mp3`, current ambience | Runtime referenced or user-current.                     |
 
 ### Dev Only
@@ -696,9 +840,7 @@ Do not delete these now. These are candidates for a later cleanup branch after a
 
 | Item                                                     | Where              | Calls It                                                                         | It Calls                                                                                                                         | Dependency Notes                                                                                                                                                                | Likely Breakage                                                                         | Confidence                                              |
 | -------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `makeJointMarker()`                                      | `main.js:2084`     | No call found by `rg`. Comment says `createDebugView()` builds markers directly. | Three.js geometry/material creation only.                                                                                        | Isolated helper.                                                                                                                                                                | None unless someone calls it manually from console.                                     | High.                                                   |
 | `applyRigMeshModeVisibility()`                           | `main.js:4509`     | No call found by `rg`.                                                           | `setGuiFolderVisible()`, `state.guiFolders.meshImport`, `state.guiFolders.bindRotationControls`, `state.guiFolders.rigMeshMode`. | Looks like an unfinished guided UI mode. `rigMeshMode` is saved in `RIG_TUNING_KEYS` at `main.js:596` and defaulted at `main.js:1122`, but no active controller/call was found. | No current behavior likely breaks. Removing key may affect saved packages, so phase it. | High for unused function, medium for saved key cleanup. |
-| `treeLeafMaterial` / `treeTrunkMaterial`                 | `world.js:287-288` | No runtime usage found by `rg`.                                                  | Nothing.                                                                                                                         | Leftover from primitive Three.js trees after GLB tree swap.                                                                                                                     | None if GLB tree path remains.                                                          | High.                                                   |
 | `#puppet-lab-container`, `#puppet-source`, `#rig-canvas` | `index.html:37-39` | No JS/CSS references found by `rg`.                                              | None.                                                                                                                            | Likely leftover from 2D/video/canvas puppet lab.                                                                                                                                | Nothing current; remove only after page visual check.                                   | High.                                                   |
 
 ### Do Not Touch Yet
@@ -753,36 +895,6 @@ Recommendation:
 
 - Later either finish it as a real guided mode or remove function plus saved key in a migration-aware cleanup.
 
-### `makeJointMarker()`
-
-Search result:
-
-- Only definition found at `main.js:2084`.
-- Comment says current debug view builds markers directly.
-
-Directly called:
-
-- No.
-
-Indirectly called:
-
-- No.
-
-Recommendation:
-
-- Remove candidate after one pass through debug view.
-
-### Primitive Tree Materials
-
-Search result:
-
-- `treeLeafMaterial` and `treeTrunkMaterial` defined at `world.js:287-288`.
-- No active usage found by search.
-- Runtime tree assets are configured at `world.js:83-89` and loaded through GLB path.
-
-Recommendation:
-
-- Remove candidate after confirming no fallback primitive tree path still exists.
 
 ### Old Puppet Lab DOM
 
@@ -1596,7 +1708,7 @@ Warning:
    - Dev Probe
    - Skeleton Lab
    - World Debug
-   - Joint Point Offsets
+   - Mesh Calibration Offsets
    - Bind Pose Rotations
 
    Why it matters:
@@ -1617,7 +1729,6 @@ Warning:
    Low.
 
 4. Add TODO comments or doc notes for unused candidates:
-   - `makeJointMarker()`
    - `applyRigMeshModeVisibility()`
    - primitive tree materials
    - old puppet lab DOM

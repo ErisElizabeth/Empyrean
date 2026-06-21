@@ -31,11 +31,10 @@ import {
   updateJumpState,
 } from "./physics.js";
 import {
-  DEFAULT_RIG_DIMENSIONS,
-  DEFAULT_RIG_HEIGHT,
-  RIG_DIMENSION_CONTROLS,
-  getRigStats,
-} from "./rig.js";
+  getMoonHemisphereFromLatitude,
+  getMoonPhase,
+} from "./moonPhase.js?v=0.2.1-alpha";
+import { DEFAULT_RIG_DIMENSIONS, RIG_DIMENSION_CONTROLS } from "./rig.js";
 import {
   createPuppetRigPackage,
   deletePuppetRigPackageFromLibrary,
@@ -52,12 +51,13 @@ import {
 } from "./puppetShop.js";
 import {
   GUIDE_COLOR,
+  applySkyMoonPhasePresentation,
   applyWorldAtmosphere,
-  applyWorldSkyMode,
   buildExplorationWorld,
   buildGhostSpheres,
   buildLighting,
   buildSkyMoon,
+  createWorldSkyCycleController,
   createEncounterRuntime,
   createWorldDebugView,
   disposeObjectTree,
@@ -70,8 +70,9 @@ import {
   resolveRigRoomCollision,
   tickEncounterSystem,
   updateGhostSphereMotion,
+  updateSkyMoonCameraAnchor,
   worldCollision,
-} from "./world.js?v=0.1.109-alpha";
+} from "./world.js?v=0.2.1-alpha";
 import {
   DEFAULT_IMPORTED_MESH_PATH,
   applyImportedMeshPresentation,
@@ -90,7 +91,7 @@ import {
   syncImportedSkinToPuppet,
   bindRiggedSkinFromPath,
   syncSkinToSkeleton,
-} from "./skin.js?v=0.1.109-alpha";
+} from "./skin.js?v=0.2.1-alpha";
 import {
   EntityRole,
   createPlayerEntity,
@@ -111,7 +112,7 @@ import {
   sanitizeSwordPresetValues,
 } from "./sword.js";
 
-const APP_VERSION = "0.1.109-alpha";
+const APP_VERSION = "0.2.1-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -160,6 +161,20 @@ const SOLO_TWEAKS = {
   camera: {
     startDistance: 6.6,
     startHeight: 2.6,
+    /*
+      The far clip must stay beyond every part of the physical sky enclosure.
+
+      Current worst-case sight line:
+        outside diagonal = sqrt(384^2 + 384^2 + 75^2) ~= 548.2
+        max camera orbit = 30
+        required far clip ~= 578.2
+
+      640 leaves modest headroom without using an unnecessarily huge depth
+      range. The old value of 160 came from the smaller 96-unit world. After the
+      outside enclosure grew to 384 units, walls beyond 160 were clipped and
+      exposed the flat scene.background behind the three-color gradient shell.
+    */
+    farClip: 640,
     keyboardOrbitSpeed: 1.5,
     keyboardZoomSpeed: 3.2,
     keyboardHeightSpeed: 2.1,
@@ -301,7 +316,31 @@ const FACING_MIGRATION_EPSILON = 0.01;
 const loaderOverlay = document.getElementById("loader-overlay");
 const TITLE_CARD_MIN_VISIBLE_MS = 1600;
 const TITLE_CARD_SETTLE_FRAMES = 18;
+const TITLE_CARD_FADE_MS = 750;
 const titleCardStartedAt = performance.now();
+let titleCardIsActive = Boolean(loaderOverlay);
+let skyCycleSuspendedByDocument = document.hidden;
+
+function finishTitleCardStartup() {
+  /*
+    Production sky-cycle datum:
+
+      cycle time zero = title card fully faded
+
+    The scene always initializes at night, but the first 120-second hold should
+    belong to visible gameplay, not be partially consumed behind EMPYREAN.
+  */
+  if (!titleCardIsActive) {
+    return;
+  }
+
+  titleCardIsActive = false;
+  requestMoonHemisphereFromBrowser();
+  const snapshot = skyCycleController?.getSnapshot();
+  console.info(
+    `[sky] title card complete; production cycle clock started at ${Math.round(snapshot?.phaseElapsed || 0)}ms`,
+  );
+}
 
 function revealWorkshop() {
   /*
@@ -318,8 +357,14 @@ function revealWorkshop() {
   const remaining = Math.max(0, TITLE_CARD_MIN_VISIBLE_MS - elapsed);
 
   setTimeout(() => {
-    loaderOverlay?.setAttribute("aria-busy", "false");
-    loaderOverlay?.classList.add("loader-hidden");
+    if (!loaderOverlay) {
+      finishTitleCardStartup();
+      return;
+    }
+
+    loaderOverlay.setAttribute("aria-busy", "false");
+    loaderOverlay.classList.add("loader-hidden");
+    setTimeout(finishTitleCardStartup, TITLE_CARD_FADE_MS);
   }, remaining);
 }
 
@@ -419,8 +464,7 @@ const sceneContainer = document.getElementById("scene-container");
 */
 sceneContainer.tabIndex = -1;
 const STORAGE_KEY = "empyrean.puppetWorkshop.rigTuning.v1";
-const PROJECT_DEFAULT_PLAYER_RIG_PATH =
-  "assets/rigs/player.default.rig.json";
+const PROJECT_DEFAULT_PLAYER_RIG_PATH = "assets/rigs/player.default.rig.json";
 
 // Slider ranges. These are intentionally broad because the rig lab should be
 // able to accommodate strange proportions, not only "normal" humanoids.
@@ -428,8 +472,8 @@ const ROOT_ALIGNMENT_RANGE = { min: -6, max: 6, step: 0.005 };
 const JOINT_POINT_OFFSET_RANGE = { min: -4, max: 4, step: 0.005 };
 const BIND_ROTATION_RANGE = { min: -Math.PI, max: Math.PI, step: 0.005 };
 const AXIS_MARKER_SCALE_RANGE = { min: 0.03, max: 3, step: 0.01 };
-
-const rigStats = getRigStats(DEFAULT_RIG_DIMENSIONS);
+const HEAD_MARKER_SIZE_RANGE = { min: 0.1, max: 3, step: 0.01 };
+const HEAD_MARKER_BASE_SCALE = new THREE.Vector3(6, 9, 9);
 
 const PRESETS = {
   /*
@@ -548,6 +592,7 @@ const RIG_TUNING_KEYS = [
   "labEnabled",
   "skeletonVisible",
   "skeletonOpacity",
+  "headMarkerSize",
   "showJointLabels",
   "showAxisMarker",
   "showRigCollider",
@@ -643,7 +688,7 @@ const camera = new THREE.PerspectiveCamera(
   42,
   sceneContainer.clientWidth / sceneContainer.clientHeight,
   0.1,
-  160,
+  SOLO_TWEAKS.camera.farClip,
 );
 const explorationWorld = buildExplorationWorld();
 scene.add(explorationWorld.group);
@@ -656,6 +701,104 @@ ghostSpheres.forEach((sphere) => scene.add(sphere.group));
 const skyMoon = buildSkyMoon();
 scene.add(skyMoon);
 let worldLighting = null;
+let skyCycleController = null;
+
+const MOON_PHASE_REFRESH_MS = 60 * 60 * 1000;
+const MOON_GEOLOCATION_OPTIONS = Object.freeze({
+  enableHighAccuracy: false,
+  timeout: 8000,
+  maximumAge: 24 * 60 * 60 * 1000,
+});
+const lunarRuntime = {
+  hemisphere: "northern",
+  current: null,
+  lastRefreshUtcMs: 0,
+  refreshTimerId: null,
+  locationRequested: false,
+};
+
+function refreshMoonPhasePresentation(currentDate = new Date()) {
+  const moonState = getMoonPhase(currentDate, lunarRuntime.hemisphere);
+
+  lunarRuntime.current = moonState;
+  lunarRuntime.lastRefreshUtcMs = Date.now();
+  applySkyMoonPhasePresentation(skyMoon, moonState);
+  return moonState;
+}
+
+function refreshMoonPhaseIfStale() {
+  if (Date.now() - lunarRuntime.lastRefreshUtcMs >= MOON_PHASE_REFRESH_MS) {
+    refreshMoonPhasePresentation();
+  }
+}
+
+function requestMoonHemisphereFromBrowser() {
+  /*
+    Privacy boundary:
+      - request low-accuracy cached location at most once per page lifetime
+      - read latitude only long enough to derive its sign
+      - retain only "northern" or "southern"
+      - never retain, log, serialize, or display coordinates
+  */
+  if (lunarRuntime.locationRequested) {
+    return;
+  }
+
+  lunarRuntime.locationRequested = true;
+
+  if (!navigator.geolocation) {
+    console.info("[moon] geolocation unavailable; northern fallback retained");
+    return;
+  }
+
+  try {
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const latitude = position?.coords?.latitude;
+
+        if (!Number.isFinite(latitude)) {
+          console.info(
+            "[moon] geolocation returned no usable latitude; northern fallback retained",
+          );
+          return;
+      }
+
+      lunarRuntime.hemisphere = getMoonHemisphereFromLatitude(latitude);
+      refreshMoonPhasePresentation();
+        console.info(
+          `[moon] ${lunarRuntime.hemisphere} presentation selected from browser geolocation`,
+        );
+      },
+      (error) => {
+        console.info(
+          `[moon] geolocation unavailable (${error?.code ?? "unknown"}); northern fallback retained`,
+        );
+      },
+      MOON_GEOLOCATION_OPTIONS,
+    );
+  } catch {
+    console.info(
+      "[moon] geolocation request blocked; northern fallback retained",
+    );
+  }
+}
+
+function initMoonPhaseRuntime() {
+  const initialState = refreshMoonPhasePresentation();
+
+  lunarRuntime.refreshTimerId = window.setInterval(
+    refreshMoonPhasePresentation,
+    MOON_PHASE_REFRESH_MS,
+  );
+
+  if (!titleCardIsActive) {
+    requestMoonHemisphereFromBrowser();
+  }
+
+  console.info(
+    `[moon] ${initialState.phaseName}; ${Math.round(initialState.illumination * 100)}% illuminated; northern fallback active`,
+  );
+}
 
 const rigHeightDisk = buildRigHeightDisk();
 scene.add(rigHeightDisk);
@@ -666,16 +809,12 @@ scene.add(rigHeightDisk);
 
 function buildRigHeightDisk() {
   /*
-    Creates a 5% opacity wireframe disk at the current program rig height.
+    Creates a 5% opacity wireframe disk at the live rig's head-pivot height.
 
     Purpose:
-      A visual "height gauge" for the default body proportions.
-
-    Current source:
-      rig.js exports DEFAULT_RIG_HEIGHT and getRigStats().
-
-    Disk placement:
-      Y = DEFAULT_RIG_DIMENSIONS.headY
+      A visual height gauge while changing base proportions or calibration
+      offsets. updateRigHeightDisk() moves it to the current head pivot instead
+      of leaving it permanently at the hardcoded default height.
 
     Geometry note:
       CircleGeometry is born in the XY plane. Rotating it around X by PI / 2
@@ -692,11 +831,34 @@ function buildRigHeightDisk() {
   });
   const disk = new THREE.Mesh(geometry, material);
 
-  disk.name = "default-rig-height-wire-disk";
+  disk.name = "live-rig-height-wire-disk";
   disk.position.set(0, DEFAULT_RIG_DIMENSIONS.headY, 0);
   disk.rotation.x = Math.PI / 2;
   disk.renderOrder = 8;
   return disk;
+}
+
+function updateRigHeightDisk() {
+  /*
+    Keeps the height gauge aligned with the current calibrated head pivot.
+
+    Base dimension controls establish the authored joint chain. Joint Point
+    Offsets can then move any link in that chain. Reading the final head point
+    in root-local space includes both layers without confusing world movement,
+    player yaw, or root alignment with body height.
+  */
+  const root = state.skeleton?.root;
+  const head = state.skeleton?.joints?.head;
+
+  if (!root || !head) {
+    rigHeightDisk.position.y = rigTuning?.headY ?? DEFAULT_RIG_DIMENSIONS.headY;
+    return;
+  }
+
+  root.updateMatrixWorld(true);
+  const headWorld = head.getWorldPosition(new THREE.Vector3());
+  const headRootLocal = root.worldToLocal(headWorld);
+  rigHeightDisk.position.y = headRootLocal.y;
 }
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -875,19 +1037,20 @@ const state = {
   */
   exitG53AfterImportedMeshRig: false,
   /*
-    Prototype day/night cycle switch.
+    Read-only mirror of the world-owned sky-cycle controller.
 
-    Pass 1 started as a moon-only switch. It now controls the first small
-    "night sky" bundle:
-      - visible skyMoon group
-      - moon DirectionalLight that lights the world
-      - moon PointLight helper that belongs to the moon presentation rig
-      - floating ghost spheres near the outside walls and ceiling
-
-    This is runtime-only state. It does not belong in rigTuning or saved puppet
-    packages because it is world/gameplay atmosphere, not skeleton calibration.
+    world.js owns phase timing, gradient colors, fog, and light interpolation.
+    main.js mirrors only the values needed to hide/show moon-owned scene objects
+    and to let G53 temporarily suppress presentation without resetting the sky.
   */
-  moonSystemEnabled: true,
+  skyCycle: {
+    phase: "holdStable",
+    stableState: "night",
+    targetState: "night",
+    dayBlend: 0,
+    nightInfluence: 1,
+    transitionSource: "startup",
+  },
 };
 
 await loadProjectDefaultPlayerRig();
@@ -1027,6 +1190,7 @@ function makeDefaultRigTuning() {
     labEnabled: true,
     skeletonVisible: true,
     skeletonOpacity: 0.7,
+    headMarkerSize: 1,
     showJointLabels: true,
     showAxisMarker: true,
     showRigCollider: true,
@@ -1157,11 +1321,19 @@ async function loadProjectDefaultPlayerRig() {
     created.
 
     Formula:
-      startupRig = sanitize(defaults + package.rigTuning)
+      startupRig = sanitize(defaults + package.rigTuning + rig.js dimensions)
 
     where:
       defaults          = current hardcoded safety net
       package.rigTuning = project-owned player.default.rig.json data
+      rig.js dimensions = authoritative project-default base proportions
+
+    Ownership rule:
+      The project default player uses DEFAULT_RIG_DIMENSIONS from rig.js for
+      its stock skeleton. The JSON still owns persistent calibration offsets,
+      bind rotations, mesh setup, motion settings, and attachments. Explicitly
+      loading another saved rig package still uses that package's own dimensions
+      through applyPuppetRigPackage(); this override is startup-only.
 
     The function does not rebuild the skeleton because it runs before the first
     buildSkeletonWorkshop() call. It only prepares rigTuning so the first build
@@ -1188,20 +1360,19 @@ async function loadProjectDefaultPlayerRig() {
       sanitizeRigTuning({
         ...makeDefaultRigTuning(),
         ...values,
+        ...DEFAULT_RIG_DIMENSIONS,
         puppetRigName: packageName,
       }),
     );
 
-    state.puppetShop.status =
-      `loaded project default ${summarizePuppetRigPackage(payload)}`;
+    state.puppetShop.status = `loaded project default ${summarizePuppetRigPackage(payload)}`;
     console.info(
       `[puppetShop] loaded project default rig from ${PROJECT_DEFAULT_PLAYER_RIG_PATH}`,
       payload,
     );
     return payload;
   } catch (error) {
-    state.puppetShop.status =
-      `project default rig missing; using hardcoded defaults (${PROJECT_DEFAULT_PLAYER_RIG_PATH})`;
+    state.puppetShop.status = `project default rig missing; using hardcoded defaults (${PROJECT_DEFAULT_PLAYER_RIG_PATH})`;
     console.warn(
       `[puppetShop] Could not load ${PROJECT_DEFAULT_PLAYER_RIG_PATH}. ` +
         "Using hardcoded defaults; save/export a new player rig package as soon as possible.",
@@ -1226,6 +1397,14 @@ function sanitizeRigTuning(candidate) {
     values[key] = candidate[key] ?? defaults[key];
     return values;
   }, {});
+
+  clean.headMarkerSize = THREE.MathUtils.clamp(
+    Number.isFinite(clean.headMarkerSize)
+      ? clean.headMarkerSize
+      : defaults.headMarkerSize,
+    HEAD_MARKER_SIZE_RANGE.min,
+    HEAD_MARKER_SIZE_RANGE.max,
+  );
 
   clean.axisMarkerJoint = AXIS_MARKER_JOINTS.includes(clean.axisMarkerJoint)
     ? clean.axisMarkerJoint
@@ -1542,6 +1721,7 @@ function buildSkeletonWorkshop() {
   state.skeleton.root.add(state.rigCollider);
   state.debugView = createDebugView(state.skeleton, {
     markerRadius: 0.035,
+    headMarkerSize: rigTuning.headMarkerSize,
     labelScale: rigTuning.labelScale,
     opacity: rigTuning.skeletonOpacity,
     color: GUIDE_COLOR,
@@ -2234,46 +2414,6 @@ function listPuppetRigLibrary() {
   console.info("[puppetShop] saved rig names", names);
 }
 
-function makeJointMarker(joint, markerRadius, material) {
-  /*
-    Creates visible helper geometry for one joint.
-
-    Most joints are small wire spheres. The head uses a capsule shape so it
-    reads like a head volume instead of another tiny point.
-
-    Note:
-      createDebugView() currently builds its own markers directly. This helper
-      is kept because it is useful for future debug-marker experiments.
-  */
-  if (joint.name === "head") {
-    const headRadius = markerRadius * 3.2;
-    const headLength = markerRadius * 4.8;
-
-    const marker = new THREE.Mesh(
-      new THREE.CapsuleGeometry(headRadius, headLength, 12, 18),
-      material,
-    );
-
-    marker.name = `${joint.name}-debug-marker`;
-    marker.renderOrder = 20;
-
-    // CapsuleGeometry is already vertical along Y.
-    // This makes the head read as a soft vertical pill.
-    marker.scale.set(0.85, 1.25, 0.72);
-
-    return marker;
-  }
-
-  const marker = new THREE.Mesh(
-    new THREE.SphereGeometry(markerRadius, 12, 8),
-    material,
-  );
-
-  marker.name = `${joint.name}-debug-marker`;
-  marker.renderOrder = 20;
-
-  return marker;
-}
 function createDebugView(skeleton, options = {}) {
   /*
     Builds the visible "skeleton lab" layer.
@@ -2288,11 +2428,17 @@ function createDebugView(skeleton, options = {}) {
   */
   const color = options.color || GUIDE_COLOR;
   const markerRadius = options.markerRadius || 0.035;
+  const initialHeadMarkerSize = THREE.MathUtils.clamp(
+    options.headMarkerSize ?? 1,
+    HEAD_MARKER_SIZE_RANGE.min,
+    HEAD_MARKER_SIZE_RANGE.max,
+  );
   const labelScale = options.labelScale || 1;
   const objects = [];
   const labels = [];
   const boneLines = [];
   const selectableMarkers = [];
+  let headMarker = null;
   let skeletonOpacity = THREE.MathUtils.clamp(options.opacity ?? 1, 0, 1);
   const applyObjectOpacity = (
     object,
@@ -2351,7 +2497,10 @@ function createDebugView(skeleton, options = {}) {
     applyObjectOpacity(marker, 0.7);
 
     if (joint.name === "head") {
-      marker.scale.set(10.5, 15.0, 12.0);
+      headMarker = marker;
+      marker.scale
+        .copy(HEAD_MARKER_BASE_SCALE)
+        .multiplyScalar(initialHeadMarkerSize);
     }
 
     joint.add(marker);
@@ -2412,6 +2561,18 @@ function createDebugView(skeleton, options = {}) {
       labels.forEach((label) => {
         label.scale.set(0.34 * scale, 0.085 * scale, 1);
       });
+    },
+    setHeadMarkerSize(size) {
+      if (!headMarker) {
+        return;
+      }
+
+      const safeSize = THREE.MathUtils.clamp(
+        Number.isFinite(size) ? size : 1,
+        HEAD_MARKER_SIZE_RANGE.min,
+        HEAD_MARKER_SIZE_RANGE.max,
+      );
+      headMarker.scale.copy(HEAD_MARKER_BASE_SCALE).multiplyScalar(safeSize);
     },
     setOpacity(opacity) {
       skeletonOpacity = THREE.MathUtils.clamp(opacity, 0, 1);
@@ -2563,6 +2724,7 @@ function applyJointPointOffsets() {
   applyJointPointOffsetsTo(state.skeleton, rigTuning);
   state.debugView?.refreshBones?.();
   updateAxisMarkerAttachment();
+  updateRigHeightDisk();
 }
 
 function applyJointPointOffsetsTo(skeleton, tuning) {
@@ -3736,8 +3898,12 @@ function enterG53RiggingMode() {
     applyG53VisibilityFixture();
     updateGuiDisplays();
     updateG53RiggingStatus("ACTIVE - HOME X0 Z0 YAW0 - WORLD FADED");
+    const skySnapshot = skyCycleController?.getSnapshot();
     console.info(
       "[G53] rigging mode active: home position and mouse point edit enabled",
+    );
+    console.info(
+      `[sky] cycle paused by G53 at ${Math.round(skySnapshot?.phaseElapsed || 0)}/${Math.round(skySnapshot?.phaseDuration || 0)}ms`,
     );
   } catch (error) {
     /*
@@ -3801,11 +3967,15 @@ function exitG53RiggingMode() {
   syncSwordAttachment();
   selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
   applyVisibility();
-  applyMoonSystemEnabled();
+  refreshSkyCyclePresentation();
   updateGuiDisplays();
   updateG53RiggingStatus("OFF");
+  const skySnapshot = skyCycleController?.getSnapshot();
   console.info(
     "[G53] rigging mode committed calibration and restored visible gameplay pose",
+  );
+  console.info(
+    `[sky] cycle resumed after G53 at ${Math.round(skySnapshot?.phaseElapsed || 0)}/${Math.round(skySnapshot?.phaseDuration || 0)}ms`,
   );
 }
 
@@ -4067,16 +4237,26 @@ function enterRiggingWizardAlignStep() {
   rigTuning.skeletonVisible = true;
   applyVisibility();
   updateGuiDisplays();
-  setRiggingWizardStep("align", "Align pivots with mouse/sliders, then click Rig.");
+  setRiggingWizardStep(
+    "align",
+    "Align pivots with mouse/sliders, then click Rig.",
+  );
 }
 
 function riggingWizardRigMesh() {
-  if (!state.importedPreview && !state.meshBlobUrl && !rigTuning.importedMeshPath) {
+  if (
+    !state.importedPreview &&
+    !state.meshBlobUrl &&
+    !rigTuning.importedMeshPath
+  ) {
     setRiggingWizardStep("select mesh", "No mesh selected yet.");
     return;
   }
 
-  setRiggingWizardStep("rigging", "Generating skin weights with existing rig engine.");
+  setRiggingWizardStep(
+    "rigging",
+    "Generating skin weights with existing rig engine.",
+  );
   rigCurrentImportedMeshAndExitG53();
 }
 
@@ -4093,7 +4273,10 @@ function setRiggingWizardTestIdle() {
 
 function holdRiggingWizardMovementTest({ run = false } = {}) {
   if (state.g53RiggingMode.active) {
-    setRiggingWizardStep("align", "Rig first; movement tests run after G53 exits.");
+    setRiggingWizardStep(
+      "align",
+      "Rig first; movement tests run after G53 exits.",
+    );
     return;
   }
 
@@ -4105,7 +4288,10 @@ function holdRiggingWizardMovementTest({ run = false } = {}) {
     controlState.keys.delete("ShiftRight");
   }
 
-  setRiggingWizardStep("test", run ? "Run test for 1 second." : "Walk test for 1 second.");
+  setRiggingWizardStep(
+    "test",
+    run ? "Run test for 1 second." : "Walk test for 1 second.",
+  );
   window.setTimeout(() => {
     controlState.keys.delete("KeyW");
     controlState.keys.delete("ShiftLeft");
@@ -4129,7 +4315,7 @@ function buildGui() {
 
       Mesh              — file browser, workflow steps, appearance, transform
       Puppet Shop       — named reusable rig packages and local rig library
-      Rig Dimensions    — body proportions (sliders)
+      Base Rig Proportions — stock skeleton dimensions (sliders)
       Pivot Offsets     — per-joint XYZ position nudges
       Bind Pose         — per-joint rest-pose rotations for mesh alignment
       Motion            — idle, walk, jump, damping, presets
@@ -4230,7 +4416,9 @@ function buildGui() {
     wizardFolder.add(state.riggingWizard, "persistence").name("save check"),
   );
   wizardFolder.add({ fn: startRiggingWizard }, "fn").name("F2 start wizard");
-  wizardFolder.add({ fn: openRiggingWizardFilePicker }, "fn").name("1 choose GLB");
+  wizardFolder
+    .add({ fn: openRiggingWizardFilePicker }, "fn")
+    .name("1 choose GLB");
   wizardFolder
     .add({ fn: previewRiggingWizardAssetsPath }, "fn")
     .name("1b preview assets path");
@@ -4425,11 +4613,11 @@ function buildGui() {
   puppetShopFolder.close();
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // RIG DIMENSIONS
+  // BASE RIG PROPORTIONS
   // Changes here rebuild the skeleton hierarchy from scratch. Drag slowly —
   // each slider fires rebuildSkeletonWorkshop on release.
   // ─────────────────────────────────────────────────────────────────────────────
-  const dimensionFolder = state.gui.addFolder("Rig Dimensions");
+  const dimensionFolder = state.gui.addFolder("Base Rig Proportions");
   state.guiFolders.dimensions = dimensionFolder;
   RIG_DIMENSION_CONTROLS.forEach(([key, min, max, step]) => {
     addGuiController(dimensionFolder, rigTuning, key, min, max, step)
@@ -4635,6 +4823,16 @@ function buildGui() {
     .onChange(applyVisibility);
   addGuiController(labFolder, rigTuning, "skeletonOpacity", 0, 1, 0.01)
     .name("guide opacity")
+    .onChange(applyVisibility);
+  addGuiController(
+    labFolder,
+    rigTuning,
+    "headMarkerSize",
+    HEAD_MARKER_SIZE_RANGE.min,
+    HEAD_MARKER_SIZE_RANGE.max,
+    HEAD_MARKER_SIZE_RANGE.step,
+  )
+    .name("head marker size")
     .onChange(applyVisibility);
   addGuiController(labFolder, rigTuning, "showJointLabels")
     .name("joint labels")
@@ -5000,10 +5198,11 @@ function buildJointPointControls(parentFolder) {
   /*
     Creates X/Y/Z sliders for every pivot point.
 
-    These sliders move the joint connection points before animation. They are
-    the main "fit the skeleton to the mesh" controls.
+    These are calibration deltas layered on top of Base Rig Proportions. They
+    move joint connection points before animation and are the main controls for
+    fitting one finalized base skeleton to a specific imported mesh.
   */
-  const folder = parentFolder.addFolder("Joint Point Offsets");
+  const folder = parentFolder.addFolder("Mesh Calibration Offsets");
   folder.close();
 
   JOINT_ORDER.forEach((jointName) => {
@@ -5170,6 +5369,7 @@ function applyVisibility() {
     rigTuning.labEnabled && rigTuning.skeletonVisible,
   );
   state.debugView?.setOpacity(rigTuning.skeletonOpacity);
+  state.debugView?.setHeadMarkerSize(rigTuning.headMarkerSize);
   state.debugView?.setLabelsVisible(
     rigTuning.labEnabled &&
       rigTuning.skeletonVisible &&
@@ -5297,9 +5497,30 @@ function animate(currentTime) {
     }
   }
   updateDevProbeReadout();
+  if (
+    skyCycleController &&
+    !titleCardIsActive &&
+    !skyCycleSuspendedByDocument &&
+    !state.g53RiggingMode.active
+  ) {
+    /*
+      delta is seconds; the world controller's documented timing is in
+      milliseconds, so one conversion keeps all phase constants readable.
+
+      Production pause gates:
+        titleCardIsActive            -> first hold begins after EMPYREAN fades
+        skyCycleSuspendedByDocument  -> hidden-tab wall time is discarded
+        g53RiggingMode.active        -> calibration cannot consume sky time
+
+      Exiting any gate continues from the exact visible transition frame.
+    */
+    skyCycleController.update(delta * 1000);
+  }
+  applySkyCycleObjectVisibility();
   updateGhostSphereMotion(ghostSpheres, elapsed);
   worldLighting?.update?.();
   updateCamera(delta);
+  updateSkyMoonCameraAnchor(skyMoon, camera);
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
 }
@@ -8623,34 +8844,55 @@ function handleWindowBlur() {
   }
 }
 
-function applyMoonSystemEnabled() {
+function handleSkyCycleStateChange(snapshot) {
+  /* Keeps main.js's small visibility mirror synchronized with world.js. */
+  Object.assign(state.skyCycle, snapshot);
+}
+
+function handleDocumentVisibilityChange() {
   /*
-    Day/night prototype, pass 1.
+    Explicit tab suspension policy for the production sky cycle.
 
-    This is intentionally a blunt on/off switch:
-      visible moon group      -> skyMoon.visible
-      world moon key light    -> worldLighting.moonLight.visible
-      moon shell helper light -> worldLighting.moonPointLight.visible
-      ghost sphere groups     -> sphere.group.visible
-      sky color               -> night when enabled, day when disabled
-      day sun light           -> off when enabled, on when disabled
-      hemisphere fill         -> dim night fill or brighter day fill
+    Browsers pause or heavily throttle requestAnimationFrame in hidden tabs.
+    Relying on that alone makes elapsed sky time browser-dependent. Empyrean
+    instead pauses cycle time while hidden and resumes from the same frame.
 
-    We do not change material opacity here. The visible moon is a Group with
-    several child meshes/materials, the ghost spheres each have two child
-    meshes, and lights have no opacity at all. Toggling Object3D.visible plus
-    switching world-owned light intensities is the simplest reversible first
-    pass and keeps the future fade-based day/night cycle free to interpolate
-    these same values instead of jumping them.
+    clock.getDelta() is called only to discard the hidden wall-time interval.
+    Without this reset, the first visible frame would receive a very large raw
+    delta (later capped, but still semantically the wrong source of time).
+  */
+  skyCycleSuspendedByDocument = document.hidden;
+  clock.getDelta();
+  const snapshot = skyCycleController?.getSnapshot();
+  const phaseTime = `${Math.round(snapshot?.phaseElapsed || 0)}/${Math.round(snapshot?.phaseDuration || 0)}ms`;
+
+  if (skyCycleSuspendedByDocument) {
+    console.info(`[sky] cycle paused: browser tab hidden at ${phaseTime}`);
+    return;
+  }
+
+  refreshMoonPhaseIfStale();
+  refreshSkyCyclePresentation();
+  console.info(`[sky] cycle resumed: browser tab visible at ${phaseTime}`);
+}
+
+function applySkyCycleObjectVisibility() {
+  /*
+    Applies only main-owned scene-object visibility.
+
+    Gradient, fog, light intensities, lensflares, moon material opacity, and
+    ghost material opacity are already crossfaded by world.js. These group/light
+    visibility checks happen only at effectively-zero opacity/intensity, where
+    hiding the objects saves rendering work without creating a visible snap.
 
     G53 note:
       Machine-home rigging mode owns temporary world visibility. If G53 is
-      active, keep the moon and ghost spheres hidden even when the sky system
-      flag is enabled. Exiting G53 calls this helper again so gameplay returns
-      to the current sky-system state.
+      active, keep the moon, ghost spheres, and their lights hidden. The sky
+      controller itself is paused by animate(), so rigging cannot consume or
+      overwrite an in-progress transition.
   */
-  const enabled = Boolean(state.moonSystemEnabled);
-  const visibleInGameplay = enabled && !state.g53RiggingMode.active;
+  const nightVisible = state.skyCycle.nightInfluence > 0.001;
+  const visibleInGameplay = nightVisible && !state.g53RiggingMode.active;
 
   skyMoon.visible = visibleInGameplay;
 
@@ -8658,34 +8900,34 @@ function applyMoonSystemEnabled() {
     sphere.group.visible = visibleInGameplay;
   });
 
-  /*
-    Sky-mode proof of concept:
-
-      enabled  = night sky, moon, moonlight, ghost spheres
-      disabled = bright day sky, sun light, no moon, no ghost spheres
-
-    world.js owns the actual sky, sun, and hemisphere values. main.js only
-    chooses the state name because keyboard input belongs here.
-  */
-  applyWorldSkyMode(scene, renderer, {
-    lightingRig: worldLighting,
-    skyName: enabled ? "night" : "day",
-  });
-
   if (worldLighting?.moonLight) {
-    worldLighting.moonLight.visible = enabled;
+    worldLighting.moonLight.visible =
+      visibleInGameplay && worldLighting.moonLight.intensity > 0.001;
   }
 
   if (worldLighting?.moonPointLight) {
-    worldLighting.moonPointLight.visible = enabled;
+    worldLighting.moonPointLight.visible =
+      visibleInGameplay && worldLighting.moonPointLight.intensity > 0.001;
   }
 }
 
+function refreshSkyCyclePresentation() {
+  /* Reapply the paused/current sky frame after G53 or startup setup. */
+  skyCycleController?.applyCurrent();
+  applySkyCycleObjectVisibility();
+}
+
 function toggleMoonSystem() {
-  state.moonSystemEnabled = !state.moonSystemEnabled;
-  applyMoonSystemEnabled();
+  const snapshot = skyCycleController?.toggleTarget();
+
+  if (!snapshot) {
+    return;
+  }
+
+  handleSkyCycleStateChange(snapshot);
+  applySkyCycleObjectVisibility();
   console.info(
-    `[sky] night-sky system ${state.moonSystemEnabled ? "enabled" : "disabled"}`,
+    `[sky] G requested ${snapshot.targetState}; transition restarted from current colors`,
   );
 }
 
@@ -8702,7 +8944,7 @@ function handleKeyDown(event) {
       Z     = toggle left arm high
       X     = toggle right arm high
       H     = toggle both hands half high
-      G     = toggle moon / ghost-sphere sky system and day/night sky color
+      G     = transition toward the opposite day/night target
       Space = wave
       J     = jump
       1     = equip sword and enter combat stance
@@ -8833,7 +9075,14 @@ console.info(
 
 worldLighting = buildLighting(scene, { skyMoon });
 applyWorldAtmosphere(scene, renderer, { lightingRig: worldLighting });
-applyMoonSystemEnabled();
+skyCycleController = createWorldSkyCycleController(scene, renderer, {
+  lightingRig: worldLighting,
+  skyMoon,
+  ghostSpheres,
+  onStateChange: handleSkyCycleStateChange,
+});
+refreshSkyCyclePresentation();
+initMoonPhaseRuntime();
 initSkin({
   state,
   rigTuning,
@@ -8980,6 +9229,7 @@ window.addEventListener("keydown", handleKeyDown);
 window.addEventListener("keyup", handleKeyUp);
 window.addEventListener("blur", handleWindowBlur);
 window.addEventListener("resize", resizeRendererToContainer);
+document.addEventListener("visibilitychange", handleDocumentVisibilityChange);
 sceneContainer.addEventListener("wheel", handleWheelZoom, { passive: false });
 sceneContainer.addEventListener("pointerdown", handleScenePointerFocus, {
   capture: true,

@@ -28,15 +28,16 @@ Important rig persistence rule:
 
 ## Current Build
 
-Current build: `0.1.109-alpha`
+Current build: `0.2.1-alpha`
 
 The project currently has:
 
 - a Three.js exploration world
 - four connected rooms
 - an outside enclosure
-- moon.glb in the sky
-- moon.glb keeps its detailed shell, contains a self-lit inner glow sphere, and anchors moonlight direction
+- a camera-facing `moon_2K.jpg` disc held at a constant distance and direction from the active camera; the retained `moon.glb` is no longer the visible moon surface
+- the sky-owned moon group keeps its self-lit inner glow and remains the moonlight direction anchor
+- the moon follows the real-world lunar phase, with restrained earthshine, phase-aware visual flare, automatic hemisphere orientation, and northern fallback
 - moon-aligned directional light prepared for a future day/night sky path
 - background audio
 - EMPYREAN stone title card loader
@@ -158,7 +159,7 @@ Recommended flow:
 
 ## Good 15-Minute Tasks
 
-- Move the moon with `WORLD_TWEAKS.skyMoon.position` in `world.js`.
+- Set the moon's initial sightline and fixed gameplay-lighting anchor with `WORLD_TWEAKS.skyMoon.position` in `world.js`; runtime visual placement then remains camera-relative.
 - Add one tree position in `buildLowPolyTrees`.
 - Add one encounter in `encounters.js`.
 - Tune camera distance in `SOLO_TWEAKS.camera`.

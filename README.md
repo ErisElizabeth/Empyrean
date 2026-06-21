@@ -4,7 +4,7 @@ A game extracted from a clean skeleton workshop, which in turn was extracted fro
 
 ## Version
 
-- Empyrean build: `0.1.109-alpha`
+- Empyrean build: `0.2.1-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -73,8 +73,9 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - expanded outside enclosure at `384 x 384 x 36` scene units, centered equally around gameplay X0/Z0
 - `cave.glb` rough-draft world prop near the moon with simple proxy rectangle colliders
 - seeded outside landmark scatter using extra `tree.glb`, `deadTree.glb`, `campfire.glb`, `skull.glb`, `rock1.glb`, and `rock2.glb` props
-- moon.glb sky focal point replacing the old planet sphere
+- camera-facing, camera-relative `moon_2K.jpg` sky disc that remains at a constant viewing distance
 - world-owned sky moon setup in `world.js`
+- real-world lunar-phase presentation with continuous Three.js shadow geometry, restrained earthshine, phase-aware atmospheric flare, and automatic northern/southern orientation
 - EMPYREAN stone-engraved title card with animated gradient and delayed reveal
 
 ---
@@ -152,6 +153,12 @@ physics.js          ← the math reference binder
                       jump state machine, pose weights, walk/run phase shaping,
                       smoothstep, clamp. No scene objects, no GUI, just math.
                       main.js calls these like looking up a formula in a book.
+
+moonPhase.js        <- the lunar data station
+                      pure real-world date math and presentation metadata for
+                      moon age, continuous phase, illumination, phase name,
+                      waxing state, hemisphere, and light-side orientation.
+                      No DOM, geolocation request, Three.js, or gameplay state.
 
 puppetShop.js       <- the rig package shelf
                       pure browser/data code for complete rig packages,
@@ -326,6 +333,25 @@ alignment.
 
 ## Change Notes
 
+- `0.2.1-alpha`: Removed the unused `treeLeafMaterial` and `treeTrunkMaterial` declarations left behind by the primitive Three.js tree implementation. Active tree placement remains unchanged: `buildLowPolyTrees()` still uses the same 16 hand-placed X/Z coordinates and collision circles while `createTreeProp()` fills those placeholders with alternating `tree.glb` and `deadTree.glb` clones. Landmark-scatter trees, GLB caching/normalization, G53 tree visibility, and all gameplay behavior are unchanged.
+- `0.2.0-alpha`: Completed lunar-phase Pass 7 by removing the visible moon group's fixed world-space position. `updateSkyMoonCameraAnchor()` now captures the authored startup offset as one normalized world-sky direction plus one fixed camera distance, then recalculates the moon position after every camera update with `moonPosition = cameraPosition + direction * distance`. Player movement can no longer approach the moon or enlarge its apparent diameter. The existing billboard quaternion update still keeps the texture camera-facing. The original `[0, 30, 149]` position is retained separately as the immutable directional/point moonlight anchor, so camera-relative visual motion cannot change gameplay lighting. Lunar math, phase uniforms, sky-cycle timing, `G`, G53, title startup, fog, ghost behavior, diagnostics, HUD/UI, and controls were not changed.
+- `0.1.126-alpha`: Completed lunar-phase Pass 6 validation without changing lunar math, phase rendering, sky timing, gameplay lighting, UI, diagnostics, or controls. The visible moon asset is now documented as the sky-owned, camera-facing `/assets/moon_2K.jpg` disc introduced by the preceding strict asset-replacement pass; `moon.glb` remains on disk but is not the visible surface. `verify.ps1` now requires the active moon texture, and the full syntax/lunar contract verification passes. Browser validation on 2026-06-20 resolved Waxing Crescent at 29% with northern fallback, loaded `moon_2K.jpg` without shader/WebGL failure, confirmed title completion starts the production sky clock at `0ms`, confirmed `G` reaches day and returns to night without recalculating lunar state, and confirmed G53 suppresses the world moon then resumes the sky cycle at the exact paused frame. Source inspection confirms the disc copies the active camera quaternion per render and the phase terminator remains view-space, preventing viewing-angle phase drift.
+- `0.1.125-alpha`: Completed lunar-phase Pass 5 by connecting the pure lunar data contract directly to the live `skyMoon` renderer. Startup immediately calculates the real-world phase with northern orientation, then requests one low-accuracy browser geolocation after the title card; only the sign of latitude is read, only `northern`/`southern` is retained, and denied, unavailable, invalid, blocked, or insecure-context requests keep the northern fallback. Coordinates are never stored, logged, serialized, or displayed. Lunar state refreshes hourly and refreshes on tab resume when stale. Live browser testing resolved 2026-06-20 as Waxing Crescent at 28%, verified permission-denied fallback, verified a temporary southern success path, and confirmed repeated `G` day/night transitions do not change lunar state. Gameplay moonlight remains independent. The temporary success-path harness was removed.
+- `0.1.124-alpha`: Completed lunar-phase Pass 4 as a restrained art-direction and flare-composition pass. Shadow opacity is now `0.935`, retaining 6.5% of the textured shell/inner-glow stack as faint earthshine, while terminator softness is narrowed to `0.014` for crisp crescent and quarter readability at the moon's game-scale apparent size. `applySkyMoonPhasePresentation()` now records analytical illumination and shapes the existing moon lensflare with `lerp(0.02, 1, illumination^0.65)`: new moon keeps only a trace, quarter reaches approximately `0.6445`, and full moon restores authored flare brightness. This lunar flare factor multiplies the existing night/day fade rather than replacing it. Directional moonlight, shell-helper PointLight, gameplay visibility, and all world-light intensities remain unchanged. A temporary real-asset gallery visually verified all eight phase silhouettes, small-size readability, and new/quarter/full flare progression, then was removed.
+- `0.1.123-alpha`: Completed lunar-phase Pass 3 by adding a standalone native Three.js phase-shadow layer to the existing `skyMoon` group. `applySkyMoonPhasePresentation()` now normalizes a continuous phase and northern/southern orientation into shader uniforms; view-space sphere normals form correct crescent, quarter, gibbous, full, and new-moon terminators while keeping the screen-side convention stable as the camera moves. The transparent shadow sphere preserves the embedded `moon.glb` texture, self-lit shell, additive inner glow, asynchronous fallback, parent scaling, G53 visibility, and sky-cycle opacity fade; it is excluded from encounter tint actions so the shadow remains neutral. Runtime defaults to phase `0.5` (full moon), so real-world date/geolocation data is still not connected and gameplay moonlight remains unchanged. A temporary real-asset browser gallery verified all eight canonical phases and southern mirroring, then was removed.
+- `0.1.122-alpha`: Completed lunar-phase Pass 2 by adding the pure `moonPhase.js` data module and deterministic `moonPhase.test.mjs` verification. The frozen moon-state contract now returns cloned reference/current dates, moon age, normalized continuous phase, approximate illumination, phase name, waxing state, normalized northern/southern hemisphere, and derived light-side orientation. Dates before the reference epoch wrap correctly; invalid dates fail explicitly; latitude classification retains only hemisphere and defaults invalid/zero inputs to northern. No browser geolocation request, rendering change, or gameplay-lighting change is active yet. `verify.ps1` now checks both new files and runs the lunar contract tests.
+- `0.1.121-alpha`: Completed lunar-phase Pass 1 as an architecture and compatibility foundation with no gameplay or rendering behavior changes. Confirmed that the existing Three.js `skyMoon` group, textured `moon.glb`, frame-driven sky controller, and centralized world presentation are compatible with a native shader-based phase shadow. Locked real-world device time as the lunar clock, browser geolocation latitude as the hemisphere source, northern orientation as the permission/error fallback, no coordinate persistence, and unchanged gameplay moonlight. Documented that later passes must preserve sky-cycle fades, encounter tint/scale actions, the detailed self-lit shell, inner glow, and flare ownership while keeping lunar state names distinct from the existing sky-cycle `phase` state.
+- `0.1.120-alpha`: Productionized sky-cycle timing and pause ownership. Full timings remain `120s` night/day holds with `1s + 5s + 1s` transitions. The first hold now starts only after the title card fully fades; hidden browser tabs and active G53 calibration pause cycle time explicitly, discard suspended wall time, and resume from the exact saved phase frame. Diagnostic snapshots now include phase elapsed/duration for suspension, G53, title-startup, and repeated-`G` verification.
+- `0.1.119-alpha`: Completed sky-cycle atmosphere integration. Fog, hemisphere fill, sun/moon lights, lensflare brightness, moon shell/glow opacity, and every ghost sphere's wire/glow opacity now follow the same `dayBlend` instead of snapping. Authored moon/ghost opacities and lensflare colors are stored as immutable bases so repeated cycles restore full night presentation without cumulative dimming; groups hide only after their fade reaches effectively zero, while G53 suppression remains authoritative.
+- `0.1.118-alpha`: Restored the stable-day gradient to the original `sky.md` / Pass 16 colors (`#A0E7FB`, `#85E0FA`, `#78DDFA`). This corrects the unrelated Pass 17 saturation change without altering the cycle controller, transition palette, lighting interpolation, or timing.
+- `0.1.117-alpha`: Applied the restrained apocalyptic treatment to stable daylight only. The day gradient keeps its authored hue/lightness but uses 20% less HSL saturation (`#A9E2F2`, `#91D9EE`, `#85D6ED`), matching the existing desaturated day atmosphere. Dawn/dusk transition colors and all cycle timing remain unchanged.
+- `0.1.116-alpha`: Added the world-owned day/night cycle controller. The app starts with a 120-second night hold, crosses through the authored transition gradient over `1s + 5s + 1s`, holds day for 120 seconds, and repeats. `G` now interrupts safely from the currently visible colors, targets the opposite stable state, and restarts the same transition sequence without overlapping timers. Gradient stops, fog, hemisphere fill, sun, moon lights, and the local accent light crossfade through one `dayBlend`; G53 pauses and restores the current transition frame.
+- `0.1.115-alpha`: Fixed the reappearing perspective-sensitive sky section at its clipping source. The outside world had expanded to `384 x 384 x 75`, but the camera far plane remained at `160`, allowing the flat scene background to show whenever the physical gradient enclosure was clipped. Camera far distance is now an explicit `SOLO_TWEAKS.camera.farClip` value of `640`, enough to keep the complete unlit, opaque sky shell rendered from anywhere inside the current world.
+- `0.1.114-alpha`: Corrected the sky-gradient coordinate system. The shader now derives horizon-to-zenith color from camera-relative viewing elevation instead of fixed enclosure-wall height, preventing the brighter gradient region from appearing painted onto a wall and contracting as the player approaches it in either day or night mode.
+- `0.1.113-alpha`: Added the first sky-gradient pass in `world.js`: the outside wall/ceiling sky shell now renders authored horizon, midpoint, and zenith colors through a world-height shader. `G` still switches immediately between static night and day gradients; the staged transition palette is present for the later timed crossfade pass, while fog, lighting, moon/sun behavior, and gameplay remain unchanged.
+- `0.1.112-alpha`: Made `rig.js` authoritative for the project default player's base proportions at startup. `player.default.rig.json` continues to supply calibration, bind, mesh, motion, and attachment data; explicitly loaded reusable rig packages still retain their own saved dimensions. Synchronized the canonical JSON dimension snapshot with the current `rig.js` values.
+- `0.1.111-alpha`: Clarified rig ownership in the workshop UI by renaming the base dimension and per-mesh calibration folders, added a live saved `head marker size` control under Skeleton Lab, made the height gauge follow the calibrated head pivot, and removed the unused `makeJointMarker()` / `getRigStats()` helpers.
+- `0.1.110-alpha`: Added procedural Three.js Lensflare presentation objects in `world.js`: a very subtle flare attached to the visible `skyMoon` group and a stronger day-mode flare attached to the sun directional light so both effects follow future sky movement from their existing source transforms.
 - `0.1.109-alpha`: Reduced night fog washout by decoupling the fog from the visible sky color: night sky remains `#131862`, while distance haze now uses darker, thinner fog (`#080A20`, density `0.006`) so distant props keep more of their material color.
 - `0.1.108-alpha`: Added `restoreSceneKeyboardFocus()` and routed World Debug GUI changes plus scene pointer entry through it so lil-gui checkbox focus does not strand movement keys after toggling debug overlays.
 - `0.1.107-alpha`: Pass 7 for the Cathedral replacement staged workflow: kept the legacy four-room structure and collision data but set old procedural room walls, ceilings, and torch mounts to `visible = false` behind the active cathedral shell, reducing render clutter without deleting the old construction path.
@@ -451,7 +477,7 @@ Open this folder with VS Code Live Server and launch `index.html`.
 - `Z`: toggle left arm up.
 - `X`: toggle right arm up.
 - `H`: toggle both hands half high.
-- `G`: toggle the moon / ghost-sphere night-sky system, switch the sky between night and desaturated `#CEEAFA` day color, and swap moonlight for warm `#FBF6D6` sunlight plus day fill.
+- `G`: request the opposite day/night target. The current visible sky crossfades through the authored transition palette (`1s` blend, `5s` twilight hold, `1s` blend), while moonlight, sunlight, fog, and fill lights follow the same transition. Pressing `G` again safely reverses from the current colors.
 - `J`: jump.
 - `Space`: wave both arms.
 - `1`: equip `assets/plainSword.glb` in the right hand and enter combat stance.
@@ -627,7 +653,7 @@ That keeps a T-posed mesh bindable without leaving the gameplay arms stuck in T-
 New mesh workflow:
 
 1. `Mesh > 1 preview`
-2. Adjust `Rig Dimensions`, `Joint Point Offsets`, and `Bind Pose Rotations` while the mesh is only a static reference.
+2. Adjust `Base Rig Proportions`, `Mesh Calibration Offsets`, and `Bind Pose Rotations` while the mesh is only a static reference.
 3. `Mesh > 2 rig mesh`
 
 Use the mouse wheel over the scene to zoom the camera in and out while placing pivots.
@@ -876,7 +902,7 @@ Workflow:
 2. Turn on `mouse point edit`.
 3. Click a visible joint marker.
 4. Drag it.
-5. The matching `Joint Point Offsets` values update.
+5. The matching `Mesh Calibration Offsets` values update.
 
 This is intentionally a simple camera-facing drag plane, not a full transform gizmo. The sliders remain the source of truth, so saved/exported rig tuning still works.
 
@@ -890,7 +916,7 @@ Collision is separate from visible geometry. Wall and door blocking shapes are s
 
 The skeleton is a hierarchy of `THREE.Group` objects. Each group is a pivot point. Parent joints carry child joints, so moving the pelvis carries the legs, moving the chest carries the neck/head/arms, and so on. Debug markers, labels, and bone lines are attached to those joints so they follow the skeleton automatically.
 
-Rig tuning is saved in `rigTuning`. The important idea is that sliders, mouse point editing, save/load, and export/import all talk to the same data. Mouse dragging a joint marker updates `Joint Point Offsets`; it does not invent a second hidden rig system.
+Rig tuning is saved in `rigTuning`. The important idea is that sliders, mouse point editing, save/load, and export/import all talk to the same data. `Base Rig Proportions` define the stock skeleton; mouse dragging a joint marker updates `Mesh Calibration Offsets` layered on that stock skeleton. It does not invent a second hidden rig system. For the project default player, the base proportion values in `rig.js` win during startup; `assets/rigs/player.default.rig.json` supplies the persistent calibration and presentation data. Explicitly loading another reusable rig package still uses that package's saved proportions.
 
 Imported meshes use a generated skin. The GLB is loaded, centered, scaled, optionally rotated, and then given generated `skinIndex` and `skinWeight` attributes. Empyrean creates real `THREE.Bone` objects that mirror the visible puppet joints. Every frame, the generated bones copy the puppet joint transforms, which is how the imported mesh follows the workshop skeleton.
 
