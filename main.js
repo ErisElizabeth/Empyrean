@@ -33,8 +33,14 @@ import {
 import {
   getMoonHemisphereFromLatitude,
   getMoonPhase,
-} from "./moonPhase.js?v=0.2.1-alpha";
-import { DEFAULT_RIG_DIMENSIONS, RIG_DIMENSION_CONTROLS } from "./rig.js";
+} from "./moonPhase.js?v=0.2.14-alpha";
+import {
+  DEFAULT_RIG_DIMENSIONS,
+  HEAD_MARKER_SIZE_RANGE,
+  RIG_DIMENSION_CONTROLS,
+  createRig,
+  createSkeleton,
+} from "./rig.js";
 import {
   createPuppetRigPackage,
   deletePuppetRigPackageFromLibrary,
@@ -72,7 +78,10 @@ import {
   updateGhostSphereMotion,
   updateSkyMoonCameraAnchor,
   worldCollision,
-} from "./world.js?v=0.2.1-alpha";
+  worldTerrain,
+} from "./world.js?v=0.2.14-alpha";
+import { updateLocomotion } from "./movementEngine.js?v=0.2.14-alpha";
+import { isWalkableTerrainHit } from "./terrain.js?v=0.2.14-alpha";
 import {
   DEFAULT_IMPORTED_MESH_PATH,
   applyImportedMeshPresentation,
@@ -91,7 +100,7 @@ import {
   syncImportedSkinToPuppet,
   bindRiggedSkinFromPath,
   syncSkinToSkeleton,
-} from "./skin.js?v=0.2.1-alpha";
+} from "./skin.js?v=0.2.14-alpha";
 import {
   EntityRole,
   createPlayerEntity,
@@ -112,7 +121,7 @@ import {
   sanitizeSwordPresetValues,
 } from "./sword.js";
 
-const APP_VERSION = "0.2.1-alpha";
+const APP_VERSION = "0.2.14-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -156,6 +165,24 @@ const SOLO_TWEAKS = {
     // runPhaseSpeed is how quickly the leg cycle advances while running.
     // Higher values mean faster turnover: more steps per second.
     runPhaseSpeed: 12.25,
+
+    // Run blend damping: high values give a snappy athletic shift into sprint
+    // while still avoiding a one-frame pose cliff.
+    runBlendRiseDamping: 20,
+    runBlendFallDamping: 14,
+
+    // Turn anticipation/banking reads smoothed yaw velocity rather than raw
+    // key/mouse input so mouse-look spikes do not snap the upper body.
+    turnVelocityDamping: 18,
+    maxTurnVelocity: Math.PI * 1.85,
+    turnHeadYaw: 0.24,
+    turnNeckYaw: 0.14,
+    turnChestYaw: 0.09,
+    turnBankRoll: 0.13,
+
+    // Terrain height is sampled after X/Z collision accepts a move.
+    maxStepUp: 0.35,
+    terrainDropSpeed: 7.0,
   },
 
   camera: {
@@ -278,33 +305,8 @@ const G53_RIGGING_HOME = {
   },
 };
 
-const RIG_BASE_BODY_YAW = -Math.PI;
-const RIG_BASE_KNEE_YAW = -Math.PI;
 const FACING_MIGRATION_EPSILON = 0.01;
-/*
-  Neutral facing correction.
-
-  The rig originally treated local +Z as the visible puppet's front. From the
-  camera/foot direction, that made the labels read mirrored: the joint named
-  rightPalm was mechanically correct, but visually/anatomically it landed on
-  what reads as the left hand.
-
-  Instead of chasing this through sword attachment, arm poses, skin weighting,
-  and combat code, the body joint now owns a 180 degree base bind yaw:
-
-    base body yaw = -PI radians
-    GUI body Y bind-rotation value = 0
-
-  In machining terms: we moved the fixture zero. The correction is baked into
-  the base rest pose, so a visible bind-pose slider value of 0 means "correct
-  anatomical facing" from here on.
-
-  V0.1.39 note:
-    The upper body correction fixed the hand labels, but the feet still read
-    backwards. Knees now use the same fixture-zero trick. A -PI base yaw on each
-    knee flips the shin/ankle/foot chain without changing hips, root movement,
-    collision, camera, or G53 machine home.
-*/
+// Tolerance for migrating older saved rig packages with pre-fixture-zero yaw.
 
 //=============================================================
 // LOADER OVERLAY LOGIC BEGIN
@@ -472,8 +474,6 @@ const ROOT_ALIGNMENT_RANGE = { min: -6, max: 6, step: 0.005 };
 const JOINT_POINT_OFFSET_RANGE = { min: -4, max: 4, step: 0.005 };
 const BIND_ROTATION_RANGE = { min: -Math.PI, max: Math.PI, step: 0.005 };
 const AXIS_MARKER_SCALE_RANGE = { min: 0.03, max: 3, step: 0.01 };
-const HEAD_MARKER_SIZE_RANGE = { min: 0.1, max: 3, step: 0.01 };
-const HEAD_MARKER_BASE_SCALE = new THREE.Vector3(6, 9, 9);
 
 const PRESETS = {
   /*
@@ -1068,9 +1068,14 @@ const controlState = {
   // player-facing direction.
   yaw: 0,
   position: new THREE.Vector3(0, 0, 0),
+  groundY: 0,
   walkPhase: 0,
   isWalking: false,
   isRunning: false,
+  runBlendWeight: 0,
+  turnVelocity: 0,
+  turnVelocitySampleYaw: 0,
+  actualMoveSpeed: 0,
   cameraYaw: 0,
   cameraDistance: SOLO_TWEAKS.camera.startDistance,
   cameraHeight: SOLO_TWEAKS.camera.startHeight,
@@ -1141,6 +1146,8 @@ const mouseJointEditor = {
   selectedJointKey: null,
   dragging: false,
 };
+const terrainRaycaster = new THREE.Raycaster();
+const terrainRayDown = new THREE.Vector3(0, -1, 0);
 
 /*
   Encounter and world-debug setup happens after worldCollision has been filled
@@ -1699,33 +1706,41 @@ function buildSkeletonWorkshop() {
     state.importedSkin = null;
   }
 
-  state.skeleton = createSkeleton({
-    headY: rigTuning.headY,
-    neckY: rigTuning.neckY,
-    chestY: rigTuning.chestY,
-    torsoY: rigTuning.torsoY,
-    pelvisY: rigTuning.pelvisY,
-    shoulderX: rigTuning.shoulderX,
-    hipX: rigTuning.hipX,
-    upperArmLength: rigTuning.upperArmLength,
-    forearmLength: rigTuning.forearmLength,
-    thighLength: rigTuning.thighLength,
-    shinLength: rigTuning.shinLength,
+  state.skeleton = createRig({
+    scene,
+    dimensions: {
+      headY: rigTuning.headY,
+      neckY: rigTuning.neckY,
+      chestY: rigTuning.chestY,
+      torsoY: rigTuning.torsoY,
+      pelvisY: rigTuning.pelvisY,
+      shoulderX: rigTuning.shoulderX,
+      hipX: rigTuning.hipX,
+      upperArmLength: rigTuning.upperArmLength,
+      forearmLength: rigTuning.forearmLength,
+      thighLength: rigTuning.thighLength,
+      shinLength: rigTuning.shinLength,
+    },
+    debugOptions: {
+      markerRadius: 0.035,
+      headMarkerSize: rigTuning.headMarkerSize,
+      labelScale: rigTuning.labelScale,
+      opacity: rigTuning.skeletonOpacity,
+      color: GUIDE_COLOR,
+      editableJointKeys: MOUSE_EDIT_JOINTS,
+      makeLabelSprite,
+    },
+    configureSkeleton(skeleton) {
+      state.skeleton = skeleton;
+      applyJointPointOffsets();
+      applyBindRotationOffsets();
+    },
+    beforeDebugView(skeleton) {
+      state.rigCollider = createRigColliderVisual();
+      skeleton.root.add(state.rigCollider);
+    },
   });
-  applyJointPointOffsets();
-  applyBindRotationOffsets();
-
-  state.skeleton.root.name = "empyrean-puppet-skeleton";
-  scene.add(state.skeleton.root);
-  state.rigCollider = createRigColliderVisual();
-  state.skeleton.root.add(state.rigCollider);
-  state.debugView = createDebugView(state.skeleton, {
-    markerRadius: 0.035,
-    headMarkerSize: rigTuning.headMarkerSize,
-    labelScale: rigTuning.labelScale,
-    opacity: rigTuning.skeletonOpacity,
-    color: GUIDE_COLOR,
-  });
+  state.debugView = state.skeleton.debugView;
   updateAxisMarkerAttachment();
   applyVisibility();
   selectMouseJointEditJoint(rigTuning.mouseJointEditJoint);
@@ -1749,277 +1764,6 @@ function rebuildSkeletonWorkshop() {
   } else if (shouldReloadImportedMesh) {
     loadImportedMeshFromPath(rigTuning.importedMeshPath);
   }
-}
-
-function createJoint(name, position = [0, 0, 0]) {
-  /*
-    Creates one puppet joint.
-
-    A joint is a THREE.Group, not a Mesh. It has no visible geometry by itself.
-    Its job is to be a transform/pivot that can rotate, move, and carry child
-    joints along with it automatically via Three.js's scene-graph parenting.
-
-    WHY THREE.Group, NOT THREE.Bone?
-      Three.js Bones are built for SkinnedMesh and come with extra constraints.
-      Using plain Groups here keeps the puppet joints simple and inspectable —
-      you can attach debug markers, labels, and bone lines to them without
-      fighting the bone system. The actual Three.js Bone objects used for mesh
-      skinning are created separately and just copy their transforms from these
-      puppet joints every frame.
-
-    THE PARENT-CHILD RELATIONSHIP IN THREE.JS:
-      When you call parent.add(child), the child's .position, .rotation, and
-      .scale are interpreted in the PARENT'S local space. If the parent moves
-      or rotates, the child moves and rotates with it automatically. This is
-      the scene graph. It is why:
-        - Rotating the chest carries the neck, head, and both arms.
-        - Moving the pelvis carries both legs.
-        - Moving the body joint carries everything.
-
-      You never need to manually update child positions when a parent moves —
-      Three.js handles that through the matrix hierarchy.
-
-    userData FIELDS (the rig's "ground truth" for every joint's rest pose):
-
-      baseBindLocalPosition:
-        The joint's ORIGINAL position from createSkeleton(). Never changes after
-        creation. This is the zero-reference for slider offsets.
-
-      bindLocalPosition:
-        base + offset. What the joint's position should be when at rest.
-        Updated by applyJointPointOffsets() whenever a slider or drag changes an
-        offset. resetSkeletonToBindPose() copies this back to joint.position.
-
-      baseBindLocalQuaternion:
-        The joint's ORIGINAL rotation from createSkeleton(). Most joints start
-        at identity (no rotation). The body joint gets one deliberate exception:
-        applyNeutralBodyFacingCorrection() bakes in a 180 degree yaw so the
-        puppet's anatomical left/right agrees with the visible foot direction.
-        The knee joints get the same style of correction through
-        applyNeutralKneeFacingCorrection() so the lower legs/feet face the
-        readable way while the GUI bind-rotation sliders still read zero.
-
-      bindLocalQuaternion:
-        base rotation multiplied by any bind-pose rotation offsets. Updated by
-        applyBindRotationOffsets(). Animation functions then add motion ON TOP of
-        this rotation, so the aligned rest pose is always the neutral reference.
-
-      bindLocalEuler:
-        The Euler-angle version of the bind rotation offset. Stored separately
-        for GUI/debug readability. Runtime animation now layers deltas onto
-        bindLocalQuaternion so invisible fixture-zero corrections like the knee
-        -PI yaw cannot be accidentally erased by pose solvers.
-
-      bindLocalScale:
-        Neutral scale (1,1,1). Kept in userData so resetSkeletonToBindPose()
-        can restore it without hard-coding the value.
-  */
-  const joint = new THREE.Group();
-  joint.name = name;
-  joint.position.fromArray(position);
-  joint.userData.isPuppetJoint = true;
-  joint.userData.bindLocalPosition = joint.position.clone();
-  joint.userData.baseBindLocalPosition = joint.position.clone();
-  joint.userData.bindLocalQuaternion = joint.quaternion.clone();
-  joint.userData.baseBindLocalQuaternion = joint.quaternion.clone();
-  joint.userData.bindLocalEuler = new THREE.Euler(0, 0, 0);
-  joint.userData.bindLocalScale = joint.scale.clone();
-  return joint;
-}
-
-function applyNeutralBodyFacingCorrection(bodyJoint) {
-  /*
-    Makes the 180-degree body facing correction the rig's neutral zero.
-
-    Why body, not root:
-      root is the player/collider/world anchor. Movement, camera, G53 home,
-      encounter range checks, and devProbe coordinates all use the root as the
-      stable machine coordinate system.
-
-      body is the visible puppet carrier under that root. Rotating body changes
-      which way the skeleton's feet/chest/arms face without moving the player
-      anchor or rewriting room navigation.
-
-    "Call it zero" mechanics:
-      1. Set body.rotation.y to RIG_BASE_BODY_YAW.
-      2. Copy that quaternion into baseBindLocalQuaternion.
-      3. Copy it into bindLocalQuaternion.
-      4. Leave bindLocalEuler at 0,0,0.
-
-    applyBindRotationOffsets() later does:
-
-      bindLocalQuaternion = baseBindLocalQuaternion * offsetQuaternion
-
-    So when the GUI slider offset is zero, the corrected facing is still active.
-  */
-  bodyJoint.rotation.y = RIG_BASE_BODY_YAW;
-  bodyJoint.userData.baseBindLocalQuaternion.copy(bodyJoint.quaternion);
-  bodyJoint.userData.bindLocalQuaternion.copy(bodyJoint.quaternion);
-  bodyJoint.userData.bindLocalEuler.set(0, 0, 0);
-}
-
-function applyNeutralKneeFacingCorrection(kneeJoint, sideName) {
-  /*
-    Makes each knee's lower-leg direction correction part of neutral zero.
-
-    What this affects:
-      knee -> ankle -> foot
-
-    What this does NOT affect:
-      pelvis, hip, upper-leg placement, root movement, collision, camera, or
-      sword attachment.
-
-    Why knee:
-      The thigh line is just hip-to-knee. The readable "which way is the foot
-      pointing?" cue lives below the knee, because the foot marker is a child of
-      the ankle and the ankle inherits the knee's rotation. Rotating the knee
-      around Y by -PI flips the shin/ankle/foot chain while keeping the knee
-      point itself in place.
-
-    "Call it zero" is identical to the body correction:
-
-      base knee yaw = -PI radians
-      GUI knee Y bind-rotation value = 0
-
-    sideName is only here for debugging/readability; both knees get the same
-    neutral yaw.
-  */
-  kneeJoint.rotation.y = RIG_BASE_KNEE_YAW;
-  kneeJoint.userData.baseBindLocalQuaternion.copy(kneeJoint.quaternion);
-  kneeJoint.userData.bindLocalQuaternion.copy(kneeJoint.quaternion);
-  kneeJoint.userData.bindLocalEuler.set(0, 0, 0);
-  kneeJoint.userData.neutralFacingCorrection = `${sideName} knee yaw`;
-}
-
-function createSkeleton(dimensions = {}) {
-  /*
-    Builds the parent/child hierarchy for the puppet.
-
-    Parent chain:
-      root
-        body
-          pelvis
-            spineBase
-              chest
-                neck
-                  head
-
-    Arms attach to chest. Legs attach to pelvis.
-
-    Why parent-relative positions matter:
-      If the chest rotates, the neck/head and both arms follow automatically.
-      If the pelvis moves, both legs follow automatically.
-  */
-  const d = { ...DEFAULT_RIG_DIMENSIONS, ...dimensions };
-  const joints = {};
-
-  joints.root = createJoint("rig-root");
-  joints.body = createJoint("body-root");
-  applyNeutralBodyFacingCorrection(joints.body);
-  joints.root.add(joints.body);
-
-  joints.pelvis = createJoint("pelvis", [0, d.pelvisY, 0]);
-  joints.spineBase = createJoint("spine-base", [0, d.torsoY - d.pelvisY, 0]);
-  joints.chest = createJoint("chest", [0, d.chestY - d.torsoY, 0]);
-  joints.neck = createJoint("neck", [0, d.neckY - d.chestY, 0]);
-  joints.head = createJoint("head", [0, d.headY - d.neckY, 0]);
-
-  joints.body.add(joints.pelvis);
-  joints.pelvis.add(joints.spineBase);
-  joints.spineBase.add(joints.chest);
-  joints.chest.add(joints.neck);
-  joints.neck.add(joints.head);
-
-  addArmChain(joints, "left", -1, d);
-  addArmChain(joints, "right", 1, d);
-  addLegChain(joints, "left", -1, d);
-  addLegChain(joints, "right", 1, d);
-
-  return { root: joints.root, joints };
-}
-
-function addArmChain(joints, sideName, side, d) {
-  /*
-    Adds one arm to the skeleton.
-
-    sideName = "left" or "right"
-    side     = -1 for left, +1 for right
-
-    The side multiplier mirrors X offsets:
-      shoulder X = side * shoulderX
-
-    Fingers are currently only base pivots. They give the future hand mesh or
-    debug geometry places to attach and animate.
-  */
-  const prefix = sideName;
-
-  joints[`${prefix}Clavicle`] = createJoint(`${prefix}-clavicle`, [
-    side * d.shoulderX * 0.55,
-    0,
-    0,
-  ]);
-  joints[`${prefix}Shoulder`] = createJoint(`${prefix}-shoulder`, [
-    side * d.shoulderX * 0.45,
-    0,
-    0,
-  ]);
-  joints[`${prefix}Elbow`] = createJoint(`${prefix}-elbow`, [
-    0,
-    -d.upperArmLength,
-    0,
-  ]);
-  joints[`${prefix}Wrist`] = createJoint(`${prefix}-wrist`, [
-    0,
-    -d.forearmLength,
-    0,
-  ]);
-  joints[`${prefix}Palm`] = createJoint(`${prefix}-palm`, [0, -0.1, 0.04]);
-
-  joints.chest.add(joints[`${prefix}Clavicle`]);
-  joints[`${prefix}Clavicle`].add(joints[`${prefix}Shoulder`]);
-  joints[`${prefix}Shoulder`].add(joints[`${prefix}Elbow`]);
-  joints[`${prefix}Elbow`].add(joints[`${prefix}Wrist`]);
-  joints[`${prefix}Wrist`].add(joints[`${prefix}Palm`]);
-
-  [-1, 0, 1].forEach((fingerIndex) => {
-    const key = `${prefix}Finger${fingerIndex + 2}Base`;
-    joints[key] = createJoint(`${prefix}-finger-${fingerIndex + 2}-base`, [
-      fingerIndex * 0.055,
-      -0.08,
-      0.04,
-    ]);
-    joints[`${prefix}Palm`].add(joints[key]);
-  });
-}
-
-function addLegChain(joints, sideName, side, d) {
-  /*
-    Adds one leg to the skeleton.
-
-    Like arms, the leg uses a side multiplier for left/right mirroring. Each
-    child joint is positioned relative to its parent, so thighLength and
-    shinLength become negative local Y offsets.
-  */
-  const prefix = sideName;
-
-  joints[`${prefix}Hip`] = createJoint(`${prefix}-hip`, [side * d.hipX, 0, 0]);
-  joints[`${prefix}Knee`] = createJoint(`${prefix}-knee`, [
-    0,
-    -d.thighLength,
-    0,
-  ]);
-  applyNeutralKneeFacingCorrection(joints[`${prefix}Knee`], sideName);
-  joints[`${prefix}Ankle`] = createJoint(`${prefix}-ankle`, [
-    0,
-    -d.shinLength,
-    0,
-  ]);
-  joints[`${prefix}Foot`] = createJoint(`${prefix}-foot`, [0, -0.08, 0.12]);
-
-  joints.pelvis.add(joints[`${prefix}Hip`]);
-  joints[`${prefix}Hip`].add(joints[`${prefix}Knee`]);
-  joints[`${prefix}Knee`].add(joints[`${prefix}Ankle`]);
-  joints[`${prefix}Ankle`].add(joints[`${prefix}Foot`]);
 }
 
 function createRigColliderVisual() {
@@ -2412,224 +2156,6 @@ function listPuppetRigLibrary() {
     names.length ? `library: ${names.join(", ")}` : "library is empty",
   );
   console.info("[puppetShop] saved rig names", names);
-}
-
-function createDebugView(skeleton, options = {}) {
-  /*
-    Builds the visible "skeleton lab" layer.
-
-    For each puppet joint, the debug view adds:
-      - a wire marker attached to the joint
-      - a text label sprite attached to the joint
-      - a line from the joint to each child puppet joint
-
-    Because markers and labels are children of the joints, they automatically
-    follow animation and pivot adjustments.
-  */
-  const color = options.color || GUIDE_COLOR;
-  const markerRadius = options.markerRadius || 0.035;
-  const initialHeadMarkerSize = THREE.MathUtils.clamp(
-    options.headMarkerSize ?? 1,
-    HEAD_MARKER_SIZE_RANGE.min,
-    HEAD_MARKER_SIZE_RANGE.max,
-  );
-  const labelScale = options.labelScale || 1;
-  const objects = [];
-  const labels = [];
-  const boneLines = [];
-  const selectableMarkers = [];
-  let headMarker = null;
-  let skeletonOpacity = THREE.MathUtils.clamp(options.opacity ?? 1, 0, 1);
-  const applyObjectOpacity = (
-    object,
-    baseOpacity = object.userData.debugBaseOpacity ?? 1,
-  ) => {
-    /*
-      Skeleton opacity is a multiplier, not a replacement.
-
-      Example:
-        marker base opacity = 0.70
-        skeletonOpacity     = 0.25
-        final marker opacity = 0.70 * 0.25 = 0.175
-
-      This preserves special cases such as the body-root line, which has a very
-      low base opacity, while still letting the whole guide layer fade together.
-    */
-    object.userData.debugBaseOpacity = baseOpacity;
-
-    const materials = Array.isArray(object.material)
-      ? object.material
-      : object.material
-        ? [object.material]
-        : [];
-
-    materials.forEach((material) => {
-      material.transparent = true;
-      material.opacity = baseOpacity * skeletonOpacity;
-      material.needsUpdate = true;
-    });
-  };
-  const markerMaterial = new THREE.MeshBasicMaterial({
-    color,
-    wireframe: true,
-    transparent: true,
-    opacity: 0.7,
-    depthTest: false,
-  });
-  const lineMaterial = new THREE.LineBasicMaterial({
-    color,
-    transparent: true,
-    opacity: 0.65,
-
-    depthTest: false,
-  });
-
-  Object.entries(skeleton.joints).forEach(([jointKey, joint]) => {
-    const jointMarkerMaterial = markerMaterial.clone();
-    const marker = new THREE.Mesh(
-      new THREE.SphereGeometry(markerRadius, 12, 8),
-      jointMarkerMaterial,
-    );
-    marker.name = `${joint.name}-debug-marker`;
-    marker.renderOrder = 20;
-    marker.userData.jointKey = jointKey;
-    marker.userData.isJointEditHandle = MOUSE_EDIT_JOINTS.includes(jointKey);
-    applyObjectOpacity(marker, 0.7);
-
-    if (joint.name === "head") {
-      headMarker = marker;
-      marker.scale
-        .copy(HEAD_MARKER_BASE_SCALE)
-        .multiplyScalar(initialHeadMarkerSize);
-    }
-
-    joint.add(marker);
-    objects.push(marker);
-    selectableMarkers.push(marker);
-
-    const label = makeLabelSprite(joint.name, { color, scale: labelScale });
-    label.name = `${joint.name}-debug-label`;
-    label.position.set(0, markerRadius * 2.6, 0);
-    label.renderOrder = 21;
-    applyObjectOpacity(label, 1);
-    joint.add(label);
-    labels.push(label);
-    objects.push(label);
-
-    joint.children.forEach((child) => {
-      if (!child.userData.isPuppetJoint) {
-        // Ignore non-joint children such as debug markers, labels, meshes, or
-        // colliders. Only actual puppet joints get bone guide lines.
-        return;
-      }
-
-      const geometry = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(0, 0, 0),
-        child.position.clone(),
-      ]);
-      const line = new THREE.Line(geometry, lineMaterial);
-      line.name = `${joint.name}-to-${child.name}-debug-bone`;
-      line.renderOrder = 19;
-      applyObjectOpacity(line, 0.65);
-
-      if (joint.name === "body-root" && child.name === "pelvis") {
-        // The body-root-to-pelvis line is visually useful but can become a
-        // bright vertical distraction, so it is made almost transparent.
-        line.material = line.material.clone();
-        applyObjectOpacity(line, 0.05);
-      }
-
-      joint.add(line);
-      boneLines.push({ line, child });
-      objects.push(line);
-    });
-  });
-
-  return {
-    selectableMarkers,
-    setVisible(visible) {
-      objects.forEach((object) => {
-        object.visible = visible;
-      });
-    },
-    setLabelsVisible(visible) {
-      labels.forEach((label) => {
-        label.visible = visible;
-      });
-    },
-    setLabelScale(scale) {
-      labels.forEach((label) => {
-        label.scale.set(0.34 * scale, 0.085 * scale, 1);
-      });
-    },
-    setHeadMarkerSize(size) {
-      if (!headMarker) {
-        return;
-      }
-
-      const safeSize = THREE.MathUtils.clamp(
-        Number.isFinite(size) ? size : 1,
-        HEAD_MARKER_SIZE_RANGE.min,
-        HEAD_MARKER_SIZE_RANGE.max,
-      );
-      headMarker.scale.copy(HEAD_MARKER_BASE_SCALE).multiplyScalar(safeSize);
-    },
-    setOpacity(opacity) {
-      skeletonOpacity = THREE.MathUtils.clamp(opacity, 0, 1);
-      objects.forEach((object) => applyObjectOpacity(object));
-    },
-    setSelectedJoint(jointKey) {
-      /*
-        Gives the currently selected mouse-edit joint a warm highlight.
-
-        This changes only the debug marker material. It does not affect the
-        actual joint, skeleton, imported mesh, or saved rig data.
-      */
-      selectableMarkers.forEach((marker) => {
-        if (!marker.userData.isJointEditHandle) {
-          marker.material.color.set(color);
-          applyObjectOpacity(marker, 0.3);
-          return;
-        }
-
-        const selected = marker.userData.jointKey === jointKey;
-        marker.material.color.set(selected ? "#ffec99" : color);
-        applyObjectOpacity(marker, selected ? 1 : 0.7);
-      });
-    },
-    refreshBones() {
-      /*
-        Re-syncs every visible debug bone line to the live child joint position.
-
-        Important detail:
-          The marker sphere is a child of the joint, so it follows automatically.
-          The bone guide line is different: it is a BufferGeometry attached to
-          the parent joint, and its second vertex stores a COPY of child.position.
-
-        Formula:
-          line vertex 0 = parent local origin = (0, 0, 0)
-          line vertex 1 = child local position = child.position
-
-        That means any system that changes joint.position after the line is
-        created must call refreshBones(). Pivot sliders call it immediately.
-        The live walk cycle must also call it every frame, because knee/ankle/
-        foot positions are animated for readability. Without this, the marker
-        moves correctly but the line endpoint appears to detach and dance near
-        the joint.
-      */
-      boneLines.forEach(({ line, child }) => {
-        const positionAttribute = line.geometry.attributes.position;
-        positionAttribute.setXYZ(
-          1,
-          child.position.x,
-          child.position.y,
-          child.position.z,
-        );
-        positionAttribute.needsUpdate = true;
-        line.geometry.computeBoundingSphere();
-      });
-    },
-  };
 }
 
 function applyWorldDebugVisibility() {
@@ -3754,6 +3280,7 @@ function makeG53RiggingSnapshot() {
       walkPhase: controlState.walkPhase,
       isWalking: Boolean(controlState.isWalking),
       isRunning: Boolean(controlState.isRunning),
+      runBlendWeight: controlState.runBlendWeight,
       cameraYaw: controlState.cameraYaw,
       cameraDistance: controlState.cameraDistance,
       cameraHeight: controlState.cameraHeight,
@@ -3798,9 +3325,19 @@ function restoreG53RiggingSnapshot(saved) {
   controlState.keys.clear();
   controlState.position.copy(saved.control.position);
   controlState.yaw = saved.control.yaw;
+  resetTurnVelocityState();
   controlState.walkPhase = saved.control.walkPhase;
   controlState.isWalking = saved.control.isWalking;
   controlState.isRunning = Boolean(saved.control.isRunning);
+  controlState.runBlendWeight = THREE.MathUtils.clamp(
+    Number.isFinite(saved.control.runBlendWeight)
+      ? saved.control.runBlendWeight
+      : controlState.isRunning
+        ? 1
+        : 0,
+    0,
+    1,
+  );
   controlState.cameraYaw = saved.control.cameraYaw;
   controlState.cameraDistance = saved.control.cameraDistance;
   controlState.cameraHeight = saved.control.cameraHeight;
@@ -3857,6 +3394,8 @@ function enterG53RiggingMode() {
     controlState.walkPhase = 0;
     controlState.isWalking = false;
     controlState.isRunning = false;
+    controlState.runBlendWeight = 0;
+    resetTurnVelocityState();
     controlState.waveUntil = 0;
     controlState.wasWaving = false;
     controlState.leftArm = "down";
@@ -4266,6 +3805,8 @@ function setRiggingWizardTestIdle() {
   controlState.keys.clear();
   controlState.isWalking = false;
   controlState.isRunning = false;
+  controlState.runBlendWeight = 0;
+  resetTurnVelocityState();
   applyRelaxedVisiblePose();
   updateGuiDisplays();
   setRiggingWizardStep("test", "Idle test active.");
@@ -5560,14 +5101,37 @@ function updateKeyboardMotion(delta, currentTime) {
     !machineHomeActive &&
     moveInput > 0 &&
     (keys.has("ShiftLeft") || keys.has("ShiftRight"));
-  const movementSpeed = wantsRun
-    ? SOLO_TWEAKS.player.runSpeed
-    : SOLO_TWEAKS.player.moveSpeed;
-  const phaseSpeed = wantsRun
-    ? SOLO_TWEAKS.player.runPhaseSpeed
-    : SOLO_TWEAKS.player.walkPhaseSpeed;
+  const runBlendTarget = wantsRun ? 1 : 0;
+  const runBlendDamping =
+    runBlendTarget > controlState.runBlendWeight
+      ? SOLO_TWEAKS.player.runBlendRiseDamping
+      : SOLO_TWEAKS.player.runBlendFallDamping;
+  const runBlendT =
+    1 - Math.pow(0.001, (delta * Math.max(0.001, runBlendDamping)) / 8);
+
+  controlState.runBlendWeight = THREE.MathUtils.lerp(
+    controlState.runBlendWeight,
+    runBlendTarget,
+    runBlendT,
+  );
+
+  const runBlendWeight = THREE.MathUtils.clamp(controlState.runBlendWeight, 0, 1);
+  const movementSpeed = THREE.MathUtils.lerp(
+    SOLO_TWEAKS.player.moveSpeed,
+    SOLO_TWEAKS.player.runSpeed,
+    runBlendWeight,
+  );
+  const phaseSpeed = THREE.MathUtils.lerp(
+    SOLO_TWEAKS.player.walkPhaseSpeed,
+    SOLO_TWEAKS.player.runPhaseSpeed,
+    runBlendWeight,
+  );
+  const attemptedDistance = Math.abs(moveInput) * delta * movementSpeed;
+  const animationMoveThreshold = Math.max(0.002, attemptedDistance * 0.08);
+  let acceptedDistance = 0;
 
   controlState.yaw += turnInput * delta * 2.2;
+  controlState.actualMoveSpeed = 0;
   controlState.cameraYaw +=
     orbitInput * delta * SOLO_TWEAKS.camera.keyboardOrbitSpeed;
 
@@ -5615,18 +5179,29 @@ function updateKeyboardMotion(delta, currentTime) {
       0,
       Math.cos(controlState.yaw),
     );
-    controlState.position.copy(
-      moveRigWithCollision(
-        controlState.position,
-        direction,
-        moveInput * delta * movementSpeed,
-        {
-          radius: rigTuning.colliderRadius + rigCollisionMargin,
-          rootOffsetX: rigTuning.rootOffsetX,
-          rootOffsetZ: rigTuning.rootOffsetZ,
-        },
-      ),
+    const before = controlState.position.clone();
+    const resolved = moveRigWithCollision(
+      controlState.position,
+      direction,
+      moveInput * delta * movementSpeed,
+      {
+        radius: rigTuning.colliderRadius + rigCollisionMargin,
+        rootOffsetX: rigTuning.rootOffsetX,
+        rootOffsetZ: rigTuning.rootOffsetZ,
+      },
     );
+    const terrainHeight = getControlTerrainHeight(
+      resolved,
+      controlState.groundY,
+    );
+    const stepUp =
+      terrainHeight === null ? 0 : terrainHeight - controlState.groundY;
+
+    if (terrainHeight === null || stepUp <= SOLO_TWEAKS.player.maxStepUp) {
+      controlState.position.copy(resolved);
+      acceptedDistance = controlState.position.distanceTo(before);
+    }
+
     /*
       phaseSpeed is the animation equivalent of spindle RPM:
         walking uses walkPhaseSpeed
@@ -5635,11 +5210,20 @@ function updateKeyboardMotion(delta, currentTime) {
       Keeping movementSpeed and phaseSpeed paired is what prevents the feet
       from looking like they are sliding independently of body travel.
     */
-    controlState.walkPhase += delta * phaseSpeed;
+    if (acceptedDistance > animationMoveThreshold) {
+      const phaseScale =
+        attemptedDistance > 0
+          ? THREE.MathUtils.clamp(acceptedDistance / attemptedDistance, 0, 1)
+          : 0;
+      controlState.walkPhase += delta * phaseSpeed * phaseScale;
+    }
   }
 
-  controlState.isWalking = Math.abs(moveInput) > 0;
-  controlState.isRunning = controlState.isWalking && wantsRun;
+  controlState.isWalking = acceptedDistance > animationMoveThreshold;
+  controlState.isRunning = controlState.isWalking && runBlendWeight > 0.5;
+  controlState.actualMoveSpeed = controlState.isWalking
+    ? acceptedDistance / Math.max(delta, 0.0001)
+    : 0;
   if (machineHomeActive) {
     /*
       G53 rigging mode keeps the rig at machine home. Camera controls above
@@ -5648,12 +5232,88 @@ function updateKeyboardMotion(delta, currentTime) {
     controlState.position.copy(G53_RIGGING_HOME.position);
     controlState.yaw = G53_RIGGING_HOME.yaw;
     controlState.isRunning = false;
+    controlState.runBlendWeight = 0;
+    resetTurnVelocityState();
+  } else {
+    updateTurnVelocity(delta);
   }
   state.skeleton.root.rotation.y = controlState.yaw;
 
   if (currentTime > controlState.waveUntil && controlState.wasWaving) {
     controlState.wasWaving = false;
   }
+}
+
+function updateTurnVelocity(delta) {
+  /*
+    Tracks yaw rate as an animation signal.
+
+    Keyboard and mouse-look both write controlState.yaw, sometimes between
+    animation frames. Sampling the wrapped yaw delta here turns all of those
+    inputs into one smoothed angular velocity for body anticipation/banking.
+  */
+  if (delta <= 0) {
+    controlState.turnVelocitySampleYaw = controlState.yaw;
+    return;
+  }
+
+  const yawDelta = wrapAngleDelta(
+    controlState.yaw - controlState.turnVelocitySampleYaw,
+  );
+  const rawTurnVelocity = yawDelta / Math.max(delta, 0.0001);
+  const targetTurnVelocity = THREE.MathUtils.clamp(
+    rawTurnVelocity,
+    -SOLO_TWEAKS.player.maxTurnVelocity,
+    SOLO_TWEAKS.player.maxTurnVelocity,
+  );
+  const t =
+    1 -
+    Math.pow(
+      0.001,
+      (delta * Math.max(0.001, SOLO_TWEAKS.player.turnVelocityDamping)) / 8,
+    );
+
+  controlState.turnVelocity = THREE.MathUtils.lerp(
+    controlState.turnVelocity,
+    targetTurnVelocity,
+    t,
+  );
+  controlState.turnVelocitySampleYaw = controlState.yaw;
+}
+
+function resetTurnVelocityState() {
+  controlState.turnVelocity = 0;
+  controlState.turnVelocitySampleYaw = controlState.yaw;
+}
+
+function wrapAngleDelta(angle) {
+  return Math.atan2(Math.sin(angle), Math.cos(angle));
+}
+
+function getPlayerTurnPoseState(speed = controlState.actualMoveSpeed) {
+  const maxTurnVelocity = Math.max(0.001, SOLO_TWEAKS.player.maxTurnVelocity);
+  const turnSignal = THREE.MathUtils.clamp(
+    controlState.turnVelocity / maxTurnVelocity,
+    -1,
+    1,
+  );
+  const speedWeight = THREE.MathUtils.clamp(
+    speed / Math.max(0.001, SOLO_TWEAKS.player.runSpeed),
+    0,
+    1,
+  );
+  const bankWeight =
+    speedWeight *
+    THREE.MathUtils.lerp(0.12, 1, controlState.runBlendWeight || 0);
+  const bankRoll = -turnSignal * SOLO_TWEAKS.player.turnBankRoll * bankWeight;
+
+  return {
+    headYaw: turnSignal * SOLO_TWEAKS.player.turnHeadYaw,
+    neckYaw: turnSignal * SOLO_TWEAKS.player.turnNeckYaw,
+    chestYaw: turnSignal * SOLO_TWEAKS.player.turnChestYaw,
+    bodyRoll: bankRoll * 0.65,
+    pelvisRoll: bankRoll,
+  };
 }
 
 function updateSkeleton(delta, elapsed, currentTime) {
@@ -5673,7 +5333,7 @@ function updateSkeleton(delta, elapsed, currentTime) {
     return;
   }
 
-  syncSkeletonRoot();
+  syncSkeletonRoot(delta);
 
   if (state.g53RiggingMode.active) {
     freezeG53RiggingPose();
@@ -5685,10 +5345,7 @@ function updateSkeleton(delta, elapsed, currentTime) {
   }
 
   if (rigTuning.walkPreview || controlState.isWalking) {
-    updateWalkMotion(delta, elapsed, {
-      phase: controlState.isWalking ? controlState.walkPhase : undefined,
-      mode: controlState.isRunning ? "run" : "walk",
-    });
+    updateQuaternionLocomotion(delta, elapsed);
   } else {
     relaxLegs(delta);
   }
@@ -5753,6 +5410,8 @@ function freezeG53RiggingPose() {
   */
   controlState.isWalking = false;
   controlState.isRunning = false;
+  controlState.runBlendWeight = 0;
+  resetTurnVelocityState();
   controlState.waveUntil = 0;
   controlState.wasWaving = false;
   controlState.swordSwingStart = 0;
@@ -5773,7 +5432,7 @@ function freezeG53RiggingPose() {
   state.debugView?.refreshBones?.();
 }
 
-function syncSkeletonRoot() {
+function syncSkeletonRoot(delta = 0) {
   /*
     Converts player control position into actual skeleton root position.
 
@@ -5787,11 +5446,56 @@ function syncSkeletonRoot() {
       rootOffsetZ: rigTuning.rootOffsetZ,
     }),
   );
+  updateControlGroundY(delta);
   state.skeleton.root.position.copy(controlState.position);
   state.skeleton.root.position.x += rigTuning.rootOffsetX;
   state.skeleton.root.position.y +=
-    rigTuning.rootOffsetY + controlState.jump.offsetY;
+    rigTuning.rootOffsetY + controlState.groundY + controlState.jump.offsetY;
   state.skeleton.root.position.z += rigTuning.rootOffsetZ;
+}
+
+function updateControlGroundY(delta = 0) {
+  const terrainHeight = getControlTerrainHeight(
+    controlState.position,
+    controlState.groundY,
+  );
+
+  if (terrainHeight === null) {
+    return;
+  }
+
+  if (terrainHeight >= controlState.groundY || delta <= 0) {
+    controlState.groundY = terrainHeight;
+    return;
+  }
+
+  controlState.groundY = Math.max(
+    terrainHeight,
+    controlState.groundY - SOLO_TWEAKS.player.terrainDropSpeed * delta,
+  );
+}
+
+function getControlTerrainHeight(position, referenceY = 0) {
+  return getTerrainHeightAtWorldXZ(
+    position.x + rigTuning.rootOffsetX,
+    position.z + rigTuning.rootOffsetZ,
+    referenceY,
+  );
+}
+
+function getTerrainHeightAtWorldXZ(x, z, referenceY = 0) {
+  if (!worldTerrain.meshes.length) {
+    return null;
+  }
+
+  terrainRaycaster.set(
+    new THREE.Vector3(x, referenceY + 10, z),
+    terrainRayDown,
+  );
+  const hits = terrainRaycaster.intersectObjects(worldTerrain.meshes, true);
+  const walkableHit = hits.find(isWalkableTerrainHit);
+
+  return walkableHit ? walkableHit.point.y : null;
 }
 function dampJointRotation(
   joint,
@@ -5913,10 +5617,16 @@ function updateIdleMotion(delta, elapsed) {
     This wrapper preserves the player call site. Per-entity NPCs/enemies use
     updateIdleMotionTo directly with their own (skeleton, tuning).
   */
-  updateIdleMotionTo(state.skeleton, rigTuning, delta, elapsed);
+  updateIdleMotionTo(
+    state.skeleton,
+    rigTuning,
+    delta,
+    elapsed,
+    getPlayerTurnPoseState(0),
+  );
 }
 
-function updateIdleMotionTo(skeleton, tuning, delta, elapsed) {
+function updateIdleMotionTo(skeleton, tuning, delta, elapsed, turnPose = null) {
   /*
     Parameterized version of updateIdleMotion used by the entity layer.
     Same math, but operates on the given skeleton + tuning so each spawned
@@ -5948,6 +5658,9 @@ function updateIdleMotionTo(skeleton, tuning, delta, elapsed) {
   const torsoSway = Math.sin(time * 0.72 + 0.25) * tuning.torsoSwayAmplitude;
   const delayedTorso =
     Math.sin(time * 0.72 - 0.48) * tuning.torsoSwayAmplitude * 0.55;
+  const turnChestYaw = turnPose?.chestYaw ?? 0;
+  const turnNeckYaw = turnPose?.neckYaw ?? 0;
+  const turnHeadYaw = turnPose?.headYaw ?? 0;
 
   joints.spineBase.scale.set(
     1 + breathing * 0.55,
@@ -5971,19 +5684,23 @@ function updateIdleMotionTo(skeleton, tuning, delta, elapsed) {
   );
   dampJointRotation(
     joints.chest,
-    new THREE.Euler(breathing * 0.45, headLead * 0.16, torsoSway),
+    new THREE.Euler(breathing * 0.45, headLead * 0.16 + turnChestYaw, torsoSway),
     delta,
     tuning.damping,
   );
   dampJointRotation(
     joints.neck,
-    new THREE.Euler(headNod * 0.45, headLead * 0.38, -torsoSway * 0.62),
+    new THREE.Euler(
+      headNod * 0.45,
+      headLead * 0.38 + turnNeckYaw,
+      -torsoSway * 0.62,
+    ),
     delta,
     tuning.damping * 0.92,
   );
   dampJointRotation(
     joints.head,
-    new THREE.Euler(headNod, headLead, -torsoSway * 0.32),
+    new THREE.Euler(headNod, headLead + turnHeadYaw, -torsoSway * 0.32),
     delta,
     tuning.damping * 0.82,
   );
@@ -6449,6 +6166,54 @@ function getPelvisWalkValues(phase, options) {
 
 function getPelvisRunValues(phase, options) {
   return getPhysicsPelvisRunValues(phase, options);
+}
+
+function updateQuaternionLocomotion(delta, elapsed) {
+  const isPreview = rigTuning.walkPreview && !controlState.isWalking;
+  let phase = controlState.walkPhase;
+  let speed = controlState.actualMoveSpeed;
+  let isRunning = controlState.isRunning;
+  let runBlendWeight = controlState.runBlendWeight;
+
+  if (isPreview) {
+    state.walkPhase +=
+      delta * SOLO_TWEAKS.player.walkPhaseSpeed * rigTuning.motionSpeed;
+    phase = state.walkPhase;
+    speed = SOLO_TWEAKS.player.moveSpeed;
+    isRunning = false;
+    runBlendWeight = 0;
+  }
+
+  const turnPose = isPreview ? null : getPlayerTurnPoseState(speed);
+
+  updateLocomotion(
+    state.skeleton,
+    {
+      elapsed,
+      phase,
+      speed,
+      maxSpeed: SOLO_TWEAKS.player.runSpeed,
+      isWalking: controlState.isWalking || isPreview,
+      walkPreview: isPreview,
+      isRunning,
+      runBlendWeight,
+      turnPose,
+      walkFrequency: 1.5,
+      runFrequency: 2.5,
+      walkStrideLength: 0.8,
+      runStrideLength: 2.0,
+      walkBounce: 0.05,
+      runBounce: 0.15,
+      relaxDamping: rigTuning.damping,
+      idleMotion: false,
+      applyArmPose: false,
+      walkArmSwing: ensureWalkArmSwingState(),
+      groundY: controlState.groundY,
+      maxFootStepUp: SOLO_TWEAKS.player.maxStepUp,
+    },
+    worldTerrain.meshes,
+    delta,
+  );
 }
 
 function updateWalkMotion(delta, elapsed, options = {}) {
@@ -7026,6 +6791,12 @@ function relaxLegs(delta) {
     delta,
     rigTuning.damping * 0.62,
   );
+  dampJointRotation(
+    joints.body,
+    new THREE.Euler(0, 0, 0),
+    delta,
+    rigTuning.damping * 0.9,
+  );
 
   ["left", "right"].forEach((sideName) => {
     ["Hip", "Knee", "Ankle", "Foot"].forEach((jointName) => {
@@ -7595,6 +7366,10 @@ function getControlledArmPoseTargets(sideName, side, pose, currentTime) {
     the walk preview or active movement is running. It is zero otherwise.
   */
   const walkSwing = state.walkArmSwing?.[sideName] ?? 0;
+  const runBlendWeight =
+    pose === "down"
+      ? THREE.MathUtils.clamp(controlState.runBlendWeight || 0, 0, 1)
+      : 0;
 
   /*
     Default "down" pose: arm hangs with a slow independent trail oscillation.
@@ -7608,7 +7383,7 @@ function getControlledArmPoseTargets(sideName, side, pose, currentTime) {
   let wrist = new THREE.Euler(handFloat * 0.08, 0, -side * handFloat * 0.26);
   let palm = new THREE.Euler(0, 0, side * 0.04);
 
-  if (pose === "down" && controlState.isRunning) {
+  if (runBlendWeight > 0.001) {
     /*
       Running "down" arm pose:
         The arm is still in the default controllable pose, but the shape changes
@@ -7636,23 +7411,33 @@ function getControlledArmPoseTargets(sideName, side, pose, currentTime) {
     const pumpScale = Math.max(0.001, rigTuning.runArmPump);
     const forwardPump = physicsClamp01(-walkSwing / pumpScale);
     const inwardTwist = forwardPump * 0.14;
-
-    shoulder = new THREE.Euler(
+    const runShoulder = new THREE.Euler(
       trail * 0.04 + walkSwing,
       -side * inwardTwist * 0.35,
       side * (0.34 + forwardPump * 0.08),
     );
-    elbow = new THREE.Euler(
+    const runElbow = new THREE.Euler(
       Math.PI * 0.5 + forwardPump * 0.34,
       0,
       side * (0.18 + forwardPump * 0.08),
     );
-    wrist = new THREE.Euler(
+    const runWrist = new THREE.Euler(
       handFloat * 0.025 + forwardPump * 0.06,
       side * inwardTwist,
       -side * (0.11 + inwardTwist),
     );
-    palm = new THREE.Euler(0.02, side * inwardTwist * 0.55, side * 0.08);
+    const runPalm = new THREE.Euler(0.02, side * inwardTwist * 0.55, side * 0.08);
+    const blendEuler = (from, to) =>
+      new THREE.Euler(
+        THREE.MathUtils.lerp(from.x, to.x, runBlendWeight),
+        THREE.MathUtils.lerp(from.y, to.y, runBlendWeight),
+        THREE.MathUtils.lerp(from.z, to.z, runBlendWeight),
+      );
+
+    shoulder = blendEuler(shoulder, runShoulder);
+    elbow = blendEuler(elbow, runElbow);
+    wrist = blendEuler(wrist, runWrist);
+    palm = blendEuler(palm, runPalm);
   } else if (pose === "up") {
     shoulder = new THREE.Euler(-0.2, 0, side * 2.2);
     elbow = new THREE.Euler(0.16, 0, side * 0.22);
@@ -8836,6 +8621,7 @@ function handleWindowBlur() {
       so the next session starts clean.
   */
   controlState.keys.clear();
+  resetTurnVelocityState();
   if (controlState.mouseLookActive) {
     controlState.mouseLookActive = false;
     if (document.pointerLockElement === sceneContainer) {
@@ -8945,8 +8731,7 @@ function handleKeyDown(event) {
       X     = toggle right arm high
       H     = toggle both hands half high
       G     = transition toward the opposite day/night target
-      Space = wave
-      J     = jump
+      Space = jump
       1     = equip sword and enter combat stance
       2     = despawn sword and return arms to idle
       Enter = sword swing / combat hit attempt   (backup; LMB also works)
@@ -9006,9 +8791,6 @@ function handleKeyDown(event) {
   } else if (event.code === "KeyG") {
     toggleMoonSystem();
   } else if (event.code === "Space") {
-    controlState.waveUntil = performance.now() + 1200;
-    controlState.wasWaving = true;
-  } else if (event.code === "KeyJ") {
     startJump();
   } else if (event.code === "Digit1") {
     equipSword();

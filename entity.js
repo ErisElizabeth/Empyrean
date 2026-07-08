@@ -281,6 +281,8 @@ function createDefaultEntityState(position, yaw) {
     walkPhase: 0,
     isWalking: false,
     isRunning: false,
+    runBlendWeight: 0,
+    turnVelocity: 0,
     leftArm: "down",
     rightArm: "down",
     weaponEquipped: false,

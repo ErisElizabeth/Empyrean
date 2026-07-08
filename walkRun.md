@@ -1,0 +1,7 @@
+Working in "C:\Users\S. Jones\Desktop\Empyrean"
+Because isRunning is an instant toggle, the phase calculation jumps discontinuously. When updateLocomotion suddenly stops looking at getLegStrideValues and starts looking at getRunStrideValues, the target quaternions generated for the hips, knees, and ankles experience a massive gap. dampJointRotation tries its best to smooth it via slerp over a few frames, but it's trying to bridge a canyon. It looks like my character just got dropkicked into a sprint.
+
+Introduce a runBlendWeight variable (from 0.0 to 1.0) into controlState. Instead of an instant boolean check, use THREE.MathUtils.lerp or existing damping logic in updateKeyboardMotion to ease runBlendWeight up to 1.0 when Shift is held, and bleed it down to 0.0 when released.
+Then, in updateLocomotion, fetch both getLegStrideValues(phase) and getRunStrideValues(phase) every frame while the blend is active. Lerp their pure data outputs (like footZ, footLift, pushOff) using runBlendWeight before you calculate the IK and convert them into target quaternions. Keep applying these resulting blended deltas directly onto bindLocalQuaternion so the rig naturally drops back to the relaxed bind pose when the movement inputs stop.
+
+Please update relevant files versions and cache busters, update README.md with new version and description of changes and EMPYREAN_SYSTEM_MAP.md should also reflect the changes.

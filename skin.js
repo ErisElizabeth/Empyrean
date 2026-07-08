@@ -22,7 +22,7 @@
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { disposeObjectTree } from "./world.js?v=0.1.109-alpha";
+import { disposeObjectTree } from "./world.js?v=0.2.1-alpha";
 
 export const DEFAULT_IMPORTED_MESH_PATH = "assets/Sigewynn.glb";
 

@@ -4,7 +4,7 @@ A game extracted from a clean skeleton workshop, which in turn was extracted fro
 
 ## Version
 
-- Empyrean build: `0.2.1-alpha`
+- Empyrean build: `0.2.14-alpha`
 - Three.js: `0.164.1`
 - lil-gui: `0.19`
 
@@ -22,7 +22,8 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - per-joint X/Y/Z point offsets
 - per-joint bind-pose rotation controls
 - idle and walk preview motion
-- Shift+W running cycle with flight, lean, hip/shoulder counter-twist, and bent-elbow arm pump
+- Shift+W running cycle with blended walk-to-run acceleration, flight, lean, hip/shoulder counter-twist, and bent-elbow arm pump
+- smoothed turn anticipation with head/neck/chest look-in and movement-scaled banking
 - jump physics and crouch/landing pose response
 - simple rig footprint collision against the room walls
 - GLB import with generated skin weights for the Empyrean puppet skeleton
@@ -77,6 +78,7 @@ This project began as a clean skeleton workshop and is now becoming the explorat
 - world-owned sky moon setup in `world.js`
 - real-world lunar-phase presentation with continuous Three.js shadow geometry, restrained earthshine, phase-aware atmospheric flare, and automatic northern/southern orientation
 - EMPYREAN stone-engraved title card with animated gradient and delayed reveal
+- quaternion locomotion integration complete in `movementEngine.js`; run-cycle work is now in tuning/refinement
 
 ---
 
@@ -253,6 +255,7 @@ Development console helpers:
 | Physical d20 look, roll timing, face numbers, result-facing quaternion math | `oracleD20.js`                                                                |
 | Oracle-roll HUD screen geometry, color, border, radius, fade timing         | `#oracle-roll-hud` in `styles.css`; timing in `combat_updated.js`             |
 | Neutral anatomical facing correction                                        | `RIG_BASE_BODY_YAW` near the top of `main.js`                                 |
+| Quaternion locomotion and terrain foot placement                            | `movementEngine.js`                                                           |
 | Complete rig package shape or local rig-library behavior                    | `puppetShop.js`                                                               |
 | Spawned NPC/enemy entity wrappers and entity update scaffold                | `entity.js`                                                                   |
 | Entity controller interface and keyboard/static controller stubs            | `entityControllers.js`                                                        |
@@ -263,7 +266,8 @@ Development console helpers:
 | Enemy combat prototype                                                      | `combat_updated.js`                                                           |
 | Jump feel (gravity, height, duration)                                       | `rigTuning` values in the GUI, or `getJumpGravityValue` in `physics.js`       |
 | Walk cycle timing                                                           | `walkPhaseSpeed` in `SOLO_TWEAKS`, walk amplitude sliders in GUI              |
-| Run cycle timing/feel                                                       | `runSpeed` / `runPhaseSpeed` in `SOLO_TWEAKS`, run sliders in `Motion`        |
+| Run cycle timing/feel                                                       | `runSpeed`, `runPhaseSpeed`, and run blend damping in `SOLO_TWEAKS`; run sliders in `Motion` |
+| Turn anticipation/banking                                                   | `turnVelocityDamping`, `maxTurnVelocity`, and turn pose amplitudes in `SOLO_TWEAKS` |
 
 ---
 
@@ -333,6 +337,19 @@ alignment.
 
 ## Change Notes
 
+- `0.2.14-alpha`: Added smoothed turn-velocity tracking from wrapped `controlState.yaw` deltas so keyboard and mouse-look turns can drive pose anticipation without raw input spikes. Player idle and quaternion locomotion now layer head/neck/chest yaw into the turn and add speed/run-blend-scaled body/pelvis banking while leaving foot replanting unchanged. Cache busters and docs were updated.
+- `0.2.13-alpha`: Added `controlState.runBlendWeight` for a snappy athletic walk-to-run transition that only rises while forward Shift movement is active. `updateKeyboardMotion()` now blends movement speed and phase speed instead of instantly switching them, `movementEngine.js` blends walk/run bounce, yaw, arm swing, foot target, lift, and ankle/foot pitch before IK, and the visible down-arm pump blends from relaxed arms instead of switching on `isRunning`. Cache busters and docs were updated.
+- `0.2.12-alpha`: Added conservative ankle/foot pitch polish in `movementEngine.js` from existing walk/run gait phase values. The offsets are layered onto each ankle/foot `bindLocalQuaternion` and relax back to neutral through the existing bind-pose damping path. Walk/run foot target behavior from `0.2.9-alpha` through `0.2.11-alpha` is preserved. No rig hierarchy, IK rewrite, camera, collision, terrain baseline, jump, combat, or controlled-arm ownership changes were made.
+- `0.2.11-alpha`: Updated run IK target generation in `movementEngine.js` to consume existing `getRunStrideValues()` data for run foot Z, swing foot lift, and knee-drive target shaping. Walk `footZ` and walk swing foot lift behavior from `0.2.9-alpha` and `0.2.10-alpha` are preserved. No ankle pitch, rig hierarchy, camera, collision, terrain baseline, jump, or controlled-arm ownership changes were made.
+- `0.2.10-alpha`: Added walk-only swing foot lift in `movementEngine.js` by layering existing `getLegStrideValues().footLift` output onto the IK target after terrain floor placement. The terrain baseline, Operation 10 walk `footZ` target behavior, run gait, ankle pitch, rig hierarchy, camera, collision, jump, and controlled-arm ownership were not changed.
+- `0.2.9-alpha`: Updated walk foot Z target generation in `movementEngine.js` to consume existing `getLegStrideValues().footZ` gait curve data from `physics.js`, giving the walk cycle a walk-only stance/swing phase target instead of the previous raw cosine pendulum target. Run gait, foot lift, ankle pitch, rig hierarchy, terrain baseline, camera, collision, jump, and controlled-arm ownership were not changed.
+- `0.2.8-alpha`: Redistributed the default spine landmarks so `torsoY` is `DEFAULT_RIG_HEIGHT * 0.6121` (`2.7300`) and `chestY` is `DEFAULT_RIG_HEIGHT * 0.7287` (`3.2500`) for a smoother spine/lean distribution target. Total rig height remains `4.46`. No movement, physics, IK, collision, or controlled-arm ownership logic changed.
+- `0.2.7-alpha`: Corrected default arm proportions so `upperArmLength` is `DEFAULT_RIG_HEIGHT * 0.17` (`0.7582`) and `forearmLength` is `DEFAULT_RIG_HEIGHT * 0.148` (`0.6601`). The upper arm is now longer than the forearm while total rig height remains `4.46` and total arm reach is preserved. No movement, physics, IK, collision, or controlled-arm ownership logic changed.
+- `0.2.6-alpha`: Bumped app/cache versions after the quaternion locomotion pass. `movementEngine.js` is now the active locomotion integration point for bind-pose-aware quaternion body/leg motion and terrain foot placement, while Empyrean's controlled-arm layer remains the owner of visible arm poses. The current run cycle is functional and now in tuning/refinement, including bounce symmetry, lean sign, stop relaxation, and footfall feel.
+- `0.2.5-alpha`: Patched sign error that caused the backwards lean after walk/run cycles.
+- `0.2.4-alpha`: Integrated the sandbox quaternion locomotion engine with minimal Empyrean adaptation
+- `0.2.3-alpha`: Added walkable test terrain.
+- `0.2.2-alpha`: Removed arm wave motion from Spacebar, reassigned to jump cycle.
 - `0.2.1-alpha`: Removed the unused `treeLeafMaterial` and `treeTrunkMaterial` declarations left behind by the primitive Three.js tree implementation. Active tree placement remains unchanged: `buildLowPolyTrees()` still uses the same 16 hand-placed X/Z coordinates and collision circles while `createTreeProp()` fills those placeholders with alternating `tree.glb` and `deadTree.glb` clones. Landmark-scatter trees, GLB caching/normalization, G53 tree visibility, and all gameplay behavior are unchanged.
 - `0.2.0-alpha`: Completed lunar-phase Pass 7 by removing the visible moon group's fixed world-space position. `updateSkyMoonCameraAnchor()` now captures the authored startup offset as one normalized world-sky direction plus one fixed camera distance, then recalculates the moon position after every camera update with `moonPosition = cameraPosition + direction * distance`. Player movement can no longer approach the moon or enlarge its apparent diameter. The existing billboard quaternion update still keeps the texture camera-facing. The original `[0, 30, 149]` position is retained separately as the immutable directional/point moonlight anchor, so camera-relative visual motion cannot change gameplay lighting. Lunar math, phase uniforms, sky-cycle timing, `G`, G53, title startup, fog, ghost behavior, diagnostics, HUD/UI, and controls were not changed.
 - `0.1.126-alpha`: Completed lunar-phase Pass 6 validation without changing lunar math, phase rendering, sky timing, gameplay lighting, UI, diagnostics, or controls. The visible moon asset is now documented as the sky-owned, camera-facing `/assets/moon_2K.jpg` disc introduced by the preceding strict asset-replacement pass; `moon.glb` remains on disk but is not the visible surface. `verify.ps1` now requires the active moon texture, and the full syntax/lunar contract verification passes. Browser validation on 2026-06-20 resolved Waxing Crescent at 29% with northern fallback, loaded `moon_2K.jpg` without shader/WebGL failure, confirmed title completion starts the production sky clock at `0ms`, confirmed `G` reaches day and returns to night without recalculating lunar state, and confirmed G53 suppresses the world moon then resumes the sky cycle at the exact paused frame. Source inspection confirms the disc copies the active camera quaternion per render and the phase terminator remains view-space, preventing viewing-angle phase drift.
@@ -877,7 +894,7 @@ The run pass uses the math from `runCycle.md` but keeps the live joint edits ins
 | `shoulderTwistY` | `-sin(phase) * runShoulderTwist`                             | Opposite shoulder yaw for balance                    |
 | `armPump`        | `-sin(legPhase) * runArmPump`                                | Same-side arm swings opposite the same-side leg      |
 
-The pure formulas live in `physics.js` as `getRunStrideValues()` and `getPelvisRunValues()`. The live puppet application lives in `main.js` as `updateRunMotion()` and `updateLegRun()`. The bent-elbow pumping shape lives in `getControlledArmPoseTargets()` under the `pose === "down" && controlState.isRunning` branch.
+The older pure formulas still live in `physics.js` as `getRunStrideValues()` and `getPelvisRunValues()` for reference and GUI-era tuning context. The active player locomotion path now runs through `movementEngine.js` via `updateLocomotion()`, which layers quaternion body/leg motion onto `bindLocalQuaternion`, raycasts against walkable terrain for foot placement, consumes walk and run gait helper data for blended foot target generation, blends walk swing lift with run swing/knee-drive lift above that floor baseline before solving IK, blends small gait-phase ankle/foot pitch offsets onto the ankle/foot bind quaternions, and layers smoothed turn-pose offsets for head/neck/chest anticipation plus speed-scaled body/pelvis banking. The bent-elbow pumping shape still lives in `getControlledArmPoseTargets()` under the `pose === "down"` path, blended by `controlState.runBlendWeight`, because Empyrean's controlled-arm layer remains the owner of visible arm poses.
 
 Run tuning is in the `Motion` GUI folder:
 

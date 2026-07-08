@@ -535,6 +535,13 @@ const WORLD_TWEAKS = {
     wallDiffuse: "assets/stoneWallDiff.jpg",
     wallDisplacement: "assets/StoneWallDisp.png",
   },
+  testTerrainHill: {
+    center: [0, 40.0],
+    radius: 3.2,
+    height: 0.65,
+    radialSegments: 64,
+    rings: 18,
+  },
   legacyRoomVisuals: {
     /*
       Pass 7 cathedral cleanup.
@@ -2234,6 +2241,10 @@ export const worldCollision = {
   solidCircles: [],
 };
 
+export const worldTerrain = {
+  meshes: [],
+};
+
 // =============================================================
 // WORLD BUILDING
 // =============================================================
@@ -2263,6 +2274,7 @@ export function buildExplorationWorld() {
   */
   const group = new THREE.Group();
   group.name = "empyrean-four-room-exploration-world";
+  worldTerrain.meshes.length = 0;
 
   worldCollision.bounds = {
     centerX: outsideCenter.x,
@@ -2271,6 +2283,7 @@ export function buildExplorationWorld() {
   };
 
   group.add(createOutsideEnclosure());
+  group.add(createWalkableTerrainSurfaces());
   group.add(createChurchShell());
   addChurchShellProxyColliders();
   group.add(createCaveProp());
@@ -2304,6 +2317,13 @@ export function buildExplorationWorld() {
   buildLowPolyTrees(group);
   buildLandmarkScatter(group);
   return { group };
+}
+
+function registerWalkableTerrain(mesh, { minWalkableNormalY = 0.5 } = {}) {
+  mesh.userData.walkable = true;
+  mesh.userData.minWalkableNormalY = minWalkableNormalY;
+  worldTerrain.meshes.push(mesh);
+  return mesh;
 }
 
 function createCaveProp() {
@@ -2787,6 +2807,109 @@ function createRoom({ name, center, doors = {} }) {
   addRoomTorches(roomGroup);
 
   return roomGroup;
+}
+
+function createWalkableTerrainSurfaces() {
+  const group = new THREE.Group();
+  group.name = "walkable-terrain-surfaces";
+
+  const flatProxy = new THREE.Mesh(
+    new THREE.PlaneGeometry(outsideSize, outsideSize),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    }),
+  );
+
+  flatProxy.name = "walkable-flat-floor-proxy";
+  flatProxy.position.set(outsideCenter.x, 0, outsideCenter.z);
+  flatProxy.rotation.x = -Math.PI / 2;
+  registerWalkableTerrain(flatProxy, { minWalkableNormalY: 0.98 });
+  group.add(flatProxy);
+
+  group.add(createNearStartTestHill());
+  return group;
+}
+
+function createNearStartTestHill() {
+  const hillConfig = WORLD_TWEAKS.testTerrainHill;
+  const [x, z] = hillConfig.center;
+  const material = cloneRoomMaterial(
+    roomSurfaceMaterials.floor,
+    WORLD_TWEAKS.roomColors.floor,
+  );
+  const hill = new THREE.Mesh(
+    enableAmbientOcclusion(
+      createSmoothHillGeometry(
+        hillConfig.radius,
+        hillConfig.height,
+        hillConfig.radialSegments,
+        hillConfig.rings,
+      ),
+    ),
+    material,
+  );
+
+  hill.name = "near-start-smooth-walkable-test-hill";
+  hill.position.set(x, 0, z);
+  hill.receiveShadow = true;
+  hill.userData.g53VisibilityRole = "floor";
+  registerWalkableTerrain(hill, { minWalkableNormalY: 0.5 });
+  return hill;
+}
+
+function createSmoothHillGeometry(radius, height, radialSegments, rings) {
+  const segments = Math.max(12, Math.floor(radialSegments));
+  const ringCount = Math.max(4, Math.floor(rings));
+  const vertices = [0, height, 0];
+  const uvs = [0.5, 0.5];
+  const indices = [];
+
+  for (let ring = 1; ring <= ringCount; ring += 1) {
+    const ringRadius = (radius * ring) / ringCount;
+    const t = ring / ringCount;
+    const y = height * 0.5 * (1 + Math.cos(Math.PI * t));
+
+    for (let segment = 0; segment < segments; segment += 1) {
+      const angle = (segment / segments) * Math.PI * 2;
+      const x = Math.cos(angle) * ringRadius;
+      const z = Math.sin(angle) * ringRadius;
+
+      vertices.push(x, y, z);
+      uvs.push(0.5 + x / (radius * 2), 0.5 + z / (radius * 2));
+    }
+  }
+
+  const vertexIndex = (ring, segment) =>
+    1 + (ring - 1) * segments + ((segment + segments) % segments);
+
+  for (let segment = 0; segment < segments; segment += 1) {
+    indices.push(0, vertexIndex(1, segment + 1), vertexIndex(1, segment));
+  }
+
+  for (let ring = 1; ring < ringCount; ring += 1) {
+    for (let segment = 0; segment < segments; segment += 1) {
+      const inner = vertexIndex(ring, segment);
+      const innerNext = vertexIndex(ring, segment + 1);
+      const outer = vertexIndex(ring + 1, segment);
+      const outerNext = vertexIndex(ring + 1, segment + 1);
+
+      indices.push(inner, innerNext, outer);
+      indices.push(innerNext, outerNext, outer);
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(vertices, 3),
+  );
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
 }
 
 function addRoomTorches(roomGroup) {

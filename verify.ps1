@@ -7,8 +7,9 @@
 # What it checks:
 #   1. JavaScript syntax for main.js.
 #   2. JavaScript syntax for the helper modules main.js imports.
-#   3. PowerShell parse health for checkpoint.ps1.
-#   4. Important files exist.
+#   3. Deterministic lunar-phase contract behavior.
+#   4. PowerShell parse health for checkpoint.ps1.
+#   5. Important files exist.
 #
 # What it does not check:
 #   - It does not open the browser.
@@ -32,6 +33,9 @@ $RequiredFiles = @(
   "index.html",
   "main.js",
   "physics.js",
+  "moonPhase.js",
+  "moonPhase.test.mjs",
+  "assets/moon_2K.jpg",
   "rig.js",
   "puppetShop.js",
   "sword.js",
@@ -66,6 +70,8 @@ Write-Host ""
 Write-Host "Checking JavaScript syntax..."
 node --check main.js
 node --check physics.js
+node --check moonPhase.js
+node --check moonPhase.test.mjs
 node --check rig.js
 node --check puppetShop.js
 node --check sword.js
@@ -80,6 +86,11 @@ node --check entity.js
 node --check entityControllers.js
 node --check encounters.js
 Write-Host "  OK JavaScript syntax"
+
+Write-Host ""
+Write-Host "Checking lunar-phase data contract..."
+node moonPhase.test.mjs
+Write-Host "  OK lunar-phase data contract"
 
 Write-Host ""
 Write-Host "Checking checkpoint.ps1 parse health..."
