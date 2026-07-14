@@ -2,8 +2,8 @@ import * as THREE from "three";
 import {
   getLegStrideValues,
   getRunStrideValues,
-} from "./physics.js?v=0.2.14-alpha";
-import { isWalkableTerrainHit } from "./terrain.js?v=0.2.14-alpha";
+} from "./physics.js?v=0.2.25-alpha";
+import { isWalkableTerrainHit } from "./terrain.js?v=0.2.25-alpha";
 
 const ZERO_TURN_POSE = Object.freeze({
   headYaw: 0,
@@ -16,6 +16,23 @@ const ZERO_TURN_POSE = Object.freeze({
 export function updateLocomotion(rig, state, terrainMeshes, deltaTime) {
   const speed = state.speed || 0;
   const isWalking = Boolean(state.isWalking || state.walkPreview || speed > 0);
+  const turnBlendWeight = isWalking
+    ? 0
+    : THREE.MathUtils.clamp(
+        state.turnBlendWeight ?? (state.isTurningInPlace ? 1 : 0),
+        0,
+        1,
+      );
+  const turnIntensity = isWalking
+    ? 0
+    : THREE.MathUtils.clamp(
+        state.turnIntensity ?? (state.isTurningInPlace ? 1 : 0),
+        0,
+        1,
+      );
+  const turnMotionWeight = turnBlendWeight * turnIntensity;
+  const isTurningInPlace = Boolean(turnBlendWeight > 0.001 && !isWalking);
+  const turnDirection = Math.sign(state.turnVelocity || 0) || 1;
   const runBlendWeight = getRunBlendWeight(state);
   const turnPose = getTurnPose(state);
   const phase = Number.isFinite(state.phase) ? state.phase : getPhaseFromTime(state);
@@ -24,7 +41,7 @@ export function updateLocomotion(rig, state, terrainMeshes, deltaTime) {
   const f = THREE.MathUtils.lerp(fWalk, fRun, runBlendWeight);
   const vMax = state.maxSpeed || 10;
 
-  if (!isWalking) {
+  if (!isWalking && !isTurningInPlace) {
     relaxToBindPose(rig, deltaTime, state.relaxDamping || 10);
     if (state.idleMotion !== false) {
       updateIdleMotion(rig, state, deltaTime);
@@ -39,6 +56,7 @@ export function updateLocomotion(rig, state, terrainMeshes, deltaTime) {
 
   const walkBounce = state.walkBounce ?? 0.05;
   const runBounce = state.runBounce ?? 0.15;
+  const turnBounce = state.turnBounce ?? 0.025;
   const walkBounceY = walkBounce * Math.abs(Math.sin(phase * 0.5));
   let runBounceY = runBounce * Math.abs(Math.sin(phase));
   const cyclePhase = cycle01(phase);
@@ -58,7 +76,14 @@ export function updateLocomotion(rig, state, terrainMeshes, deltaTime) {
       launchVelocity * flightTime - 0.5 * gravity * flightTime * flightTime;
     runBounceY = Math.max(runBounceY, flightY);
   }
-  const yBounce = THREE.MathUtils.lerp(walkBounceY, runBounceY, runBlendWeight);
+  const walkRunBounceY = THREE.MathUtils.lerp(
+    walkBounceY,
+    runBounceY,
+    runBlendWeight,
+  );
+  const yBounce = isTurningInPlace
+    ? turnMotionWeight * turnBounce * Math.abs(Math.sin(phase))
+    : walkRunBounceY;
 
   const joints = rig.joints || {};
   const basePelvisY = joints.pelvis?.userData?.bindLocalPosition?.y ?? 0;
@@ -84,7 +109,11 @@ export function updateLocomotion(rig, state, terrainMeshes, deltaTime) {
     THREE.MathUtils.degToRad(10),
     runBlendWeight,
   );
-  const hipYaw = hipYawAmount * Math.sin(phase);
+  const turnPelvisYaw = state.turnPelvisYaw ?? 0.11;
+  const turnPelvisPulse = 0.45 + 0.55 * Math.abs(Math.sin(phase));
+  const hipYaw = isTurningInPlace
+    ? turnDirection * turnMotionWeight * turnPelvisYaw * turnPelvisPulse
+    : hipYawAmount * Math.sin(phase);
   const qHipYaw = new THREE.Quaternion().setFromAxisAngle(
     new THREE.Vector3(0, 1, 0),
     hipYaw,
@@ -109,13 +138,36 @@ export function updateLocomotion(rig, state, terrainMeshes, deltaTime) {
   setJointQuaternionFromBind(joints.chest, qChestYaw);
   applyTurnLookPose(joints, turnPose);
 
-  updateArmSwing(rig, state, "left", 0, phase, runBlendWeight);
-  updateArmSwing(rig, state, "right", Math.PI, phase, runBlendWeight);
+  if (isWalking) {
+    updateArmSwing(rig, state, "left", 0, phase, runBlendWeight);
+    updateArmSwing(rig, state, "right", Math.PI, phase, runBlendWeight);
+  } else if (state.walkArmSwing) {
+    state.walkArmSwing.left = 0;
+    state.walkArmSwing.right = 0;
+  }
 
   getRigRoot(rig)?.updateMatrixWorld(true);
 
-  solveLegIK(rig, state, terrainMeshes, "left", Math.PI, phase, runBlendWeight);
-  solveLegIK(rig, state, terrainMeshes, "right", 0, phase, runBlendWeight);
+  solveLegIK(
+    rig,
+    state,
+    terrainMeshes,
+    "left",
+    Math.PI,
+    phase,
+    runBlendWeight,
+    deltaTime,
+  );
+  solveLegIK(
+    rig,
+    state,
+    terrainMeshes,
+    "right",
+    0,
+    phase,
+    runBlendWeight,
+    deltaTime,
+  );
 
   updateJumpPose(rig, state, deltaTime);
 }
@@ -258,6 +310,7 @@ function solveLegIK(
   phaseOffset,
   phase,
   runBlendWeight,
+  deltaTime,
 ) {
   const joints = rig.joints || {};
   const hip = side === "left" ? joints.leftHip : joints.rightHip;
@@ -269,20 +322,35 @@ function solveLegIK(
     return;
   }
 
+  const isTurningInPlace = Boolean(state.isTurningInPlace);
+  const turnBlendWeight = isTurningInPlace
+    ? THREE.MathUtils.clamp(state.turnBlendWeight ?? 1, 0, 1)
+    : 0;
+  const turnIntensity = isTurningInPlace
+    ? THREE.MathUtils.clamp(state.turnIntensity ?? 1, 0, 1)
+    : 0;
+  const turnMotionWeight = turnBlendWeight * turnIntensity;
   const walkStrideLength = state.walkStrideLength ?? 0.8;
   const runStrideLength = state.runStrideLength ?? 2.0;
+  const turnStrideLength = state.turnStrideLength ?? 0.34;
+  const turnSideStep = state.turnSideStep ?? 0.12;
+  const turnDirection = Math.sign(state.turnVelocity || 0) || 1;
   const thighLen = rig.dimensions?.thighLength ?? 1;
   const shinLen = rig.dimensions?.shinLength ?? 1;
   const legPhase = phase + phaseOffset;
   const walkStride = getLegStrideValues(legPhase);
   const runStride = getRunStrideValues(legPhase);
+  const turnStride = getLegStrideValues(legPhase);
   const walkFootLocalZ = walkStride.footZ * walkStrideLength;
   const runFootLocalZ = runStride.footZ * runStrideLength * 0.5;
-  const footLocalZ = THREE.MathUtils.lerp(
-    walkFootLocalZ,
-    runFootLocalZ,
-    runBlendWeight,
-  );
+  const turnFootLocalZ =
+    turnStride.footZ * turnStrideLength * turnDirection * turnMotionWeight;
+  const turnFootLocalX =
+    turnStride.footZ * turnSideStep * turnDirection * turnMotionWeight;
+  const footLocalX = isTurningInPlace ? turnFootLocalX : 0;
+  const footLocalZ = isTurningInPlace
+    ? turnFootLocalZ
+    : THREE.MathUtils.lerp(walkFootLocalZ, runFootLocalZ, runBlendWeight);
   const hipWorld = new THREE.Vector3();
 
   hip.getWorldPosition(hipWorld);
@@ -293,9 +361,11 @@ function solveLegIK(
   );
   const maxFootStepUp = state.maxFootStepUp ?? 0.55;
   const movementQuat = getMovementFrameQuaternion(rig);
-  const footOffsetWorld = new THREE.Vector3(0, 0, footLocalZ).applyQuaternion(
-    movementQuat,
-  );
+  const footOffsetWorld = new THREE.Vector3(
+    footLocalX,
+    0,
+    footLocalZ,
+  ).applyQuaternion(movementQuat);
   const footWorld = hipWorld.clone().add(footOffsetWorld);
   const raycaster = new THREE.Raycaster();
   const downVector = new THREE.Vector3(0, -1, 0);
@@ -322,21 +392,33 @@ function solveLegIK(
   const walkFootLiftHeight = state.walkFootLiftHeight ?? 0.12;
   const runFootLiftHeight = state.runFootLiftHeight ?? 0.18;
   const runKneeDriveHeight = state.runKneeDriveHeight ?? 0.06;
+  const turnFootLiftHeight = state.turnFootLiftHeight ?? 0.11;
   const walkFootLiftY = walkStride.footLift * walkFootLiftHeight;
   const runFootLiftY =
     runStride.footLift * runFootLiftHeight +
     runStride.kneeDrive * runKneeDriveHeight;
-  const footLiftY = THREE.MathUtils.lerp(
-    walkFootLiftY,
-    runFootLiftY,
-    runBlendWeight,
-  );
+  const turnFootLiftY =
+    turnStride.footLift * turnFootLiftHeight * turnMotionWeight;
+  const footLiftY = isTurningInPlace
+    ? turnFootLiftY
+    : THREE.MathUtils.lerp(walkFootLiftY, runFootLiftY, runBlendWeight);
 
   const targetWorld = new THREE.Vector3(
     footWorld.x,
     floorY + ankleHeight + footLiftY,
     footWorld.z,
   );
+
+  if (isTurningInPlace) {
+    resolveTurnInPlaceFootTarget(
+      state,
+      side,
+      turnStride,
+      targetWorld,
+      deltaTime,
+    );
+  }
+
   const parent = hip.parent;
   const targetLocal = targetWorld.clone();
 
@@ -376,7 +458,100 @@ function solveLegIK(
   );
 
   setJointQuaternionFromBind(hip, qHipIK);
-  applyFootPitchPolish(ankle, foot, walkStride, runStride, runBlendWeight);
+  if (isTurningInPlace) {
+    applyFootPitchPolish(
+      ankle,
+      foot,
+      turnStride,
+      turnStride,
+      0,
+      turnMotionWeight,
+    );
+    applyTurnInPlaceFootYaw(
+      foot,
+      turnStride,
+      turnDirection,
+      (state.turnFootYaw ?? 0.18) * turnMotionWeight,
+    );
+  } else {
+    applyFootPitchPolish(ankle, foot, walkStride, runStride, runBlendWeight);
+  }
+}
+
+function resolveTurnInPlaceFootTarget(
+  state,
+  side,
+  stride,
+  targetWorld,
+  deltaTime,
+) {
+  const anchors = state.turnFootAnchors;
+
+  if (!anchors) {
+    return;
+  }
+
+  if (!anchors[side]?.isVector3) {
+    anchors[side] = targetWorld.clone();
+    return;
+  }
+
+  const anchorBlend =
+    THREE.MathUtils.clamp(state.turnBlendWeight ?? 1, 0, 1) *
+    THREE.MathUtils.clamp(state.turnIntensity ?? 1, 0, 1);
+  /*
+    At the start of stance, refresh the planted point to the foot's current
+    procedural landing target. The refresh is damped so landings can settle
+    into the new target without a one-frame anchor snap. During the rest of
+    stance, keep using that world anchor so root yaw does not simply sweep both
+    feet like a turntable.
+  */
+  const refreshWindow = state.turnAnchorRefreshWindow ?? 0.14;
+  const refreshAnchor =
+    !stride.isSwing && Number.isFinite(stride.stanceProgress)
+      ? stride.stanceProgress < refreshWindow
+      : false;
+
+  if (refreshAnchor) {
+    const damping = state.turnAnchorDamping ?? 18;
+    const t = 1 - Math.exp(-damping * Math.max(0, deltaTime || 0));
+    anchors[side].lerp(targetWorld, THREE.MathUtils.clamp(t, 0, 1));
+    targetWorld.lerp(anchors[side], anchorBlend);
+    return;
+  }
+
+  if (!stride.isSwing) {
+    targetWorld.lerp(anchors[side], anchorBlend);
+  }
+}
+
+function applyTurnInPlaceFootYaw(foot, stride, turnDirection, maxYaw = 0.18) {
+  if (!foot?.userData?.bindLocalQuaternion || !stride) {
+    return;
+  }
+
+  const yawLimit = THREE.MathUtils.clamp(Math.abs(maxYaw), 0, 0.32);
+  const direction = Math.sign(turnDirection || 0) || 1;
+  const swingWeight = THREE.MathUtils.clamp(stride.footLift ?? 0, 0, 1);
+  const plantWeight = THREE.MathUtils.clamp(stride.plant ?? 0, 0, 1);
+  const pushOffWeight = THREE.MathUtils.clamp(stride.pushOff ?? 0, 0, 1);
+  const yawWeight = Math.max(
+    swingWeight,
+    plantWeight * 0.45,
+    pushOffWeight * 0.25,
+  );
+  const yaw = direction * yawLimit * yawWeight;
+
+  if (Math.abs(yaw) <= 0.00001) {
+    return;
+  }
+
+  const qYaw = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(0, 1, 0),
+    yaw,
+  );
+
+  foot.quaternion.multiply(qYaw);
 }
 
 function applyFootPitchPolish(
@@ -385,11 +560,13 @@ function applyFootPitchPolish(
   walkStride,
   runStride,
   runBlendWeight,
+  amplitude = 1,
 ) {
   if (!walkStride || !runStride) {
     return;
   }
 
+  const poseAmplitude = THREE.MathUtils.clamp(amplitude, 0, 1);
   const walkStrideSwing = THREE.MathUtils.clamp(
     walkStride.strideSwing ?? 0,
     -1,
@@ -421,8 +598,8 @@ function applyFootPitchPolish(
     runBlendWeight,
   );
 
-  applyLocalPitchFromBind(ankle, anklePitch);
-  applyLocalPitchFromBind(foot, footPitch);
+  applyLocalPitchFromBind(ankle, anklePitch * poseAmplitude);
+  applyLocalPitchFromBind(foot, footPitch * poseAmplitude);
 }
 
 function applyLocalPitchFromBind(joint, pitch) {

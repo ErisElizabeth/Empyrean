@@ -33,7 +33,7 @@ import {
 import {
   getMoonHemisphereFromLatitude,
   getMoonPhase,
-} from "./moonPhase.js?v=0.2.14-alpha";
+} from "./moonPhase.js?v=0.2.25-alpha";
 import {
   DEFAULT_RIG_DIMENSIONS,
   HEAD_MARKER_SIZE_RANGE,
@@ -79,9 +79,9 @@ import {
   updateSkyMoonCameraAnchor,
   worldCollision,
   worldTerrain,
-} from "./world.js?v=0.2.14-alpha";
-import { updateLocomotion } from "./movementEngine.js?v=0.2.14-alpha";
-import { isWalkableTerrainHit } from "./terrain.js?v=0.2.14-alpha";
+} from "./world.js?v=0.2.25-alpha";
+import { updateLocomotion } from "./movementEngine.js?v=0.2.25-alpha";
+import { isWalkableTerrainHit } from "./terrain.js?v=0.2.25-alpha";
 import {
   DEFAULT_IMPORTED_MESH_PATH,
   applyImportedMeshPresentation,
@@ -100,7 +100,7 @@ import {
   syncImportedSkinToPuppet,
   bindRiggedSkinFromPath,
   syncSkinToSkeleton,
-} from "./skin.js?v=0.2.14-alpha";
+} from "./skin.js?v=0.2.25-alpha";
 import {
   EntityRole,
   createPlayerEntity,
@@ -121,7 +121,7 @@ import {
   sanitizeSwordPresetValues,
 } from "./sword.js";
 
-const APP_VERSION = "0.2.14-alpha";
+const APP_VERSION = "0.2.25-alpha";
 const THREE_VERSION_PIN = "0.164.1";
 
 //=============================================================
@@ -175,10 +175,31 @@ const SOLO_TWEAKS = {
     // key/mouse input so mouse-look spikes do not snap the upper body.
     turnVelocityDamping: 18,
     maxTurnVelocity: Math.PI * 1.85,
+    // Stationary body yaw is capped to a human-scale pivot rate. Camera/look
+    // intent remains responsive through controlState.targetYaw.
+    stationaryTurnMaxYawRate: Math.PI / 3,
     turnHeadYaw: 0.24,
     turnNeckYaw: 0.14,
     turnChestYaw: 0.09,
     turnBankRoll: 0.13,
+    turnInPlaceVelocityThreshold: 0.22,
+    turnInPlaceBlendRiseDamping: 16,
+    turnInPlaceBlendFallDamping: 10,
+    turnInPlaceIntensityDamping: 14,
+    turnInPlaceFullStepVelocity: 2.2,
+    turnInPlaceCadenceIntensityFloor: 0.45,
+    turnInPlacePhaseSpeedDamping: 18,
+    turnInPlacePhaseScale: 2.6,
+    turnInPlaceMinPhaseSpeed: 2.9,
+    turnInPlaceMaxPhaseSpeed: 7.2,
+    turnInPlaceStrideLength: 0.34,
+    turnInPlaceSideStep: 0.12,
+    turnInPlaceFootLift: 0.11,
+    turnInPlaceFootYaw: 0.18,
+    turnInPlacePelvisYaw: 0.11,
+    turnInPlaceBounce: 0.025,
+    turnInPlaceAnchorRefreshWindow: 0.14,
+    turnInPlaceAnchorDamping: 18,
 
     // Terrain height is sampled after X/Z collision accepts a move.
     maxStepUp: 0.35,
@@ -1064,8 +1085,9 @@ const controlState = {
   */
   keys: new Set(),
 
-  // yaw rotates the puppet/player. cameraYaw orbits the camera around that
-  // player-facing direction.
+  // targetYaw is immediate look/turn intent. yaw is the actual puppet/player
+  // body root, which chases targetYaw at a human-scale cap while stationary.
+  targetYaw: 0,
   yaw: 0,
   position: new THREE.Vector3(0, 0, 0),
   groundY: 0,
@@ -1075,6 +1097,12 @@ const controlState = {
   runBlendWeight: 0,
   turnVelocity: 0,
   turnVelocitySampleYaw: 0,
+  turnPhase: 0,
+  turnPhaseSpeed: 0,
+  turnBlendWeight: 0,
+  turnIntensity: 0,
+  isTurningInPlace: false,
+  turnFootAnchors: { left: null, right: null },
   actualMoveSpeed: 0,
   cameraYaw: 0,
   cameraDistance: SOLO_TWEAKS.camera.startDistance,
@@ -3276,6 +3304,7 @@ function makeG53RiggingSnapshot() {
   return {
     control: {
       position: controlState.position.clone(),
+      targetYaw: controlState.targetYaw,
       yaw: controlState.yaw,
       walkPhase: controlState.walkPhase,
       isWalking: Boolean(controlState.isWalking),
@@ -3325,7 +3354,11 @@ function restoreG53RiggingSnapshot(saved) {
   controlState.keys.clear();
   controlState.position.copy(saved.control.position);
   controlState.yaw = saved.control.yaw;
+  controlState.targetYaw = Number.isFinite(saved.control.targetYaw)
+    ? saved.control.targetYaw
+    : controlState.yaw;
   resetTurnVelocityState();
+  resetTurnInPlaceState();
   controlState.walkPhase = saved.control.walkPhase;
   controlState.isWalking = saved.control.isWalking;
   controlState.isRunning = Boolean(saved.control.isRunning);
@@ -3391,11 +3424,13 @@ function enterG53RiggingMode() {
     controlState.keys.clear();
     controlState.position.copy(G53_RIGGING_HOME.position);
     controlState.yaw = G53_RIGGING_HOME.yaw;
+    controlState.targetYaw = G53_RIGGING_HOME.yaw;
     controlState.walkPhase = 0;
     controlState.isWalking = false;
     controlState.isRunning = false;
     controlState.runBlendWeight = 0;
     resetTurnVelocityState();
+    resetTurnInPlaceState();
     controlState.waveUntil = 0;
     controlState.wasWaving = false;
     controlState.leftArm = "down";
@@ -3807,6 +3842,7 @@ function setRiggingWizardTestIdle() {
   controlState.isRunning = false;
   controlState.runBlendWeight = 0;
   resetTurnVelocityState();
+  resetTurnInPlaceState();
   applyRelaxedVisiblePose();
   updateGuiDisplays();
   setRiggingWizardStep("test", "Idle test active.");
@@ -5130,7 +5166,15 @@ function updateKeyboardMotion(delta, currentTime) {
   const animationMoveThreshold = Math.max(0.002, attemptedDistance * 0.08);
   let acceptedDistance = 0;
 
-  controlState.yaw += turnInput * delta * 2.2;
+  applyPlayerYawIntent(turnInput * delta * 2.2, moveInput !== 0);
+  if (!machineHomeActive) {
+    const bodyYawCatchupRate =
+      moveInput === 0
+        ? SOLO_TWEAKS.player.stationaryTurnMaxYawRate
+        : SOLO_TWEAKS.player.maxTurnVelocity;
+    advanceBodyYawTowardTarget(delta, bodyYawCatchupRate);
+  }
+
   controlState.actualMoveSpeed = 0;
   controlState.cameraYaw +=
     orbitInput * delta * SOLO_TWEAKS.camera.keyboardOrbitSpeed;
@@ -5231,9 +5275,11 @@ function updateKeyboardMotion(delta, currentTime) {
     */
     controlState.position.copy(G53_RIGGING_HOME.position);
     controlState.yaw = G53_RIGGING_HOME.yaw;
+    controlState.targetYaw = G53_RIGGING_HOME.yaw;
     controlState.isRunning = false;
     controlState.runBlendWeight = 0;
     resetTurnVelocityState();
+    resetTurnInPlaceState();
   } else {
     updateTurnVelocity(delta);
   }
@@ -5244,13 +5290,66 @@ function updateKeyboardMotion(delta, currentTime) {
   }
 }
 
+function hasForwardMotionInput() {
+  return (
+    !state.g53RiggingMode.active &&
+    (controlState.keys.has("KeyW") || controlState.keys.has("KeyS"))
+  );
+}
+
+function ensurePlayerYawTargets() {
+  if (!Number.isFinite(controlState.yaw)) {
+    controlState.yaw = 0;
+  }
+  if (!Number.isFinite(controlState.targetYaw)) {
+    controlState.targetYaw = controlState.yaw;
+  }
+}
+
+function applyPlayerYawIntent(yawDelta, immediate = hasForwardMotionInput()) {
+  ensurePlayerYawTargets();
+  if (!Number.isFinite(yawDelta) || yawDelta === 0) {
+    return;
+  }
+
+  if (immediate) {
+    controlState.yaw += yawDelta;
+    controlState.targetYaw = controlState.yaw;
+    return;
+  }
+
+  controlState.targetYaw += yawDelta;
+}
+
+function advanceBodyYawTowardTarget(delta, maxYawRate) {
+  ensurePlayerYawTargets();
+  if (delta <= 0 || !Number.isFinite(maxYawRate) || maxYawRate <= 0) {
+    return;
+  }
+
+  const yawDelta = wrapAngleDelta(controlState.targetYaw - controlState.yaw);
+  if (Math.abs(yawDelta) <= 0.0005) {
+    controlState.yaw = controlState.targetYaw;
+    return;
+  }
+
+  const maxStep = Math.max(0, maxYawRate) * delta;
+  const yawStep = THREE.MathUtils.clamp(yawDelta, -maxStep, maxStep);
+  controlState.yaw += yawStep;
+}
+
+function getCameraFacingYaw() {
+  ensurePlayerYawTargets();
+  return controlState.targetYaw;
+}
+
 function updateTurnVelocity(delta) {
   /*
     Tracks yaw rate as an animation signal.
 
-    Keyboard and mouse-look both write controlState.yaw, sometimes between
-    animation frames. Sampling the wrapped yaw delta here turns all of those
-    inputs into one smoothed angular velocity for body anticipation/banking.
+    Keyboard and mouse-look write targetYaw while stationary, then the actual
+    body yaw chases it. Sampling the wrapped actual-yaw delta here keeps turn
+    anticipation tied to what the body physically did this frame.
   */
   if (delta <= 0) {
     controlState.turnVelocitySampleYaw = controlState.yaw;
@@ -5286,8 +5385,51 @@ function resetTurnVelocityState() {
   controlState.turnVelocitySampleYaw = controlState.yaw;
 }
 
+function resetTurnInPlaceState() {
+  controlState.isTurningInPlace = false;
+  controlState.turnPhase = 0;
+  controlState.turnPhaseSpeed = 0;
+  controlState.turnBlendWeight = 0;
+  controlState.turnIntensity = 0;
+  controlState.turnFootAnchors.left = null;
+  controlState.turnFootAnchors.right = null;
+}
+
+function getTurnInPlaceFullAnimationVelocity() {
+  /*
+    The old turn-in-place intensity was calibrated against uncapped keyboard
+    yaw. Once stationary body yaw is capped to a human-scale rate, that same
+    mapping starves the feet: the body is still rotating, but foot lift,
+    offsets, anchors, toe yaw, and pelvis lead only receive a weak intensity.
+
+    Treat the stationary cap as the full-step animation rate so a 45 deg/s
+    body pivot still looks like an intentional pivot rather than a held-foot
+    slide.
+  */
+  const threshold = SOLO_TWEAKS.player.turnInPlaceVelocityThreshold;
+  const legacyFullStep = SOLO_TWEAKS.player.turnInPlaceFullStepVelocity;
+  const stationaryCap = SOLO_TWEAKS.player.stationaryTurnMaxYawRate;
+
+  if (Number.isFinite(stationaryCap) && stationaryCap > threshold) {
+    return Math.min(legacyFullStep, stationaryCap);
+  }
+
+  return legacyFullStep;
+}
+
 function wrapAngleDelta(angle) {
   return Math.atan2(Math.sin(angle), Math.cos(angle));
+}
+
+function isPlayerTurningInPlace() {
+  return (
+    !state.g53RiggingMode.active &&
+    !rigTuning.walkPreview &&
+    !controlState.isWalking &&
+    controlState.jump.phase === "grounded" &&
+    Math.abs(controlState.turnVelocity) >
+      SOLO_TWEAKS.player.turnInPlaceVelocityThreshold
+  );
 }
 
 function getPlayerTurnPoseState(speed = controlState.actualMoveSpeed) {
@@ -5344,9 +5486,18 @@ function updateSkeleton(delta, elapsed, currentTime) {
     updateIdleMotion(delta, elapsed);
   }
 
-  if (rigTuning.walkPreview || controlState.isWalking) {
-    updateQuaternionLocomotion(delta, elapsed);
+  const isTurningInPlace = isPlayerTurningInPlace();
+  const isTurnBlendActive = controlState.turnBlendWeight > 0.01;
+
+  if (
+    rigTuning.walkPreview ||
+    controlState.isWalking ||
+    isTurningInPlace ||
+    isTurnBlendActive
+  ) {
+    updateQuaternionLocomotion(delta, elapsed, { isTurningInPlace });
   } else {
+    resetTurnInPlaceState();
     relaxLegs(delta);
   }
 
@@ -5412,6 +5563,7 @@ function freezeG53RiggingPose() {
   controlState.isRunning = false;
   controlState.runBlendWeight = 0;
   resetTurnVelocityState();
+  resetTurnInPlaceState();
   controlState.waveUntil = 0;
   controlState.wasWaving = false;
   controlState.swordSwingStart = 0;
@@ -6168,20 +6320,112 @@ function getPelvisRunValues(phase, options) {
   return getPhysicsPelvisRunValues(phase, options);
 }
 
-function updateQuaternionLocomotion(delta, elapsed) {
+function updateQuaternionLocomotion(delta, elapsed, options = {}) {
   const isPreview = rigTuning.walkPreview && !controlState.isWalking;
+  const isTurningInPlace = Boolean(options.isTurningInPlace && !isPreview);
+  const targetTurnBlend = isTurningInPlace ? 1 : 0;
+  const turnBlendDamping = isTurningInPlace
+    ? SOLO_TWEAKS.player.turnInPlaceBlendRiseDamping
+    : SOLO_TWEAKS.player.turnInPlaceBlendFallDamping;
+  const turnBlendT =
+    1 -
+    Math.pow(
+      0.001,
+      (delta * Math.max(0.001, turnBlendDamping)) / 8,
+    );
+  controlState.turnBlendWeight = THREE.MathUtils.lerp(
+    controlState.turnBlendWeight,
+    targetTurnBlend,
+    turnBlendT,
+  );
+  const fullAnimationVelocity = getTurnInPlaceFullAnimationVelocity();
+  const turnIntensityRange = Math.max(
+    0.001,
+    fullAnimationVelocity - SOLO_TWEAKS.player.turnInPlaceVelocityThreshold,
+  );
+  const targetTurnIntensity = isTurningInPlace
+    ? THREE.MathUtils.clamp(
+        (Math.abs(controlState.turnVelocity) -
+          SOLO_TWEAKS.player.turnInPlaceVelocityThreshold) /
+          turnIntensityRange,
+        0,
+        1,
+      )
+    : 0;
+  const turnIntensityT =
+    1 -
+    Math.pow(
+      0.001,
+      (delta *
+        Math.max(0.001, SOLO_TWEAKS.player.turnInPlaceIntensityDamping)) /
+        8,
+    );
+  controlState.turnIntensity = THREE.MathUtils.lerp(
+    controlState.turnIntensity,
+    targetTurnIntensity,
+    turnIntensityT,
+  );
+
   let phase = controlState.walkPhase;
   let speed = controlState.actualMoveSpeed;
   let isRunning = controlState.isRunning;
   let runBlendWeight = controlState.runBlendWeight;
+  let turnBlendWeight = controlState.turnBlendWeight;
+  let turnIntensity = controlState.turnIntensity;
 
   if (isPreview) {
+    resetTurnInPlaceState();
+    turnBlendWeight = 0;
+    turnIntensity = 0;
     state.walkPhase +=
       delta * SOLO_TWEAKS.player.walkPhaseSpeed * rigTuning.motionSpeed;
     phase = state.walkPhase;
     speed = SOLO_TWEAKS.player.moveSpeed;
     isRunning = false;
     runBlendWeight = 0;
+  } else if (controlState.isWalking) {
+    resetTurnInPlaceState();
+    turnBlendWeight = 0;
+    turnIntensity = 0;
+  } else if (isTurningInPlace || turnBlendWeight > 0.001) {
+    const rawTurnPhaseSpeed = isTurningInPlace
+      ? THREE.MathUtils.clamp(
+          Math.abs(controlState.turnVelocity) *
+            SOLO_TWEAKS.player.turnInPlacePhaseScale,
+          SOLO_TWEAKS.player.turnInPlaceMinPhaseSpeed,
+          SOLO_TWEAKS.player.turnInPlaceMaxPhaseSpeed,
+        )
+      : 0;
+    const cadenceIntensity = THREE.MathUtils.lerp(
+      SOLO_TWEAKS.player.turnInPlaceCadenceIntensityFloor,
+      1,
+      turnIntensity,
+    );
+    const targetTurnPhaseSpeed = isTurningInPlace
+      ? rawTurnPhaseSpeed * cadenceIntensity
+      : 0;
+    const turnPhaseSpeedT =
+      1 -
+      Math.pow(
+        0.001,
+        (delta *
+          Math.max(0.001, SOLO_TWEAKS.player.turnInPlacePhaseSpeedDamping)) /
+          8,
+      );
+
+    controlState.isTurningInPlace = turnBlendWeight > 0.001;
+    controlState.turnPhaseSpeed = THREE.MathUtils.lerp(
+      controlState.turnPhaseSpeed,
+      targetTurnPhaseSpeed,
+      turnPhaseSpeedT,
+    );
+    controlState.turnPhase += delta * controlState.turnPhaseSpeed;
+    phase = controlState.turnPhase;
+    speed = 0;
+    isRunning = false;
+    runBlendWeight = 0;
+  } else {
+    resetTurnInPlaceState();
   }
 
   const turnPose = isPreview ? null : getPlayerTurnPoseState(speed);
@@ -6195,8 +6439,13 @@ function updateQuaternionLocomotion(delta, elapsed) {
       maxSpeed: SOLO_TWEAKS.player.runSpeed,
       isWalking: controlState.isWalking || isPreview,
       walkPreview: isPreview,
+      isTurningInPlace: turnBlendWeight > 0.001,
       isRunning,
       runBlendWeight,
+      turnBlendWeight,
+      turnIntensity,
+      turnVelocity: controlState.turnVelocity,
+      turnFootAnchors: controlState.turnFootAnchors,
       turnPose,
       walkFrequency: 1.5,
       runFrequency: 2.5,
@@ -6204,6 +6453,15 @@ function updateQuaternionLocomotion(delta, elapsed) {
       runStrideLength: 2.0,
       walkBounce: 0.05,
       runBounce: 0.15,
+      turnStrideLength: SOLO_TWEAKS.player.turnInPlaceStrideLength,
+      turnSideStep: SOLO_TWEAKS.player.turnInPlaceSideStep,
+      turnFootLiftHeight: SOLO_TWEAKS.player.turnInPlaceFootLift,
+      turnFootYaw: SOLO_TWEAKS.player.turnInPlaceFootYaw,
+      turnPelvisYaw: SOLO_TWEAKS.player.turnInPlacePelvisYaw,
+      turnBounce: SOLO_TWEAKS.player.turnInPlaceBounce,
+      turnAnchorRefreshWindow:
+        SOLO_TWEAKS.player.turnInPlaceAnchorRefreshWindow,
+      turnAnchorDamping: SOLO_TWEAKS.player.turnInPlaceAnchorDamping,
       relaxDamping: rigTuning.damping,
       idleMotion: false,
       applyArmPose: false,
@@ -7594,10 +7852,12 @@ function updateCamera(delta) {
       body, not the feet.
 
     yaw:
-      avatar yaw + extra camera orbit yaw + PI
+      target yaw + extra camera orbit yaw + PI
       The +PI puts the camera behind the player. Before the rework this term
       was absent and the camera sat in front of the player, which made sense
       for the puppet rigging origin of this project but not for gameplay.
+      targetYaw is used instead of actual body yaw so stationary turn caps do
+      not make camera/look input feel sluggish.
 
     pitch:
       controlState.cameraPitch, applied as a vertical orbit (latitude).
@@ -7615,7 +7875,7 @@ function updateCamera(delta) {
   const target = state.skeleton.root.position
     .clone()
     .add(new THREE.Vector3(0, 1.65, 0));
-  const yaw = controlState.yaw + controlState.cameraYaw + Math.PI;
+  const yaw = getCameraFacingYaw() + controlState.cameraYaw + Math.PI;
   const pitch = controlState.cameraPitch;
   const dist = controlState.cameraDistance;
   const offset = new THREE.Vector3(
@@ -8437,7 +8697,7 @@ function handleGameplayPointerMove(event) {
       having to track its own previous coords.
 
     Axes:
-      dx (horizontal) -> turn the PLAYER (controlState.yaw). Mirrors A/D
+      dx (horizontal) -> turn the player targetYaw. Mirrors A/D
         keys: positive dx (mouse moved right) -> turn right -> yaw decreases.
       dy (vertical)   -> pitch the CAMERA (controlState.cameraPitch).
         Default mouseInvertY=false means forward (dy<0) makes pitch decrease,
@@ -8457,7 +8717,7 @@ function handleGameplayPointerMove(event) {
   const dx = event.movementX || 0;
   const dy = event.movementY || 0;
 
-  controlState.yaw -= dx * SOLO_TWEAKS.camera.mouseTurnSensitivity;
+  applyPlayerYawIntent(-dx * SOLO_TWEAKS.camera.mouseTurnSensitivity);
 
   const pitchSign = SOLO_TWEAKS.camera.mouseInvertY ? -1 : 1;
   controlState.cameraPitch = THREE.MathUtils.clamp(
@@ -8621,7 +8881,9 @@ function handleWindowBlur() {
       so the next session starts clean.
   */
   controlState.keys.clear();
+  controlState.targetYaw = controlState.yaw;
   resetTurnVelocityState();
+  resetTurnInPlaceState();
   if (controlState.mouseLookActive) {
     controlState.mouseLookActive = false;
     if (document.pointerLockElement === sceneContainer) {

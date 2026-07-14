@@ -25,7 +25,7 @@ gameplay moonlight remains unchanged. The same build removes the unused primitiv
 tree material declarations while retaining the GLB tree placeholders, positions,
 colliders, caching, normalization, and visibility ownership.
 
-7/6/2026 update:
+7/6/2026 and 7/14/2026 update:
 Build `0.2.13-alpha` added `controlState.runBlendWeight` as the active
 walk-to-run transition scalar. The player movement path now blends movement
 speed, gait phase speed, locomotion body/leg targets, and visible down-arm pump
@@ -34,9 +34,49 @@ Build `0.2.14-alpha` added smoothed `controlState.turnVelocity` from wrapped
 root-yaw deltas. Player idle and quaternion locomotion now use that signal for
 head/neck/chest turn anticipation and movement-scaled body/pelvis banking
 without adding procedural foot replanting.
+Build `0.2.15-alpha` added the first turn-in-place stepping branch. Idle yaw
+can now wake `updateQuaternionLocomotion()`, advance `controlState.turnPhase`,
+and pass turn-only stepping state plus planted-foot anchors into
+`movementEngine.js` without changing the forward walk/run constants.
+Build `0.2.16-alpha` refined that branch with diagonal turn-step targets and
+damped early-stance anchor refresh so the feet step around the pivot more
+clearly while still using the existing IK solve.
+Build `0.2.17-alpha` fixed the `0.2.16-alpha` turn-in-place freeze by passing
+`deltaTime` into `solveLegIK()` before the damped anchor refresh reads it. The
+symptom was a stopped animation loop with lil-gui controls still responsive.
+Build `0.2.18-alpha` added turn-only foot-yaw polish after the existing
+ankle/foot pitch pass. The foot toes into the current yaw direction from the
+same stride lift/plant/push-off markers, without changing the IK target solve.
+Build `0.2.19-alpha` replaced generic walk-phase hip yaw during turn-in-place
+with a small direction-aware pelvis lead so the lower body participates in the
+stationary pivot without changing forward walk/run hip yaw.
+Build `0.2.20-alpha` added turn-in-place blend and phase-speed smoothing so
+stationary pivots ease in/out instead of snapping directly between idle and
+full stepping. Turn-only bounce, targets, anchors, pitch, toe yaw, and pelvis
+lead now scale with that blend. Forward walk/run and walk preview clear it
+immediately.
+Build `0.2.21-alpha` added velocity-scaled turn animation intensity without
+limiting actual player yaw. `controlState.turnIntensity` maps smoothed yaw
+velocity into animation amplitude so slow pivots use smaller turn steps while
+keyboard-speed pivots still reach the full turn-in-place pose.
+Build `0.2.22-alpha` refined normal-speed turn cadence by scaling the turn
+phase-speed target with `controlState.turnIntensity`. Slow pivots now use a
+gentler cadence floor, while keyboard-speed pivots keep the established rhythm.
+Build `0.2.23-alpha` split player look intent from physical body yaw for a
+first stationary turn-cap pass. `controlState.targetYaw` follows keyboard and
+RMB mouse-look immediately, the body/root `controlState.yaw` chases it at
+`stationaryTurnMaxYawRate` while stationary, and the camera follows target yaw
+so the view stays responsive during capped pivots.
+Build `0.2.24-alpha` recalibrated turn-in-place animation intensity for that
+cap. `getTurnInPlaceFullAnimationVelocity()` maps the capped stationary body
+yaw rate to full pivot-step animation so foot lift, offsets, planted anchors,
+toe yaw, and pelvis lead remain active at 45 degrees per second.
+Build `0.2.25-alpha` raised `stationaryTurnMaxYawRate` from 45 degrees per
+second to 60 degrees per second (`Math.PI / 3`) while keeping the camera/look
+split and capped-turn animation mapping intact.
 
 Generated: 2026-05-27  
-Updated: 2026-07-06
+Updated: 2026-07-14
 Scope: architecture audit plus documentation alignment notes.
 
 This document maps the current Empyrean prototype as it exists now: a browser-based Three.js game/workshop hybrid with an active puppet rig, imported mesh skinning, dev rigging tools, a dark exploratory world, sword stance work, combat encounter logic, a d20/oracle presentation, and several older experimental systems still present.
@@ -125,7 +165,7 @@ Map first. Surgery later.
 State:
 
 - DOM: `#emp-loader`, `#emp-title`, `#scene-container`.
-- App constants: `APP_VERSION` at `main.js:101`.
+- App constants: `APP_VERSION` at `main.js:124`.
 
 Update loop:
 
@@ -155,6 +195,7 @@ State:
 - `scene`
 - `camera`
 - `renderer`
+- `controlState.targetYaw`
 - `controlState.cameraYaw`
 - `controlState.cameraDistance`
 - `controlState.cameraHeight`
@@ -613,6 +654,31 @@ Overwrite warning:
   - active player transitions use `controlState.runBlendWeight`, which is
     updated in `updateKeyboardMotion()` and passed through
     `updateQuaternionLocomotion()` into `movementEngine.js`.
+- Turn in place:
+  - active player idle yaw uses `controlState.turnVelocity` to gate a
+    turn-only locomotion branch.
+  - `controlState.targetYaw` stores immediate look intent; while stationary,
+    the physical/root `controlState.yaw` chases it at
+    `stationaryTurnMaxYawRate`.
+  - `controlState.turnPhase` advances independently from `walkPhase`.
+  - `controlState.turnBlendWeight` and `controlState.turnPhaseSpeed` smooth
+    entry/exit and cadence before the state reaches `movementEngine.js`.
+  - `controlState.turnIntensity` maps turn velocity into turn-only animation
+    amplitude; after `0.2.24-alpha`, capped stationary body yaw uses
+    `getTurnInPlaceFullAnimationVelocity()` so 60 degrees per second can still
+    reach full pivot-step animation strength.
+  - `turnInPlaceCadenceIntensityFloor` scales cadence for gentle pivots so
+    low-intensity turns do not take tiny fast steps.
+  - `turnInPlaceSideStep` offsets the turn-only foot target diagonally from
+    the existing stride curve and current turn direction.
+  - `turnInPlaceFootYaw` adds a small turn-only toe-in rotation after the
+    existing foot pitch polish; it does not change the IK target.
+  - `turnInPlacePelvisYaw` replaces generic walk hip yaw only during
+    turn-in-place, giving the pelvis a small direction-aware lead.
+  - `controlState.turnFootAnchors` stores planted world-space foot targets
+    consumed by `movementEngine.js` before the existing IK solve.
+  - `turnInPlaceAnchorRefreshWindow` and `turnInPlaceAnchorDamping` smooth
+    the early-stance anchor update instead of hard-snapping it.
 - Leg relaxation:
   - `relaxLegs()` at `main.js:6442`
 
@@ -623,6 +689,12 @@ State:
 - `controlState.isRunning`
 - `controlState.runBlendWeight`
 - `controlState.turnVelocity`
+- `controlState.turnPhase`
+- `controlState.turnPhaseSpeed`
+- `controlState.turnBlendWeight`
+- `controlState.turnIntensity`
+- `controlState.isTurningInPlace`
+- `controlState.turnFootAnchors`
 - `controlState.jump`
 - `rigTuning.walk*`, `rigTuning.run*`, `rigTuning.jump*`, `rigTuning.idleMotion`
 
@@ -1543,7 +1615,7 @@ Per-frame order:
 
 | Order | Function                                      | Called From                       | Modifies                                                           | Gates                                       | Should Run In Gameplay? | Should Run In G53/Dev?                                                                  | Overwrite Risk                              |
 | ----- | --------------------------------------------- | --------------------------------- | ------------------------------------------------------------------ | ------------------------------------------- | ----------------------- | --------------------------------------------------------------------------------------- | ------------------------------------------- |
-| 1     | `updateKeyboardMotion(delta, currentTime)`    | `animate()`                       | `controlState.position`, yaw, camera values, walking/running flags, `runBlendWeight`, `turnVelocity` | G53 freezes movement/yaw but allows camera  | Yes                     | Partly. Camera yes, movement no                                                         | Can move root unless G53 active.            |
+| 1     | `updateKeyboardMotion(delta, currentTime)`    | `animate()`                       | `controlState.position`, target/body yaw, camera values, walking/running flags, `runBlendWeight`, `turnVelocity` | G53 freezes movement/yaw but allows camera  | Yes                     | Partly. Camera yes, movement no                                                         | Can move root unless G53 active.            |
 | 2     | `tickEncounterSystem()`                       | `animate()` if encounters enabled | Encounter active ids, world debug, audio/sky actions               | `rigTuning.encounterSystemEnabled`          | Yes                     | Currently yes unless disabled; G53 world hidden does not necessarily stop trigger logic | Can modify audio/sky state.                 |
 | 3     | `updateCombatEncounter(delta)`                | `animate()`                       | Combat phase, enemy, d20, healthbar, battle audio                  | Combat module suppresses visuals during G53 | Yes                     | It returns early when suppressed                                                        | Can change audio and enemy visuals.         |
 | 4     | `updateJumpPhysics(delta)`                    | `animate()`                       | `controlState.jump`                                                | Jump phase                                  | Yes                     | G53 freeze resets jump to grounded                                                      | Affects root Y via later sync.              |
@@ -1563,7 +1635,7 @@ Per-frame order:
 | 1     | Root sync         | `syncSkeletonRoot()`                 | skeleton root position                 | Always                          | Adds `rootOffset*` and jump offset to `controlState.position`. |
 | 2     | G53 freeze        | `freezeG53RiggingPose()`             | live joints reset to bind pose         | `state.g53RiggingMode.active`   | Returns early. Stops all animation solvers.                    |
 | 3     | Idle              | `updateIdleMotion()`                 | spine/chest/head/torso scale/rotations | `rigTuning.idleMotion`          | Breathing mostly affects torso, not whole avatar.              |
-| 4     | Walk/run or relax | `updateWalkMotion()` / `relaxLegs()` | legs, pelvis, body motion              | walking or preview              | Overwrites leg live positions.                                 |
+| 4     | Walk/run/turn or relax | `updateWalkMotion()` / `updateQuaternionLocomotion()` / `relaxLegs()` | legs, pelvis, body motion              | walking, preview, or turn-in-place              | Turn-in-place blends cadence, anchors, pelvis lead, and toe-in polish; otherwise relaxes.     |
 | 5     | Combat stance     | `updateCombatStancePose()`           | body/legs/arms/stance balance          | weapon equipped and not walking | Low guard layer.                                               |
 | 6     | Arms              | `updateControlledArms()`             | shoulder/elbow/wrist/palm              | Always in gameplay              | Major overwrite point for visible arm transforms.              |
 | 7     | Jump pose         | `updateJumpPose()`                   | crouch/air/landing overlays            | Jump phase                      | Adds jump pose on top of current animation.                    |
@@ -1605,6 +1677,16 @@ z = Math.cos(yaw);
 ```
 
 At `yaw = 0`, forward is `+Z`.
+
+Stationary turning now separates look intent from physical root yaw:
+
+- `controlState.targetYaw` is the immediate keyboard/RMB look target and feeds
+  the third-person camera.
+- `controlState.yaw` is the body/root yaw used for movement direction,
+  skeleton rotation, sword arcs, and turn-velocity sampling.
+- With no forward/back input, `controlState.yaw` chases `targetYaw` at
+  `stationaryTurnMaxYawRate` (`Math.PI / 3`, 60 degrees per second) so the
+  body pivots at a human-scale rate while the camera remains responsive.
 
 ### Local vs World Position
 
@@ -1925,7 +2007,7 @@ Use these anchors when navigating the current code.
 
 ### Main Runtime
 
-- `main.js:101` - `APP_VERSION`
+- `main.js:124` - `APP_VERSION`
 - `main.js:91-99` - Entity imports
 - `main.js:8480` - Entity layer setup
 - `main.js:8511` - `empyreanSpawnNPC`
